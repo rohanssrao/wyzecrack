@@ -1,13 +1,19 @@
-"""ENR harvest: read the camera's ENR out of its own HTTPS calls.
+"""Reading the camera's own HTTPS: its ENR and its motion-event uploads.
 
-The ENR is the per-camera secret the DTLS PSK is derived from. The camera
-sends it in the JSON body of its POSTs to api.wyzecam.com (at boot, on
-motion alarms, and every few hours). The camera's TLS client still trusts
-the eMudhra "EM OV TLS CA - G3C" intermediate, whose private key is public
-(the October 2026 eMudhra incident: P-384 key with d=4). So once we route
-the camera, we can redirect its tcp/443 to a local TLS server that presents
-a leaf for the requested name signed under that intermediate, relay to the
-real server, and read the ENR off the request.
+The camera's TLS client still trusts the eMudhra "EM OV TLS CA - G3C"
+intermediate, whose private key is public (the October 2026 eMudhra
+incident: a P-384 key with d=4). Once we route the camera, its tcp/443 is
+redirected to a local TLS relay that presents a leaf for the requested
+name signed under that intermediate and forwards everything to the real
+server, so the camera's cloud calls keep working. Two things are read off
+the camera's requests:
+
+- the ENR, the per-camera secret the DTLS PSK is derived from, in the JSON
+  body of its POSTs to api.wyzecam.com (at boot, on motion alarms, and
+  every few hours);
+- motion events: for each alarm the camera PUTs a snapshot (jpg) and a
+  12 s clip (mp4, H.264 + A-law audio) to cpl-t-sightsafe.wyzecam.com via
+  pre-signed URLs, with no encryption beyond TLS.
 """
 import datetime as dt
 import ipaddress
@@ -19,6 +25,7 @@ import ssl
 import struct
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from cryptography import x509
@@ -109,7 +116,11 @@ uL5ChFWOQU+ErSDnUq7yr+pjBQ==
 
 
 SO_ORIGINAL_DST = 80
-HARVEST_PORT = 18443
+INTERCEPT_PORT = 18443
+# PUT /<MAC>/<date>/<alarm id>_<alarm ms>_<n>_<file type>_<n>/<uuid>_1.<ext>
+EVENT_PATH_RE = re.compile(rb"^/[0-9A-F]{12}/[0-9-]+/([0-9A-F]+)_(\d{13})_\d+_(\d)_\d+/"
+                           rb"[0-9a-f]+_\d+\.(jpg|mp4)")
+MAX_BODY = 64 << 20
 ENR_RE = re.compile(rb'"enr"\s*:\s*"((?:[^"\\]|\\.)+)"')
 MAC_RE = re.compile(rb'"mac"\s*:\s*"([0-9A-Fa-f]{12})"')
 
@@ -174,18 +185,81 @@ def original_dst(sock):
     return socket.inet_ntoa(raw[4:8]), port
 
 
-class Harvester:
+class RequestTap:
+    """Incremental parser for one connection's client->server bytes: calls
+    on_request(method, path, headers, body) per complete HTTP/1.1 request
+    with a Content-Length body. Anything else (chunked bodies, MQTT, ...)
+    makes it give up on the connection; the relay is unaffected."""
+
+    def __init__(self, on_request):
+        self.on_request = on_request
+        self.buf = b""
+        self.dead = False
+
+    def feed(self, data):
+        if self.dead:
+            return
+        self.buf += data
+        while True:
+            end = self.buf.find(b"\r\n\r\n")
+            if end < 0:
+                if len(self.buf) > 65536:
+                    self.dead = True
+                return
+            head = self.buf[:end].split(b"\r\n")
+            parts = head[0].split(b" ")
+            if len(parts) != 3 or not parts[2].startswith(b"HTTP/"):
+                self.dead = True
+                return
+            headers = {}
+            for line in head[1:]:
+                k, _, v = line.partition(b":")
+                headers[k.strip().lower()] = v.strip()
+            if b"chunked" in headers.get(b"transfer-encoding", b""):
+                self.dead = True
+                return
+            try:
+                n = int(headers.get(b"content-length", b"0"))
+            except ValueError:
+                self.dead = True
+                return
+            if n > MAX_BODY:
+                self.dead = True
+                return
+            if len(self.buf) < end + 4 + n:
+                return
+            body = self.buf[end + 4:end + 4 + n]
+            self.buf = self.buf[end + 4 + n:]
+            self.on_request(parts[0].decode(), parts[1], headers, body)
+
+
+def event_name(path):
+    """(event folder name, file name) for a motion-event upload path, or
+    None. Folder: local alarm time + alarm id; files snapshot.jpg/clip.mp4."""
+    m = EVENT_PATH_RE.match(path)
+    if not m:
+        return None
+    alarm_id, ms, _ftype, ext = (x.decode() for x in m.groups())
+    when = time.strftime("%Y%m%d-%H%M%S", time.localtime(int(ms) / 1000))
+    return f"{when}_{alarm_id[-10:]}", "clip.mp4" if ext == "mp4" else "snapshot.jpg"
+
+
+class CloudTap:
     """Transparent TLS interceptor for the camera's tcp/443.
 
-    Every connection is relayed to its real destination, so the camera's
-    cloud calls keep working; only the client->server bytes are read. The
-    redirect is removed by stop(), which callers do as soon as the ENR is
-    in hand."""
+    Every connection is relayed to its real destination with the camera's
+    SNI. `enr_found` is set when an ENR is seen; with events_dir set,
+    motion-event uploads are saved there as <time>_<id>/clip.mp4 and
+    snapshot.jpg."""
 
-    def __init__(self, cam_ip, us, port=HARVEST_PORT):
-        self.cam_ip, self.us, self.port = cam_ip, us, port
-        self.found = threading.Event()
+    def __init__(self, cam_ip, port=INTERCEPT_PORT, events_dir=None,
+                 on_event=None):
+        self.cam_ip, self.port = cam_ip, port
+        self.events_dir = Path(events_dir) if events_dir else None
+        self.on_event = on_event
+        self.enr_found = threading.Event()
         self.enr = self.mac = None
+        self.events = []
         self.hosts = {}
         self._work = tempfile.mkdtemp(prefix="wyze-splice-certs-")
         self._ctx_lock = threading.Lock()
@@ -196,6 +270,7 @@ class Harvester:
              "--dport", str(port), "-j", "ACCEPT"),
         ]
         self._installed = []
+        self._srv = None
 
     def _ctx_for(self, host):
         with self._ctx_lock:
@@ -228,16 +303,18 @@ class Harvester:
         for r in reversed(self._installed):
             ipt(r[0], r[1], "-D", r[2], *r[3:])
         self._installed = []
-        try:
-            self._srv.close()
-        except OSError:
-            pass
+        if self._srv:
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+            self._srv = None
 
     def _accept(self):
         while True:
             try:
                 c, _ = self._srv.accept()
-            except OSError:
+            except (OSError, AttributeError):
                 return
             threading.Thread(target=self._handle, args=(c,), daemon=True).start()
 
@@ -254,7 +331,7 @@ class Harvester:
             cctx.verify_mode = ssl.CERT_NONE
             raw = socket.create_connection(dst, timeout=15)
             up = cctx.wrap_socket(raw, server_hostname=sni)
-            self._relay(tc, up)
+            self._relay(tc, up, RequestTap(self._on_request))
         except (OSError, ssl.SSLError, ValueError):
             pass
         finally:
@@ -264,9 +341,24 @@ class Harvester:
                 except OSError:
                     pass
 
-    def _relay(self, a, b):
-        """Pump a<->b until either side closes; scan a->b for the ENR."""
-        seen = b""
+    def _on_request(self, method, path, headers, body):
+        if not self.enr_found.is_set():
+            hit = find_enr(body)
+            if hit:
+                self.enr, self.mac = hit
+                self.enr_found.set()
+        if method == "PUT" and self.events_dir is not None and body:
+            name = event_name(path)
+            if name:
+                d = self.events_dir / name[0]
+                d.mkdir(parents=True, exist_ok=True)
+                (d / name[1]).write_bytes(body)
+                self.events.append(d / name[1])
+                if self.on_event:
+                    self.on_event(d / name[1])
+
+    def _relay(self, a, b, tap):
+        """Pump a<->b until either side closes, feeding a->b to the tap."""
         for s in (a, b):
             s.settimeout(1)
         while True:
@@ -283,9 +375,5 @@ class Harvester:
                 if not data:
                     return
                 (b if s is a else a).sendall(data)
-                if s is a and not self.found.is_set():
-                    seen = (seen + data)[-65536:]
-                    hit = find_enr(seen)
-                    if hit:
-                        self.enr, self.mac = hit
-                        self.found.set()
+                if s is a:
+                    tap.feed(data)

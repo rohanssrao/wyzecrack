@@ -1,4 +1,4 @@
-"""ENR harvest: request parsing and the eMudhra-signed leaf."""
+"""Cloud interception: ENR and event parsing, and the eMudhra-signed leaf."""
 import socket
 import ssl
 import tempfile
@@ -6,7 +6,7 @@ import threading
 
 from cryptography.hazmat.primitives import serialization
 
-from wyze_splice import enr
+from wyze_splice import cloud as enr
 
 
 def test_find_enr_unescapes_and_finds_mac():
@@ -43,3 +43,21 @@ def test_leaf_validates_against_the_emudhra_intermediate():
         assert c.recv(5) == b"hello"
     t.join(5)
     assert not err
+
+
+def test_request_tap_splits_pipelined_requests_and_names_events():
+    got = []
+    tap = enr.RequestTap(lambda m, p, h, b: got.append((m, p, b)))
+    put = (b"/D03F27A1B2C3/2026-01-01/D03F27A1B2C3011767225600_1767225600894_1_2_0/"
+           b"0123456789abcdef0123456789abcdef_1.mp4?Policy=x&Signature=y")
+    clip = b"\x00\x00\x00\x18ftypmp42" + bytes(100)
+    stream = (b"POST /device/alarm/upload_alarm HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"
+              + b"PUT " + put + b" HTTP/1.1\r\nHost: cpl-t-sightsafe.wyzecam.com\r\n"
+              + b"Content-Length: %d\r\n\r\n" % len(clip) + clip)
+    for i in range(0, len(stream), 7):        # arbitrary TLS record splits
+        tap.feed(stream[i:i + 7])
+    assert [g[0] for g in got] == ["POST", "PUT"]
+    assert got[1][2] == clip
+    folder, fname = enr.event_name(got[1][1])
+    assert folder.endswith("_1767225600") and fname == "clip.mp4"
+    assert enr.event_name(b"/device/alarm/upload_alarm") is None

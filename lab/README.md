@@ -10,7 +10,8 @@ The camera's default route points at `mid` and `mid` NATs it, which is what
 the camera-only ARP poison plus MASQUERADE produce on a real LAN.
 `lab_peers.py` plays the camera and the phone-behind-the-relay with real
 DTLS and format-exact 0xCC51 wrappers, shaped after live relay captures.
-`lab_api.py` plays api.wyzecam.com and the camera's ENR-bearing POST.
+`lab_api.py` plays the Wyze cloud and the camera's ENR-bearing POST and
+motion-clip upload.
 
 Run as root on Linux, from the repo after `uv sync`:
 
@@ -23,7 +24,8 @@ Run as root on Linux, from the repo after `uv sync`:
     sudo DIE_FIRST=1 DUR=30 bash lab/lab_run.sh splice
                                          # camera closes the spliced channel early; the app retries elsewhere
     sudo MEDIA_PPS=250 bash lab/lab_run.sh splice   # throughput
-    sudo HARVEST=1 bash lab/lab_run.sh splice       # no --enr: harvest it from the camera's HTTPS first
+    sudo HARVEST=1 bash lab/lab_run.sh splice       # no --enr: harvest it from the camera's HTTPS
+                                                    # first, and save its motion-clip upload
     sudo bash lab/arp_check.sh           # the ARP step: camera-only poison, then restore
     sudo bash lab/labsuite.sh            # all of the above; one PASS/FAIL line each in /tmp/wslab-suite.txt
 

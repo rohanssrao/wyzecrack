@@ -16,8 +16,13 @@ srcs = sorted({a for s in ph["sessions"].values() for a in s["srcs"]}) + sorted(
 good = any(m == exp and b == 0 and h for h, m, b in sess.values())
 if os.path.exists(f"{o}/api.json"):
     api = json.load(open(f"{o}/api.json"))
-    good = good and api.get("ok") and "ENR harvested" in out
-    if "ENR harvested" not in out: print(f"  ({name}: no harvest)")
+    import glob, hashlib
+    clips = glob.glob(f"{o}/events/*/clip.mp4")
+    clip_ok = bool(clips) and hashlib.sha256(open(clips[0], "rb").read()).hexdigest() == api.get("clip_sha")
+    sni = open(f"{o}/api-sni.txt").read().split() if os.path.exists(f"{o}/api-sni.txt") else []
+    sni_ok = sni == ["api.wyzecam.com", "cpl-t-sightsafe.wyzecam.com"]
+    good = good and api.get("ok") and "ENR harvested" in out and clip_ok and sni_ok
+    print(f"  ({name}: harvest={'ENR harvested' in out} clip={clip_ok} upstream_sni={sni})")
 spliced = "spliced: both DTLS legs up" in out
 ends = [l.split("session over: ")[1] for l in out.splitlines() if "session over:" in l]
 latches = [l.split("relay flow ")[1] for l in out.splitlines() if "relay flow (" in l]
@@ -40,4 +45,5 @@ for spec in "direct-plain::direct" "splice-plain::splice" \
   summ $name
 done
 echo "arp-poison: $(bash $L/arp_check.sh | tail -1)" >> $R
+echo "leftover processes: $(pgrep -fc 'target 10.99.0.20')" >> $R
 echo DONE >> $R

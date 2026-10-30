@@ -13,6 +13,14 @@ ThroughTek relays). When the viewer leaves, the tool tears everything down
 and writes the decrypted stream to `captures/<time>/video.mp4` and a still
 to `frame.jpg`. The app plays the feed normally.
 
+It also saves the camera's motion events (the 12 s clip and snapshot it
+uploads to Wyze's cloud) while it runs, and `wyze-splice events` does only
+that, until Ctrl-C:
+
+```
+sudo .venv/bin/wyze-splice events --target 192.168.1.20
+```
+
 Only use this against cameras you own or are authorized to test.
 
 ## What it needs
@@ -37,7 +45,7 @@ uv sync
 sudo .venv/bin/wyze-splice run --target <camera ip>
 ```
 
-Options: `--enr` to supply the ENR, `--keep-going` to splice every session
+Options: `--enr` to supply the ENR, `--no-events` to leave event uploads alone, `--keep-going` to splice every session
 until Ctrl-C (default: stop after the first), `--on-path` when the host
 already routes the camera (its gateway, or the lab), `--journal` to also log
 all key material, `--pass-through` to divert without decrypting (an A/B
@@ -53,15 +61,18 @@ control). `wyze-splice extract <av.bin>` rebuilds the video from a capture.
    stream. The camera's existing flows survive the switch; the relays pick
    up the new NAT mapping from its next keepalive.
 
-2. **Harvest the ENR** (`enr.py`). The camera's TLS client still trusts the
+2. **Read the camera's HTTPS** (`cloud.py`). The camera's TLS client still trusts the
    eMudhra "EM OV TLS CA - G3C" intermediate, whose private key became
    public in October 2026 (a P-384 key with d=4). The tool redirects the
    camera's tcp/443 to a local TLS relay that presents a leaf for the
    requested name signed under that intermediate, forwards everything to
    the real server, and reads `"enr"` out of the camera's POSTs to
    api.wyzecam.com. The camera sends these at boot, on motion alarms, and
-   every few hours, so the first harvest can take a while. The redirect is
-   removed as soon as the ENR is in hand.
+   every few hours, so the first harvest can take a while; walking past
+   the camera triggers a motion alarm. The same relay saves motion events:
+   for each alarm the camera PUTs a snapshot and a 12 s 1080p clip (H.264
+   with A-law audio) to cpl-t-sightsafe.wyzecam.com through pre-signed
+   URLs, encrypted by nothing but the TLS we terminate.
 
 3. **Catch the session** (`splice.py`). Nothing is diverted while waiting.
    When the app opens the feed, the camera sends a 0x1102 channel-open to a
@@ -94,7 +105,9 @@ control). `wyze-splice extract <av.bin>` rebuilds the video from a capture.
 
 | file | contents |
 |---|---|
-| `video.mp4`, `frame.jpg` | the decrypted stream, at true speed, and its last frame |
+| `video.mp4`, `frame.jpg` | the decrypted live view at true speed (HD part), and its last frame |
+| `video-640x360.mp4` | the SD start of the live view, before the app switches to HD |
+| `events/<time>_<id>/` | `clip.mp4` and `snapshot.jpg` of each motion event uploaded meanwhile |
 | `video.h264` | the raw Annex-B stream |
 | `av.bin` | every decrypted DTLS application record, both directions |
 | `splice.log` | engine milestones (handshakes, phone frame ACKs) |

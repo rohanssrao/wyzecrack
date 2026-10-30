@@ -14,7 +14,7 @@ bash $LAB/lab_setup.sh up
 cd $REPO
 if [ "${HARVEST:-0}" = 1 ]; then
   ENRARG="--reharvest --harvest-timeout 20"
-  ip netns exec tfl-relay $PY $LAB/lab_api.py server $((DUR+15)) &
+  ip netns exec tfl-relay env OUT=$OUT $PY $LAB/lab_api.py server $((DUR+15)) &
 else
   ENRARG="--enr gekMdn0XjZoWF/mD"
 fi
@@ -26,7 +26,7 @@ if [ "$MODE" = splice ]; then
   sleep 4
 fi
 if [ "${HARVEST:-0}" = 1 ]; then
-  ip netns exec tfl-cam $PY $LAB/lab_api.py client > $OUT/api.json 2>&1
+  ip netns exec tfl-cam env OUT=$OUT $PY $LAB/lab_api.py client > $OUT/api.json 2>&1
   sleep 1
 fi
 ip netns exec tfl-mid $TCPDUMP -ni eth0 -s0 -U -w $OUT/mid.pcap udp >/dev/null 2>&1 &
@@ -39,7 +39,12 @@ ip netns exec tfl-cam env $PEERENV $PY $LAB/lab_peers.py cam $DUR > $OUT/cam.jso
 wait $PH
 sleep 1
 kill $TD 2>/dev/null
-[ "$MODE" = splice ] && { kill -INT $SP 2>/dev/null; sleep 3; kill $SP 2>/dev/null; }
+if [ "$MODE" = splice ]; then
+  # `ip netns exec` forks, so $SP is not the tool's pid: signal everything
+  # in the mid namespace, then make sure nothing outlives the lab
+  ip netns pids tfl-mid | xargs -r kill -INT 2>/dev/null; sleep 3
+  ip netns pids tfl-mid | xargs -r kill -9 2>/dev/null
+fi
 echo "== cam";   python3 -m json.tool $OUT/cam.json 2>/dev/null || cat $OUT/cam.json;   tail -3 $OUT/cam.err
 echo "== phone"; python3 -m json.tool $OUT/phone.json 2>/dev/null || cat $OUT/phone.json; tail -3 $OUT/phone.err
 [ -f $OUT/api.json ] && { echo "== api"; cat $OUT/api.json; }
