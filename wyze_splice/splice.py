@@ -554,8 +554,7 @@ class Splicer:
         # socket: until its conntrack entry is gone, the relay's replies
         # are de-NATed to the camera instead of reaching relay_face
         for pip, pport in peers:
-            conntrack_delete("-p", "udp", "-s", self.target, "--sport",
-                             str(cam_port), "-d", pip, "--dport", str(pport))
+            conntrack_delete(self.target, cam_port, pip, pport)
         try:
             return self._splice(paths)
         finally:
@@ -569,11 +568,8 @@ class Splicer:
             # seeing the same public address
             for pip, pport in peers:
                 for src in (self.us, self.target):
-                    conntrack_delete("-p", "udp", "-s", src, "--sport",
-                                     str(cam_port), "-d", pip, "--dport",
-                                     str(pport))
-                conntrack_delete("-p", "udp", "-s", pip, "--sport", str(pport),
-                                 "-d", self.us, "--dport", str(cam_port))
+                    conntrack_delete(src, cam_port, pip, pport)
+                conntrack_delete(pip, pport, self.us, cam_port)
             self.stats["storm_dropped"] = self.storm_guard.dropped
             print(f"[+] divert removed. stats: {self.stats}")
 

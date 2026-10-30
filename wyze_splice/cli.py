@@ -126,26 +126,10 @@ def cmd_run(a):
     return 0 if spliced else 1
 
 
-def _find_ffmpeg():
-    """ffmpeg for the MP4 step: PATH, else build it with nix if present."""
-    if os.environ.get("FFMPEG") or shutil.which("ffmpeg"):
-        return True
-    if shutil.which("nix"):
-        r = subprocess.run(["nix", "build", "--no-link", "--print-out-paths",
-                            "nixpkgs#ffmpeg.bin"], capture_output=True, text=True)
-        for path in r.stdout.split():
-            if os.path.exists(f"{path}/bin/ffmpeg"):
-                os.environ["FFMPEG"] = f"{path}/bin/ffmpeg"
-                return True
-    return False
-
-
 def _export(av, outdir):
     from .media import export
-    if not _find_ffmpeg():
-        print("[!] ffmpeg not found; writing video.h264 only")
     try:
-        r = export(str(av), str(outdir), mp4=_find_ffmpeg())
+        r = export(str(av), str(outdir))
     except Exception as e:  # noqa: BLE001
         print(f"[!] video export failed ({e}); "
               f"retry with: wyze-splice extract {av}")
@@ -153,8 +137,11 @@ def _export(av, outdir):
     if not r["frames"]:
         print("[!] no decodable video in av.bin")
         return
-    print(f"[+] video: {r['frames']} frames over {r['seconds']:.1f}s "
-          f"-> {r.get('mp4', r['h264'])}")
+    print(f"[+] video: {r['frames']} frames over {r['seconds']:.1f}s")
+    for m in r["mp4s"]:
+        size = f"{m['size'][0]}x{m['size'][1]}" if m["size"] else "?"
+        print(f"    {m['path']}: {size}, {m['frames']} frames, "
+              f"{m['seconds']:.1f}s")
     if r["dropped"]:
         print(f"    ({r['dropped']} frames dropped: incomplete, or after an "
               f"incomplete I-frame; the camera stops completing I-frames "

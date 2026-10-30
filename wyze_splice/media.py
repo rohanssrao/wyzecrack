@@ -32,15 +32,11 @@ frames), so parsing them with the 36-byte layout corrupts exactly the
 frames that start a new picture. Bit 0x01 marks a frame's last packet.
 
 Output: one Annex-B .h264 per channel, ordered by first appearance.
-Verified against capture splice3 (fw 4.36.17.21): H.264 640x360 decodable
-by ffmpeg.
+Verified against live captures (fw 4.36.17.21): H.264 640x360.
 """
 
+import os
 import struct
-import sys
-import time
-
-START = time.time()
 
 VIDEO_CHANNELS = (5, 6, 7)
 
@@ -119,39 +115,6 @@ def frame_times(path, direction=1):
     return times
 
 
-def write_timed(outdir, extract, times, channels=VIDEO_CHANNELS):
-    """Per-channel frame fragments + ffconcat manifests with wall-clock
-    durations, for true-speed VFR MP4s (ffmpeg -f concat -safe 0)."""
-    import os
-    manifests = []
-    for ch in channels:
-        if ch not in extract:
-            continue
-        chdir = os.path.join(outdir, f"ch{ch}")
-        os.makedirs(chdir, exist_ok=True)
-        lines = ["ffconcat version 1.0"]
-        n = 0
-        t_prev = None
-        for frame_no, blob, ended in extract[ch]:
-            t = times.get((ch, frame_no))
-            if t is None or not ended or b"\x00\x00\x01" not in blob[:4096]:
-                continue
-            frag = os.path.join(chdir, f"f{n:05d}.h264")
-            with open(frag, "wb") as f:
-                f.write(blob)
-            dur = max(0.01, t - t_prev) if t_prev is not None else 0.04
-            lines.append(f"file '{os.path.basename(frag)}'")
-            lines.append(f"duration {dur:.3f}")
-            t_prev = t
-            n += 1
-        if n:
-            manifest = os.path.join(chdir, "frames.ffconcat")
-            with open(manifest, "w") as f:
-                f.write("\n".join(lines) + "\n")
-            manifests.append(manifest)
-    return manifests
-
-
 def extract_combined(path, direction=1):
     """All video frames (channels 5/6/7) merged in capture order — the
     P-frames on one channel reference SPS/PPS delivered on another, so
@@ -203,149 +166,107 @@ def direction_reader(path, direction):
             yield d, ts, p
 
 
-def live(path, outdir, poll=0.25, channels=VIDEO_CHANNELS):
-    """Tail av.bin as it grows; reassemble frames incrementally; emit
-    each completed frame to outdir/frames/ as f%05d.h264 the moment its
-    end packet lands. Yields (ch, frame_no, blob, t) per frame."""
-    import os
-    import time
-    os.makedirs(os.path.join(outdir, "frames"), exist_ok=True)
-    state = {}   # (ch, frame_no) -> {"pkts": [...], "end": bool}
-    n = 0
-    seen_off = 0
-    while True:
-        data = open(path, "rb").read()
-        off = seen_off
-        new = 0
-        while off + 13 <= len(data):
-            d, ts, ln = struct.unpack_from("<BdI", data, off)
-            if off + 13 + ln > len(data):
-                break            # partial write; retry next poll
-            p = data[off + 13 : off + 13 + ln]
-            off += 13 + ln
-            m = parse_media(p) if d == 1 else None
-            if m is None or m[0] not in channels:
-                continue
-            ch, frame_no, cidx, payload, end = m
-            key = (ch, frame_no)
-            if key not in state:
-                state[key] = {"pkts": [], "end": False}
-            f = state[key]
-            f["end"] |= end
-            f["pkts"].append((cidx, payload))
-            if f["end"]:
-                seen, merged = set(), []
-                for c, pl in sorted(f["pkts"]):
-                    if c in seen:
-                        continue
-                    seen.add(c)
-                    merged.append(pl)
-                blob = b"".join(merged)
-                frag = os.path.join(outdir, "frames", f"f{n:05d}.h264")
-                open(frag, "wb").write(blob)
-                n += 1
-                yield ch, frame_no, blob, ts
-                del state[key]
-        seen_off = off
-        if not new:
-            time.sleep(poll)
+def make_mp4(h264_path, mp4_path, frames):
+    """Remux the Annex-B stream into an MP4 without re-encoding, giving
+    each frame its arrival time as its timestamp, so playback runs at
+    true speed (relay delivery is bursty, so a fixed frame rate would
+    stretch quiet gaps and compress bursts).
 
-
-def make_mp4(h264_path, mp4_path, frames, ffmpeg=None):
-    """True-speed MP4 with per-frame PTS.
-
-    frames: [(t, ch, frame_no, blob, ended)] in stream order — the same
-    list that produced h264_path — supplies each frame's arrival time.
-
-    A uniform setpts stretch is wrong because delivery is bursty (relay
-    batching): quiet gaps would stretch and bursts compress. Instead:
-    pyav demuxes the stream, each packet is mapped back to its owning
-    frame blob by byte offset (corrupt blobs with no access unit never
-    demux, so they never display — same as live), each decoded frame is
-    written to a JPEG, and an ffconcat manifest with duration =
-    t[next] - t[this] drives the final encode: frame i is shown from
-    its arrival until the next frame arrives, exactly what a live
-    viewer would have seen. Falls back to a uniform stretch (approximate
-    pacing) when pyav/Pillow are unavailable."""
-    import os
-    import subprocess
-    import tempfile
-    if ffmpeg is None:
-        ffmpeg = os.environ.get("FFMPEG", "ffmpeg")
-    try:
-        import av
-        from bisect import bisect_right
-        starts, off = [], 0
-        for f in frames:
-            starts.append(off)
-            off += len(f[3])
-        work = tempfile.mkdtemp(prefix="avmp4_")
-        inp = av.open(h264_path)
+    frames: the [(t, ch, frame_no, blob, ended)] list that produced
+    h264_path, in order. Each demuxed packet is mapped back to its frame
+    by byte offset. Returns the number of frames written."""
+    import av
+    from bisect import bisect_right
+    from fractions import Fraction
+    starts, off = [], 0
+    for f in frames:
+        starts.append(off)
+        off += len(f[3])
+    tb = 90000
+    n, last = 0, -1
+    with av.open(h264_path, format="h264") as inp, \
+            av.open(mp4_path, "w", format="mp4") as out:
         vin = inp.streams.video[0]
-        order = []
-        for packet in inp.demux(vin):
-            pos = packet.pos if packet.pos is not None else 0
-            idx = max(0, bisect_right(starts, pos) - 1)
-            for frame in packet.decode():
-                frame.to_image().save(
-                    os.path.join(work, f"{len(order):06d}.jpg"),
-                    quality=92)
-                order.append(idx)
-        inp.close()
-        if not order:
-            raise RuntimeError("nothing decoded")
-        lines = ["ffconcat version 1.0"]
-        for i, idx in enumerate(order):
-            t = frames[idx][0]
-            t_next = (frames[order[i + 1]][0] if i + 1 < len(order)
-                      else t + 0.13)
-            lines.append(f"file '{i:06d}.jpg'")
-            lines.append(f"duration {max(0.01, t_next - t):.3f}")
-        lines.append(f"file '{len(order) - 1:06d}.jpg'")
-        manifest = os.path.join(work, "frames.ffconcat")
-        with open(manifest, "w") as f:
-            f.write("\n".join(lines) + "\n")
-        r = subprocess.run([ffmpeg, "-v", "error", "-f", "concat",
-                            "-safe", "0", "-i", manifest,
-                            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                            "-crf", "20", mp4_path, "-y"],
-                           capture_output=True, text=True)
-        if r.returncode:
-            raise RuntimeError(f"ffmpeg concat failed: {r.stderr[-400:]}")
-        return len(order)
-    except ImportError:
-        return _make_mp4_uniform(h264_path, mp4_path, frames, ffmpeg)
+        vout = out.add_stream_from_template(vin)
+        vout.time_base = Fraction(1, tb)
+        t0 = frames[0][0]
+        for i, pkt in enumerate(inp.demux(vin)):
+            if pkt.size == 0:
+                continue
+            idx = (bisect_right(starts, pkt.pos) - 1 if pkt.pos is not None
+                   and pkt.pos >= 0 else i)
+            ts = round((frames[min(max(idx, 0), len(frames) - 1)][0] - t0) * tb)
+            # relay bursts deliver frames microseconds apart; give each at
+            # least 10 ms on screen (the burst catches up at the next gap)
+            ts = max(ts, last + tb // 100)
+            last = ts
+            # the camera's stream has no B-frames, so pts == dts
+            pkt.pts = pkt.dts = ts
+            pkt.time_base = vout.time_base
+            pkt.stream = vout
+            out.mux(pkt)
+            n += 1
+    return n
 
 
-def _make_mp4_uniform(h264_path, mp4_path, frames, ffmpeg=None):
-    """Fallback (no pyav): uniform setpts stretch — approximate pacing
-    only; per-frame arrival gaps are bursty, so this compresses bursts
-    and stretches quiet gaps."""
-    import os
-    import subprocess
-    if ffmpeg is None:
-        ffmpeg = os.environ.get("FFMPEG", "ffmpeg")
-    if not frames:
-        raise RuntimeError("no frames")
-    span = frames[-1][0] - frames[0][0]
-    native_dur = len(frames) / 20.0
-    factor = max(0.01, span / native_dur) if native_dur > 0 else 1.0
-    subprocess.run([ffmpeg, "-v", "error", "-f", "h264", "-i", h264_path,
-                    "-vf", f"setpts=PTS*{factor:.4f}",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
-                    mp4_path, "-y"], check=True)
-    return len(frames)
+def last_frame_jpeg(h264_path, jpg_path):
+    """Decode the stream and save its last picture (needs Pillow)."""
+    import av
+    img = None
+    with av.open(h264_path, format="h264") as inp:
+        for frame in inp.decode(video=0):
+            img = frame.to_image()
+    if img is None:
+        return False
+    img.save(jpg_path, quality=92)
+    return True
 
 
-def export(av_bin, outdir, mp4=True, frame=True):
-    """av.bin -> outdir/video.h264 (clean GOPs only), and with mp4=True a
-    true-speed outdir/video.mp4 plus outdir/frame.jpg (needs pyav,
-    Pillow and ffmpeg). Returns a dict of what was written."""
-    import os
+def _sps(blob):
+    """The SPS NAL (bytes) of an access unit, or None."""
+    i = blob.find(b"\x00\x00\x01")
+    while i != -1 and i + 3 < len(blob):
+        if blob[i + 3] & 0x1F == 7:
+            j = blob.find(b"\x00\x00\x01", i + 3)
+            return blob[i + 3: j if j != -1 else len(blob)].rstrip(b"\x00")
+        i = blob.find(b"\x00\x00\x01", i + 3)
+    return None
+
+
+def segments(tagged):
+    """Split frames where the SPS changes. The app starts the live view
+    in SD and switches the camera to HD a few seconds in (640x360 ->
+    1920x1080 at an IDR), and an MP4 track holds one resolution."""
+    segs, cur = [], None
+    for t in tagged:
+        sps = _sps(t[3])
+        if sps is not None and sps != cur:
+            segs.append([])
+            cur = sps
+        if not segs:
+            segs.append([])
+        segs[-1].append(t)
+    return segs
+
+
+def _size(h264_path):
+    import av
+    with av.open(h264_path, format="h264") as inp:
+        for frame in inp.decode(video=0):
+            return frame.width, frame.height
+    return None
+
+
+def export(av_bin, outdir):
+    """av.bin -> outdir/video.h264 (all clean GOPs), one true-speed MP4
+    per resolution (video.mp4 is the longest; others are named
+    video-WxH.mp4) and frame.jpg, the last picture of video.mp4.
+    Returns what was written."""
     os.makedirs(outdir, exist_ok=True)
     every = extract_combined(av_bin)
     tagged = decodable(every)
-    res = {"frames": len(tagged), "dropped": len(every) - len(tagged)}
+    res = {"frames": len(tagged), "dropped": len(every) - len(tagged),
+           "mp4s": []}
     if not tagged:
         return res
     h264 = os.path.join(outdir, "video.h264")
@@ -353,87 +274,23 @@ def export(av_bin, outdir, mp4=True, frame=True):
         f.write(b"".join(t[3] for t in tagged))
     res["h264"] = h264
     res["seconds"] = tagged[-1][0] - tagged[0][0]
-    if mp4:
-        path = os.path.join(outdir, "video.mp4")
-        make_mp4(h264, path, tagged)
-        res["mp4"] = path
-        if frame:
-            import subprocess
+    segs = segments(tagged)
+    main = max(range(len(segs)), key=lambda i: len(segs[i]))
+    for i, seg in enumerate(segs):
+        part = os.path.join(outdir, f".seg{i}.h264")
+        with open(part, "wb") as f:
+            f.write(b"".join(t[3] for t in seg))
+        size = _size(part)
+        name = ("video.mp4" if i == main or size is None
+                else f"video-{size[0]}x{size[1]}.mp4")
+        mp4 = os.path.join(outdir, name)
+        make_mp4(part, mp4, seg)
+        res["mp4s"].append({"path": mp4, "size": size, "frames": len(seg),
+                            "seconds": seg[-1][0] - seg[0][0]})
+        if i == main:
+            res["mp4"] = mp4
             jpg = os.path.join(outdir, "frame.jpg")
-            r = subprocess.run([os.environ.get("FFMPEG", "ffmpeg"), "-v",
-                                "error", "-y", "-sseof", "-1", "-i", path,
-                                "-frames:v", "1", jpg], capture_output=True)
-            if r.returncode == 0:
+            if last_frame_jpeg(part, jpg):
                 res["frame"] = jpg
+        os.remove(part)
     return res
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} av.bin [outdir] [--timed|--live]",
-              file=sys.stderr)
-        return 2
-    outdir = (sys.argv[2] if len(sys.argv) > 2
-              and not sys.argv[2].startswith("-") else ".")
-    import os
-
-    if "--live" in sys.argv:
-        try:
-            for ch, frame_no, blob, t in live(sys.argv[1], outdir):
-                print(f"[live] ch{ch} frame {frame_no}: {len(blob)}B")
-        except KeyboardInterrupt:
-            return 0
-    os.makedirs(outdir, exist_ok=True)
-    if "--combined" in sys.argv:
-        every = extract_combined(sys.argv[1])
-        tagged = decodable(every)
-        blob = b"".join(t[3] for t in tagged)
-        path_out = os.path.join(outdir, "combined.h264")
-        open(path_out, "wb").write(blob)
-        n = len(tagged)
-        if n < len(every):
-            print(f"dropped {len(every) - n} of {len(every)} frames "
-                  f"(incomplete, or after an incomplete I-frame)")
-        span = (tagged[-1][0] - tagged[0][0]) if len(tagged) > 1 else 1.0
-        fps = (n - 1) / span if span > 0 else 25.0
-        print(f"{path_out}: {len(blob)} bytes, {n} frames over "
-              f"{span:.2f}s ({fps:.2f} fps)")
-        if "--mp4" in sys.argv:
-            mp4 = os.path.join(outdir, "realtime.mp4")
-            n = make_mp4(path_out, mp4, tagged)
-            print(f"{mp4}: true-speed MP4, {n} frames, per-frame PTS")
-        if "--live-fifo" in sys.argv:
-            fifo = os.path.join(outdir, "live.h264")
-            if not os.path.exists(fifo):
-                os.mkfifo(fifo)
-            print(f"live pipe: {fifo}")
-            print(f"view with: ffplay -probesize 32 -fflags nobuffer "
-                  f"-f h264 -vf setpts=PTS*{20/max(fps,0.01):.2f} -i {fifo}")
-            with open(fifo, "wb") as f:
-                t0 = None
-                for t, ch, frame_no, b_, ended in tagged:
-                    if t0 is None:
-                        t0 = t
-                    time.sleep(max(0, t - t0 - (time.time() - START)))
-                    f.write(b_)
-        return 0
-    if "--timed" in sys.argv:
-        for m in write_timed(os.path.join(outdir, "timed"),
-                             extract(sys.argv[1]),
-                             frame_times(sys.argv[1])):
-            print(f"timed manifest: {m}")
-        return 0
-    for ch, frs in sorted(extract(sys.argv[1]).items()):
-        blob = b"".join(b for _, b, _ in frs)
-        path = os.path.join(outdir, f"video_ch{ch}.h264" if ch in VIDEO_CHANNELS
-                            else f"media_ch{ch}.bin")
-        open(path, "wb").write(blob)
-        kind = "video" if ch in VIDEO_CHANNELS else "audio"
-        print(f"{path}: {len(blob)} bytes, {len(frs)} frames "
-              f"({sum(1 for f in frs if f[2])} ended) [{kind}]")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-

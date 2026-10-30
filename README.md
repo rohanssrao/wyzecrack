@@ -21,9 +21,11 @@ Only use this against cameras you own or are authorized to test.
   access to the camera, the phone or the Wyze account.
 - The camera's ENR. The tool harvests it the first time (see below) and
   caches it in `/var/lib/wyze-splice/enr.json`; `--enr` skips that.
-- `iptables` (with the TPROXY target), `ip`, `conntrack`, and `ffmpeg` for
-  the MP4. On NixOS, `conntrack` and `ffmpeg` are fetched with `nix` if
-  they're not on `PATH`.
+- `iptables` with the TPROXY target, `ip` (iproute2), and libpcap (for
+  scapy's packet filters). Everything else comes from the Python
+  dependencies: conntrack is handled over netlink with pyroute2, and the
+  MP4 and JPEG are written in-process with PyAV and Pillow, so there's no
+  `ffmpeg` or `conntrack` binary to install.
 
 Tested against a Wyze Cam v3 (WYZE_CAKP2JFUS) on firmware 4.36.17.21, with
 the phone app on cellular.

@@ -84,3 +84,14 @@ def test_decodable_drops_gop_after_incomplete_idr():
               (5, 5, 6, idr, True), (6, 7, 7, p, True)]
     kept = [f[2] for f in av_extract.decodable(frames)]
     assert kept == [1, 2, 6, 7]
+
+
+def test_segments_split_where_the_sps_changes():
+    sd = b"\x00\x00\x00\x01\x67\x4d\x00\x1e" + b"\x00\x00\x00\x01\x65\x88"
+    hd = b"\x00\x00\x00\x01\x67\x4d\x00\x29" + b"\x00\x00\x00\x01\x65\x88"
+    p = b"\x00\x00\x00\x01\x41\x9a"
+    frames = [(0, 5, 1, sd, True), (1, 7, 2, p, True),
+              (2, 5, 3, sd, True), (3, 7, 4, p, True),     # same SPS: same segment
+              (4, 5, 5, hd, True), (5, 7, 6, p, True)]
+    segs = av_extract.segments(frames)
+    assert [[f[2] for f in s] for s in segs] == [[1, 2, 3, 4], [5, 6]]
