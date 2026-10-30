@@ -62,7 +62,9 @@ boot, on motion alarms and every few hours: walk past the camera to trigger
 one. The ENR is then cached per camera in `/var/lib/wyze-splice/enr.json`.
 
 Tested against a Wyze Cam v3 (WYZE_CAKP2JFUS) on firmware 4.36.17.21, with
-the phone app on cellular.
+the phone app on cellular, from a NixOS host. The lab suite also passes on
+Debian 12 (iptables 1.8.9, nf_tables backend); `lab/debian-check.sh` runs
+it in a throwaway container.
 
 ## How it works
 

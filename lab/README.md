@@ -27,9 +27,15 @@ Run as root on Linux, from the repo after `uv sync`:
     sudo HARVEST=1 bash lab/lab_run.sh splice       # no --enr: harvest it from the camera's HTTPS
                                                     # first, and save its motion-clip upload
     sudo bash lab/arp_check.sh           # the ARP step: camera-only poison, then restore
-    sudo bash lab/labsuite.sh            # all of the above; one PASS/FAIL line each in /tmp/wslab-suite.txt
+    sudo bash lab/labsuite.sh            # all of the above, plus teardown under SIGTERM,
+                                         # SIGHUP, double Ctrl-C and SIGKILL; one PASS/FAIL
+                                         # line each in /tmp/wslab-suite.txt
+    sudo bash lab/debian-check.sh        # unit tests + suite on stock Debian 12 (podman/docker)
 
-Pass criteria: both peers report `handshake_done`, the phone's `media_ok`
-equals `expected_media` with `media_bad` 0, and each side only sees the
+After every splice run the lab checks that the tool left nothing behind in
+the mid namespace (TPROXY/REDIRECT/FORWARD rules, the policy route,
+`accept_local`, the journal). Pass criteria: both peers report
+`handshake_done`, the phone's `media_ok` equals `expected_media` with
+`media_bad` 0, and each side only sees the
 other's real address in `srcs`. Captures and logs land in `/tmp/wslab-out`.
 `lab_run.sh` captures the mid box with `tcpdump` (override with `TCPDUMP=`).
