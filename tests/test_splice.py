@@ -71,8 +71,8 @@ class TestWatcherLatch(unittest.TestCase):
     bursts (0x1102/0x1202), STUN, or established media (rt=23)."""
 
     def _pkt(self, src, dst, sport, dport, payload):
-        from scapy.all import IP, UDP, Raw
-        return IP(src=src, dst=dst) / UDP(sport=sport, dport=dport) / Raw(payload)
+        from wyze_splice.rawnet import UdpPacket
+        return UdpPacket(src, dst, sport, dport, payload)
 
     def _watcher(self):
         from wyze_splice.splice import RelayFlowWatcher
@@ -488,12 +488,12 @@ class TestRelatchReason(unittest.TestCase):
         self.assertEqual(len(cleanup), 2 * 3 + 2)
 
     def test_watcher_sees_relay_replies_to_our_nat_address(self):
-        from scapy.all import IP, UDP
+        from wyze_splice.rawnet import UdpPacket
         from wyze_splice.splice import RelayFlowWatcher
         w = RelayFlowWatcher("192.168.1.20", masq_ip="192.168.1.2")
         open_ = (b"\x51\xcc\x00\x00\x02\x11\x28\x00" + bytes(44))
-        cam = IP(src="192.168.1.20", dst="198.51.100.152") / UDP(sport=52586, dport=44369) / open_
-        rly = IP(src="198.51.100.152", dst="192.168.1.2") / UDP(sport=44369, dport=52586) / open_
+        cam = UdpPacket("192.168.1.20", "198.51.100.152", 52586, 44369, open_)
+        rly = UdpPacket("198.51.100.152", "192.168.1.2", 44369, 52586, open_)
         w._cb(cam)          # camera opens; its port becomes known
         w._cb(rly)          # relay answers our NAT address
         w._cb(cam)          # camera's next channel-open latches

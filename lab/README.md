@@ -24,6 +24,7 @@ Run as root on Linux, from the repo after `uv sync`:
                                          # camera closes the spliced channel early; the app retries elsewhere
     sudo MEDIA_PPS=250 bash lab/lab_run.sh splice   # throughput
     sudo HARVEST=1 bash lab/lab_run.sh splice       # no --enr: harvest it from the camera's HTTPS first
+    sudo bash lab/arp_check.sh           # the ARP step: camera-only poison, then restore
     sudo bash lab/labsuite.sh            # all of the above; one PASS/FAIL line each in /tmp/wslab-suite.txt
 
 Pass criteria: both peers report `handshake_done`, the phone's `media_ok`

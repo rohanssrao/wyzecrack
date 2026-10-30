@@ -5,7 +5,6 @@ description = "Decrypt a Wyze Cam v3 live view on the network while the app keep
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=42",
-    "scapy>=2.5",
     "av>=12",
     "pillow>=10",
     "pyroute2>=0.9",

@@ -39,4 +39,5 @@ for spec in "direct-plain::direct" "splice-plain::splice" \
   cp /tmp/wslab-out/splice.out /tmp/wslab-$name.splice.out 2>/dev/null
   summ $name
 done
+echo "arp-poison: $(bash $L/arp_check.sh | tail -1)" >> $R
 echo DONE >> $R

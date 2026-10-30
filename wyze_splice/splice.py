@@ -33,15 +33,13 @@ import struct
 import time
 from pathlib import Path
 
-from .netutil import (conntrack_delete, ensure_libpcap, iface_for, ip_cmd,
-                      ipt, ipt_restore)
+from .netutil import conntrack_delete, iface_for, ip_cmd, ipt, ipt_restore
 from .tutk import (CMD_CHANNEL_OPEN, STUN_RELAY_PORT, is_clienthello_flight,
                    is_dtls_wrap, is_hs_flight, is_plain_clienthello, wrap_cmd)
 from .dtls import SpliceEngine
 
-ensure_libpcap()
-import threading  # noqa: E402
-from scapy.all import IP, UDP, sniff  # noqa: E402
+from . import rawnet
+import threading
 
 # never latch on DNS or NTP
 EXCLUDE_PORTS = {53, 123}
@@ -251,10 +249,9 @@ class RelayFlowWatcher:
         self.found.set()
 
     def _cb(self, pkt):
-        if IP not in pkt or UDP not in pkt:
-            return
-        payload = bytes(pkt[UDP].payload)
-        src, dst = pkt[IP].src, pkt[IP].dst
+        """pkt: rawnet.UdpPacket"""
+        payload = pkt.payload
+        src, dst = pkt.src, pkt.dst
         # inbound (phone via relay -> camera). Only a PLAIN ClientHello
         # marks the tuple (run-6: ghost flows from abandoned sessions
         # retransmit cookie-CHs and CKEs for 15s+; a mark from those let
@@ -262,14 +259,14 @@ class RelayFlowWatcher:
         # app's retry window). The mark's TTL (INBOUND_TTL) is sized to
         # the ~1.1s CH-to-camera-flight gap, not to session lifetime.
         if src == self.target:
-            self.cam_ports.add(pkt[UDP].sport)
+            self.cam_ports.add(pkt.sport)
         if dst == self.target or (dst == self.masq_ip
-                                  and pkt[UDP].dport in self.cam_ports):
+                                  and pkt.dport in self.cam_ports):
             if (is_plain_clienthello(payload)
-                    and pkt[UDP].sport not in EXCLUDE_PORTS
-                    and pkt[UDP].dport not in EXCLUDE_PORTS):
+                    and pkt.sport not in EXCLUDE_PORTS
+                    and pkt.dport not in EXCLUDE_PORTS):
                 now = time.time()
-                self.inbound_1502[(src, pkt[UDP].sport)] = now
+                self.inbound_1502[(src, pkt.sport)] = now
                 stale = [k for k, t in self.inbound_1502.items()
                          if now - t > 300]
                 for k in stale:
@@ -278,9 +275,9 @@ class RelayFlowWatcher:
             # pre-CH latch below
             if (len(payload) > 24 and payload[:2] == b"\x51\xcc"
                     and wrap_cmd(payload) == CMD_CHANNEL_OPEN
-                    and pkt[UDP].sport not in EXCLUDE_PORTS
-                    and pkt[UDP].dport not in EXCLUDE_PORTS):
-                self.inbound_1102[(src, pkt[UDP].sport)] = time.time()
+                    and pkt.sport not in EXCLUDE_PORTS
+                    and pkt.dport not in EXCLUDE_PORTS):
+                self.inbound_1102[(src, pkt.sport)] = time.time()
             # fast path: the phone's plain CH latches immediately when
             # the camera already opened the flow. This entry is
             # IMPERFECT -- the camera may have seen the phone's first
@@ -291,22 +288,22 @@ class RelayFlowWatcher:
             # session attempt.
             if (self.relay_port is None
                     and is_plain_clienthello(payload)
-                    and (src, pkt[UDP].sport) in self.seen
-                    and pkt[UDP].dport not in EXCLUDE_PORTS):
-                self._latch(src, pkt[UDP].sport, pkt[UDP].dport, "phone CH")
+                    and (src, pkt.sport) in self.seen
+                    and pkt.dport not in EXCLUDE_PORTS):
+                self._latch(src, pkt.sport, pkt.dport, "phone CH")
             return
         if src != self.target:
             return
-        if pkt[UDP].dport in EXCLUDE_PORTS or pkt[UDP].sport in EXCLUDE_PORTS:
+        if pkt.dport in EXCLUDE_PORTS or pkt.sport in EXCLUDE_PORTS:
             return
         o1 = int(dst.split(".")[0])
         if o1 in (10, 127) or o1 >= 224:
             return
-        key = (dst, pkt[UDP].dport)
+        key = (dst, pkt.dport)
         c = self.seen.get(key)
         if c is None:
             c = self.seen[key] = [time.time(), 0]
-            print(f"[*] new public flow: {key[0]}:{key[1]} (cam port {pkt[UDP].sport})")
+            print(f"[*] new public flow: {key[0]}:{key[1]} (cam port {pkt.sport})")
         c[1] += 1
         self.last_seen[key] = time.time()
         cmd = (wrap_cmd(payload)
@@ -326,7 +323,7 @@ class RelayFlowWatcher:
                 and key not in self.tried
                 and time.time() - c[0] < 10
                 and time.time() - self.inbound_1102.get(key, 0) < 2):
-            self._latch(key[0], key[1], pkt[UDP].sport, "channel-open")
+            self._latch(key[0], key[1], pkt.sport, "channel-open")
             return
         # CONFIRMED FALLBACK: the camera's first outbound handshake
         # flight (rt=22/ep=0) with a fresh plain-CH mark on the same
@@ -339,7 +336,7 @@ class RelayFlowWatcher:
         if (self.relay_port is None and is_hs_flight(payload)
                 and time.time() - self.inbound_1502.get(key, 0)
                 < INBOUND_TTL):
-            self._latch(key[0], key[1], pkt[UDP].sport, "1502-confirmed")
+            self._latch(key[0], key[1], pkt.sport, "1502-confirmed")
             return
         # RATE FALLBACK: handshake-burst confirmation for flows whose
         # camera flight somehow fails is_hs_flight. Control and
@@ -352,22 +349,20 @@ class RelayFlowWatcher:
                 and is_hs_flight(payload)
                 and time.time() - self.inbound_1502.get(key, 0)
                 < INBOUND_TTL):
-            self._latch(key[0], key[1], pkt[UDP].sport, "rate-confirmed")
+            self._latch(key[0], key[1], pkt.sport, "rate-confirmed")
 
     def wait(self, timeout=300):
-        # A suspend/resume can tear the sniffer down mid-session (scapy
-        # raises when the iface disappears); retry instead of dying so a
-        # long-running watcher survives the host sleeping.
+        # A suspend/resume can tear the sniffer down mid-session (the
+        # interface disappears); retry instead of dying so a long-running
+        # watcher survives the host sleeping.
         deadline = time.time() + timeout
+        prog = rawnet.udp_filter([self.target], [self.masq_ip])
         while not self.found.is_set() and time.time() < deadline:
             try:
-                sniff(iface=iface_for(self.target),
-                      filter=(f"udp and (host {self.target} or "
-                              f"dst host {self.masq_ip})"),
-                      prn=self._cb, store=False,
-                      stop_filter=lambda _: self.found.is_set(),
-                      timeout=max(1, deadline - time.time()))
-            except Exception as e:
+                rawnet.sniff(iface_for(self.target), prog, rawnet.parse_udp,
+                             self._cb, self.found.is_set,
+                             timeout=max(1, deadline - time.time()))
+            except OSError as e:
                 print(f"[!] sniffer error ({e}); retrying in 5s")
                 time.sleep(5)
         return self.found.is_set()
