@@ -1,0 +1,21 @@
+[project]
+name = "wyze-splice"
+version = "0.1.0"
+description = "Decrypt a Wyze Cam v3 live view on the network while the app keeps playing"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42",
+    "scapy>=2.5",
+    "av>=12",
+    "pillow>=10",
+]
+
+[project.scripts]
+wyze-splice = "wyze_splice.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
