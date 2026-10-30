@@ -57,9 +57,12 @@ def server(seconds):
     s.bind(ADDR)
     s.listen(4)
     s.settimeout(seconds)
-    try:
-        while True:
+    while True:
+        try:
             c, _ = s.accept()
+        except (socket.timeout, OSError):
+            return
+        try:
             with ctx.wrap_socket(c, server_side=True) as t:
                 t.settimeout(5)
                 buf = t.recv(65536)
@@ -67,12 +70,16 @@ def server(seconds):
                 n = int(dict(l.split(b": ", 1) for l in head.split(b"\r\n")[1:]
                              if b": " in l).get(b"Content-Length", b"0"))
                 while len(rest) < n:
-                    rest += t.recv(65536)
+                    chunk = t.recv(65536)
+                    if not chunk:
+                        break
+                    rest += chunk
                 body = b'{"code":"1","msg":"SUCCESS"}'
                 t.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
                           % (len(body), body))
-    except (socket.timeout, OSError):
-        pass
+                print("served", len(rest), "of", n, flush=True)
+        except Exception as e:  # noqa: BLE001
+            print("server error:", repr(e), flush=True)
 
 
 def client():
@@ -91,17 +98,32 @@ def client():
            b"Content-Type:application/octet-stream\r\nContent-Length: %d\r\n\r\n"
            % (CLIP_PATH.encode(), len(clip))) + clip
     replies = []
+    step = "post"
     try:
         for host, req in (("api.wyzecam.com", post),
                           ("cpl-t-sightsafe.wyzecam.com", put)):
+            step = host
             with ctx.wrap_socket(socket.create_connection(ADDR, timeout=10),
                                  server_hostname=host) as t:
                 t.sendall(req)
                 replies.append(t.recv(4096).decode()[-30:])
-        print(json.dumps({"ok": True, "replies": replies,
+        # a non-Wyze name must pass through untouched: the camera then
+        # sees the real server's own certificate, not an eMudhra leaf
+        step = "passthrough"
+        raw = ssl.create_default_context()
+        raw.check_hostname, raw.verify_mode = False, ssl.CERT_NONE
+        with raw.wrap_socket(socket.create_connection(ADDR, timeout=10),
+                             server_hostname="wyze-iot.s3.us-west-2.amazonaws.com") as t:
+            from cryptography import x509
+            cert = x509.load_der_x509_certificate(t.getpeercert(binary_form=True))
+            passthrough = cert.issuer == cert.subject       # the server's self-signed
+            t.sendall(b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            t.recv(4096)
+        print(json.dumps({"ok": passthrough, "replies": replies,
+                          "passthrough": passthrough,
                           "clip_sha": hashlib.sha256(clip).hexdigest()}))
     except Exception as e:  # noqa: BLE001
-        print(json.dumps({"ok": False, "error": repr(e)}))
+        print(json.dumps({"ok": False, "step": step, "error": repr(e)}))
 
 
 if __name__ == "__main__":

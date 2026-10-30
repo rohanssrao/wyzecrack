@@ -18,8 +18,10 @@ the camera's requests:
 import datetime as dt
 import ipaddress
 import json
+import os
 import re
 import select
+import shutil
 import socket
 import ssl
 import struct
@@ -117,6 +119,7 @@ uL5ChFWOQU+ErSDnUq7yr+pjBQ==
 
 SO_ORIGINAL_DST = 80
 INTERCEPT_PORT = 18443
+DEBUG = bool(os.environ.get("WYZE_SPLICE_DEBUG"))
 # PUT /<MAC>/<date>/<alarm id>_<alarm ms>_<n>_<file type>_<n>/<uuid>_1.<ext>
 EVENT_PATH_RE = re.compile(rb"^/[0-9A-F]{12}/[0-9-]+/([0-9A-F]+)_(\d{13})_\d+_(\d)_\d+/"
                            rb"[0-9a-f]+_\d+\.(jpg|mp4)")
@@ -144,7 +147,10 @@ def mint_leaf(host, workdir):
     except ValueError:
         san = x509.DNSName(host)
     cert = (x509.CertificateBuilder()
-            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+            # a CN is limited to 64 characters; the SAN is what clients check
+            .subject_name(x509.Name(
+                [x509.NameAttribute(NameOID.COMMON_NAME, host)]
+                if len(host) <= 64 else []))
             .issuer_name(icert.subject)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
@@ -174,9 +180,49 @@ def find_enr(buf):
     m = ENR_RE.search(buf)
     if not m:
         return None
-    enr = json.loads(b'"' + m.group(1) + b'"')
+    try:
+        enr = json.loads(b'"' + m.group(1) + b'"')
+    except ValueError:
+        return None
     mac = MAC_RE.search(buf)
     return enr, mac.group(1).decode().upper() if mac else None
+
+
+# Only Wyze's own names are terminated; everything else the camera sends
+# to tcp/443 (firmware and model downloads from S3, anything pinned,
+# non-TLS) is relayed as raw TCP, untouched.
+INTERCEPT_SUFFIX = ".wyzecam.com"
+
+
+def intercepts(sni):
+    return bool(sni) and sni.lower().endswith(INTERCEPT_SUFFIX)
+
+
+def client_hello_sni(data):
+    """SNI from the start of a TLS stream: a str, "" if the ClientHello
+    has none, or None if the bytes are not (yet) a whole ClientHello."""
+    if len(data) < 5 or data[0] != 0x16:
+        return None
+    rec_len = struct.unpack("!H", data[3:5])[0]
+    body = data[5:5 + rec_len]
+    if len(body) < rec_len or len(body) < 42 or body[0] != 1:
+        return None
+    try:
+        i = 4 + 2 + 32                         # hs header, version, random
+        i += 1 + body[i]                       # session id
+        i += 2 + struct.unpack("!H", body[i:i + 2])[0]   # cipher suites
+        i += 1 + body[i]                       # compression
+        end = i + 2 + struct.unpack("!H", body[i:i + 2])[0]
+        i += 2
+        while i + 4 <= end:
+            etype, elen = struct.unpack("!HH", body[i:i + 4])
+            if etype == 0:                     # server_name
+                n = struct.unpack("!H", body[i + 7:i + 9])[0]
+                return body[i + 9:i + 9 + n].decode("ascii", "replace")
+            i += 4 + elen
+    except (IndexError, struct.error):
+        return None
+    return ""
 
 
 def original_dst(sock):
@@ -193,7 +239,7 @@ class RequestTap:
 
     def __init__(self, on_request):
         self.on_request = on_request
-        self.buf = b""
+        self.buf = bytearray()
         self.dead = False
 
     def feed(self, data):
@@ -206,7 +252,7 @@ class RequestTap:
                 if len(self.buf) > 65536:
                     self.dead = True
                 return
-            head = self.buf[:end].split(b"\r\n")
+            head = bytes(self.buf[:end]).split(b"\r\n")
             parts = head[0].split(b" ")
             if len(parts) != 3 or not parts[2].startswith(b"HTTP/"):
                 self.dead = True
@@ -228,9 +274,10 @@ class RequestTap:
                 return
             if len(self.buf) < end + 4 + n:
                 return
-            body = self.buf[end + 4:end + 4 + n]
-            self.buf = self.buf[end + 4 + n:]
-            self.on_request(parts[0].decode(), parts[1], headers, body)
+            body = bytes(self.buf[end + 4:end + 4 + n])
+            del self.buf[:end + 4 + n]
+            self.on_request(parts[0].decode("latin-1"), bytes(parts[1]),
+                            headers, body)
 
 
 def event_name(path):
@@ -245,31 +292,32 @@ def event_name(path):
 
 
 class CloudTap:
-    """Transparent TLS interceptor for the camera's tcp/443.
+    """Transparent interceptor for the camera's tcp/443.
 
-    Every connection is relayed to its real destination with the camera's
-    SNI. `enr_found` is set when an ENR is seen; with events_dir set,
-    motion-event uploads are saved there as <time>_<id>/clip.mp4 and
-    snapshot.jpg."""
+    Connections whose SNI is a *.wyzecam.com name are terminated with an
+    eMudhra-chained leaf and relayed to the real server under the same
+    SNI; all others are relayed as raw TCP. `enr_found` is set when an
+    ENR is seen; with events_dir set, motion-event uploads are saved
+    there as <time>_<id>/clip.mp4 and snapshot.jpg.
 
-    def __init__(self, cam_ip, port=INTERCEPT_PORT, events_dir=None,
+    listen() binds (do it before going on-path), start() installs the
+    redirect, stop() removes it."""
+
+    def __init__(self, changes, cam_ip, port=INTERCEPT_PORT, events_dir=None,
                  on_event=None):
+        self.changes = changes
         self.cam_ip, self.port = cam_ip, port
         self.events_dir = Path(events_dir) if events_dir else None
         self.on_event = on_event
         self.enr_found = threading.Event()
         self.enr = self.mac = None
         self.events = []
+        self.stats = {"connections": 0, "intercepted": 0, "passed": 0,
+                      "tls_failed": 0}
         self.hosts = {}
         self._work = tempfile.mkdtemp(prefix="wyze-splice-certs-")
         self._ctx_lock = threading.Lock()
-        self._rules = [
-            ("-t", "nat", "PREROUTING", "-s", cam_ip, "-p", "tcp",
-             "--dport", "443", "-j", "REDIRECT", "--to-ports", str(port)),
-            ("-t", "filter", "INPUT", "-s", cam_ip, "-p", "tcp",
-             "--dport", str(port), "-j", "ACCEPT"),
-        ]
-        self._installed = []
+        self._tokens = []
         self._srv = None
 
     def _ctx_for(self, host):
@@ -278,62 +326,117 @@ class CloudTap:
             if ctx is None:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(*mint_leaf(host, self._work))
-                ctx.sni_callback = self._pick
                 self.hosts[host] = ctx
             return ctx
 
-    def _pick(self, sslsock, name, _ctx):
-        # remember the name for the upstream leg, then present a leaf for it
-        sslsock.sni_name = name
-        if name:
-            sslsock.context = self._ctx_for(name)
-
-    def start(self):
+    def listen(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", self.port))
+        try:
+            srv.bind(("0.0.0.0", self.port))
+        except OSError as e:
+            srv.close()
+            raise SystemExit(f"TCP port {self.port} is busy ({e.strerror})")
         srv.listen(32)
         self._srv = srv
         threading.Thread(target=self._accept, daemon=True).start()
-        for r in self._rules:
-            if ipt(r[0], r[1], "-I", r[2], "1", *r[3:]).returncode == 0:
-                self._installed.append(r)
+
+    def start(self):
+        if self._srv is None:
+            self.listen()
+        for table, chain, spec in (
+                ("nat", "PREROUTING", ["-s", self.cam_ip, "-p", "tcp",
+                                       "--dport", "443", "-j", "REDIRECT",
+                                       "--to-ports", str(self.port)]),
+                ("filter", "INPUT", ["-s", self.cam_ip, "-p", "tcp",
+                                     "--dport", str(self.port), "-j",
+                                     "ACCEPT"])):
+            self._tokens.append(self.changes.add(
+                "ipt", args=["-t", table, "-D", chain, *spec]))
+            ipt("-t", table, "-I", chain, "1", *spec)
 
     def stop(self):
-        for r in reversed(self._installed):
-            ipt(r[0], r[1], "-D", r[2], *r[3:])
-        self._installed = []
+        """Remove the redirect (new connections go straight to the cloud)
+        and stop listening; relays in flight finish on their own."""
+        self.changes.undo(self._tokens)
+        self._tokens = []
         if self._srv:
             try:
-                self._srv.close()
+                self._srv.shutdown(socket.SHUT_RDWR)   # wakes accept()
             except OSError:
                 pass
+            self._srv.close()
             self._srv = None
+        shutil.rmtree(self._work, ignore_errors=True)
 
     def _accept(self):
         while True:
-            try:
-                c, _ = self._srv.accept()
-            except (OSError, AttributeError):
+            srv = self._srv
+            if srv is None:
                 return
+            try:
+                c, peer = srv.accept()
+            except OSError:
+                return
+            if peer[0] != self.cam_ip:
+                c.close()          # only the camera's redirected traffic
+                continue
             threading.Thread(target=self._handle, args=(c,), daemon=True).start()
+
+    def _peek_hello(self, c):
+        """Wait (briefly) for the client's first bytes; returns the SNI
+        decision of client_hello_sni, or None for non-TLS/no data."""
+        deadline = time.monotonic() + 10
+        data = b""
+        while time.monotonic() < deadline:
+            c.settimeout(max(0.1, deadline - time.monotonic()))
+            try:
+                data = c.recv(16384, socket.MSG_PEEK)
+            except socket.timeout:
+                return None
+            if not data:
+                return None
+            sni = client_hello_sni(data)
+            if sni is not None or data[0] != 0x16 or len(data) >= 16384:
+                return sni
+            time.sleep(0.05)
+        return None
 
     def _handle(self, c):
         up = None
+        self.stats["connections"] += 1
         try:
             dst = original_dst(c)
+            if dst[1] == self.port or is_local(dst[0]):
+                return             # never relay into ourselves
+            sni = self._peek_hello(c)
+            if DEBUG:
+                print(f"[d] camera -> {dst[0]}:{dst[1]} sni={sni!r} "
+                      f"{'intercept' if intercepts(sni) else 'pass'}")
+            if not intercepts(sni):
+                self.stats["passed"] += 1
+                up = socket.create_connection(dst, timeout=15)
+                _pump(c, up, None)
+                return
             c.settimeout(15)
-            # without SNI the leaf names the destination IP
-            tc = self._ctx_for(dst[0]).wrap_socket(c, server_side=True)
-            sni = getattr(tc, "sni_name", None)
+            try:
+                tc = self._ctx_for(sni).wrap_socket(c, server_side=True)
+            except (ssl.SSLError, OSError):
+                # the camera refused our certificate
+                self.stats["tls_failed"] += 1
+                return
+            self.stats["intercepted"] += 1
             cctx = ssl.create_default_context()
             cctx.check_hostname = False
             cctx.verify_mode = ssl.CERT_NONE
             raw = socket.create_connection(dst, timeout=15)
             up = cctx.wrap_socket(raw, server_hostname=sni)
-            self._relay(tc, up, RequestTap(self._on_request))
-        except (OSError, ssl.SSLError, ValueError):
-            pass
+            _pump(tc, up, RequestTap(self._on_request))
+        except (OSError, ssl.SSLError, ValueError) as e:
+            if DEBUG:
+                import traceback
+                traceback.print_exc()
+            self.stats["errors"] = self.stats.get("errors", 0) + 1
         finally:
             for s in (c, up):
                 try:
@@ -357,23 +460,52 @@ class CloudTap:
                 if self.on_event:
                     self.on_event(d / name[1])
 
-    def _relay(self, a, b, tap):
-        """Pump a<->b until either side closes, feeding a->b to the tap."""
-        for s in (a, b):
-            s.settimeout(1)
-        while True:
-            ready = [s for s in (a, b) if s.pending()]
+
+# per-operation timeout and idle cutoff for relayed connections: generous,
+# so slow uploads and quiet keep-alive connections are never cut short
+IO_TIMEOUT = 60
+IDLE_TIMEOUT = 900
+
+
+def _pump(a, b, tap):
+    """Relay a<->b until either side closes (a is the camera's side),
+    feeding a->b bytes to the tap. Reads never block (a readable TLS
+    socket may hold only a partial record, or a post-handshake message
+    such as a TLS 1.3 session ticket that carries no data); writes block
+    for up to IO_TIMEOUT. Tap errors disable the tap, never the
+    connection."""
+    tls = hasattr(a, "pending")
+    while True:
+        ready = [s for s in (a, b) if tls and s.pending()]
+        if not ready:
+            ready, _, _ = select.select([a, b], [], [], IDLE_TIMEOUT)
             if not ready:
-                ready, _, _ = select.select([a, b], [], [], 30)
-                if not ready:
-                    return
-            for s in ready:
+                return
+        for s in ready:
+            s.settimeout(0)
+            try:
+                data = s.recv(65536)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError,
+                    BlockingIOError, socket.timeout):
+                continue
+            if not data:
+                return
+            dst = b if s is a else a
+            dst.settimeout(IO_TIMEOUT)
+            dst.sendall(data)
+            if s is a and tap and not tap.dead:
                 try:
-                    data = s.recv(65536)
-                except (socket.timeout, ssl.SSLWantReadError):
-                    continue
-                if not data:
-                    return
-                (b if s is a else a).sendall(data)
-                if s is a:
                     tap.feed(data)
+                except Exception as e:  # noqa: BLE001
+                    tap.dead = True
+                    print(f"[!] stopped reading a camera connection ({e!r})")
+
+
+def is_local(ip):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((ip, 0))
+        s.close()
+        return True
+    except OSError:
+        return False

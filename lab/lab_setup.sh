@@ -4,7 +4,11 @@
 # cam's default route points at mid (what the camera-only ARP poison does)
 # and mid NATs the camera's traffic out, so wyze-splice runs with --on-path.
 set -eu
-down() { for n in tfl-cam tfl-mid tfl-gw tfl-relay tfl-lan; do ip netns del $n 2>/dev/null || true; done; }
+down() {
+  for n in tfl-cam tfl-mid tfl-gw tfl-relay tfl-lan; do ip netns del $n 2>/dev/null || true; done
+  # veths an aborted setup left in the root namespace
+  for l in v-cam v-mid v-gw v-gwo v-rl p-cam p-mid p-gw; do ip link del $l 2>/dev/null || true; done
+}
 if [ "${1:-up}" = down ]; then down; exit 0; fi
 down
 for n in tfl-lan tfl-cam tfl-mid tfl-gw tfl-relay; do ip netns add $n; ip -n $n link set lo up; done

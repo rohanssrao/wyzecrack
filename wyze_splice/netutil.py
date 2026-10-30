@@ -2,29 +2,33 @@
 and conntrack over netlink (pyroute2)."""
 import errno
 import socket
-import subprocess
+
+from .changes import run
 
 
 def ipt(*a):
-    return subprocess.run(["iptables", *a], capture_output=True, text=True)
+    return run(["iptables", *a])
 
 
 def ip_cmd(*a):
-    return subprocess.run(["ip", *a], capture_output=True, text=True)
+    return run(["ip", *a])
 
 
 def ipt_restore(blob):
-    return subprocess.run(["iptables-restore", "--noflush"], input=blob,
-                          capture_output=True, text=True)
+    return run(["iptables-restore", "--noflush"], input=blob)
 
 
 def route_get(dst):
-    return subprocess.run(["ip", "-4", "route", "get", dst],
-                          capture_output=True, text=True).stdout
+    return run(["ip", "-4", "route", "get", dst]).stdout
 
 
 def local_ip_for(dst):
-    return route_get(dst).split("src ")[1].split()[0]
+    """Our source address toward dst (for an on-link camera: our address
+    on the camera's LAN)."""
+    out = route_get(dst)
+    if "src " not in out:
+        raise OSError(f"no route to {dst}")
+    return out.split("src ")[1].split()[0]
 
 
 def iface_for(dst):
@@ -33,6 +37,27 @@ def iface_for(dst):
         # e.g. the link is down across a suspend/resume; callers retry
         raise OSError(f"no route to {dst}")
     return out.split("dev ")[1].split()[0]
+
+
+def on_link(dst):
+    """True if dst is reached directly, not through a gateway."""
+    out = route_get(dst)
+    return bool(out) and " via " not in out.split("\n")[0]
+
+
+def default_gateway(iface):
+    """The default route's next hop on iface, or None."""
+    out = run(["ip", "-4", "route", "show", "default", "dev", iface]).stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if "via" in parts:
+            return parts[parts.index("via") + 1]
+    return None
+
+
+def is_local_address(ip):
+    out = run(["ip", "-4", "route", "get", ip]).stdout
+    return out.startswith("local ")
 
 
 _CT = [None]

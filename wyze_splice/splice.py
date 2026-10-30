@@ -33,6 +33,7 @@ import struct
 import time
 from pathlib import Path
 
+from .changes import signals_held
 from .netutil import conntrack_delete, iface_for, ip_cmd, ipt, ipt_restore
 from .tutk import (CMD_CHANNEL_OPEN, STUN_RELAY_PORT, is_clienthello_flight,
                    is_dtls_wrap, is_hs_flight, is_plain_clienthello, wrap_cmd)
@@ -52,9 +53,12 @@ INBOUND_TTL = 5
 # on old tuples must not re-latch them. A plain CH (fresh session)
 # may still latch on a tried tuple.
 TRIED_TTL = 120
-SPLICE_PORT = 51820
-TP_MARK = "0x1"
-TP_TABLE = "100"
+# TPROXY listener port, and the mark/table/pref of its policy route;
+# chosen to stay clear of common users (51820 is WireGuard, mark 0x1 and
+# table 100 are popular in VPN and container setups)
+SPLICE_PORT = 47821
+TP_MARK = "0x5a170000/0xffff0000"
+TP_TABLE = "5917"
 IP_TRANSPARENT = 19  # SOL_IP option; the socket module may not define it
 IP_RECVTTL = getattr(socket, "IP_RECVTTL", 12)
 IP_TTL = getattr(socket, "IP_TTL", 2)
@@ -92,7 +96,26 @@ class StormGuard:
         return True
 
 
-def install_splice_rules(us, cam_ip, cam_port, peers):
+def tproxy_target():
+    return ["-j", "TPROXY", "--on-port", str(SPLICE_PORT),
+            "--tproxy-mark", TP_MARK]
+
+
+def divert_specs(us, cam_ip, cam_port, peers):
+    """(table, chain, rule spec) for one session's divert."""
+    specs = []
+    for pip, pport in peers:
+        specs.append(("mangle", "PREROUTING",
+                      ["-s", cam_ip, "-p", "udp", "--sport", str(cam_port),
+                       "-d", pip, "--dport", str(pport), *tproxy_target()]))
+        # firewalls (nixos-fw) drop unsolicited UDP to local sockets
+        specs.append(("filter", "INPUT",
+                      ["-s", pip, "-p", "udp", "--sport", str(pport),
+                       "-d", us, "--dport", str(cam_port), "-j", "ACCEPT"]))
+    return specs
+
+
+def install_splice_rules(changes, us, cam_ip, cam_port, peers):
     """Divert the camera's packets toward each peer (relay ip, port) to
     the splice, in ONE iptables-restore spawn (install speed matters
     inside the handshake window), and open an INPUT hole for the peers'
@@ -101,46 +124,51 @@ def install_splice_rules(us, cam_ip, cam_port, peers):
     control) stay with the kernel.
 
     Call this with the sockets already open: a divert with no reader
-    black-holes the flow. Returns (kind, undo-args) cleanup commands, or
-    None on failure."""
-    tp = f"-j TPROXY --on-port {SPLICE_PORT} --tproxy-mark {TP_MARK}/0x1"
-    mangle, filt = [], []
-    for pip, pport in peers:
-        mangle.append(f"-I PREROUTING 1 -s {cam_ip} -p udp --sport {cam_port} "
-                      f"-d {pip} --dport {pport} {tp}")
-        # firewalls (nixos-fw) drop unsolicited UDP to local sockets
-        filt.append(f"-I INPUT 1 -s {pip} -p udp --sport {pport} "
-                    f"-d {us} --dport {cam_port} -j ACCEPT")
-    blob = ("*mangle\n" + "\n".join(mangle) + "\nCOMMIT\n"
-            "*filter\n" + "\n".join(filt) + "\nCOMMIT\n")
+    black-holes the flow. Returns the journal tokens, or None on failure
+    (with anything partially installed already undone)."""
+    specs = divert_specs(us, cam_ip, cam_port, peers)
+    tokens = [changes.add("ipt", args=["-t", t, "-D", ch, *spec])
+              for t, ch, spec in specs]
+    blob = ""
+    for table in ("mangle", "filter"):
+        rules = [f"-I {ch} 1 " + " ".join(spec)
+                 for t, ch, spec in specs if t == table]
+        blob += f"*{table}\n" + "\n".join(rules) + "\nCOMMIT\n"
     res = ipt_restore(blob)
     if res.returncode != 0:
         print("[!] iptables-restore failed:", res.stderr.strip())
+        changes.undo(tokens)     # a table may have committed before the error
         return None
-    # policy route: marked packets are local
-    ip_cmd("rule", "add", "fwmark", TP_MARK, "pref", TP_TABLE, "table", TP_TABLE)
-    ip_cmd("route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", TP_TABLE)
-    tpa = ("-j", "TPROXY", "--on-port", str(SPLICE_PORT),
-           "--tproxy-mark", f"{TP_MARK}/0x1")
-    cleanup = []
-    for pip, pport in peers:
-        cleanup.append(
-            ("ipt", ("-t", "mangle", "-D", "PREROUTING", "-s", cam_ip, "-p",
-                     "udp", "--sport", str(cam_port), "-d", pip, "--dport",
-                     str(pport), *tpa)))
-        cleanup.append(
-            ("ipt", ("-t", "filter", "-D", "INPUT", "-s", pip, "-p", "udp",
-                     "--sport", str(pport), "-d", us, "--dport",
-                     str(cam_port), "-j", "ACCEPT")))
-    cleanup += [
-        ("ip", ("rule", "del", "fwmark", TP_MARK, "pref", TP_TABLE,
-                "table", TP_TABLE)),
-        ("ip", ("route", "del", "local", "0.0.0.0/0", "dev", "lo",
-                "table", TP_TABLE)),
-    ]
     print(f"[+] divert armed: {cam_ip}:{cam_port} -> "
           + ", ".join(f"{p[0]}:{p[1]}" for p in peers))
-    return cleanup
+    return tokens
+
+
+def install_policy_route(changes):
+    """Marked (diverted) packets are local: one ip rule + route for the
+    whole run. Raises SystemExit if they cannot be installed."""
+    rule = ["fwmark", TP_MARK, "pref", TP_TABLE, "table", TP_TABLE]
+    route = ["local", "0.0.0.0/0", "dev", "lo", "table", TP_TABLE]
+    tokens = [changes.add("ip", args=["rule", "del", *rule]),
+              changes.add("ip", args=["route", "del", *route])]
+    for args in (["rule", "add", *rule], ["route", "add", *route]):
+        r = ip_cmd(*args)
+        if r.returncode and "File exists" not in r.stderr:
+            changes.undo(tokens)
+            raise SystemExit(f"ip {' '.join(args)} failed: {r.stderr.strip()}")
+    return tokens
+
+
+def probe_tproxy(changes):
+    """Fail at startup, not at the first app attempt, when the kernel or
+    iptables lacks the TPROXY target."""
+    spec = ["-s", "0.0.0.1/32", "-p", "udp", *tproxy_target()]
+    tok = changes.add("ipt", args=["-t", "mangle", "-D", "PREROUTING", *spec])
+    r = ipt("-t", "mangle", "-I", "PREROUTING", "1", *spec)
+    changes.undo([tok])
+    if r.returncode:
+        raise SystemExit("iptables cannot use the TPROXY target "
+                         f"({r.stderr.strip()}); load the xt_TPROXY module")
 
 
 def recv_ttl(face):
@@ -230,6 +258,8 @@ class RelayFlowWatcher:
         self.tried = {}           # (ip, port) -> latch time (TRIED_TTL)
         self.last_seen = {}       # (ip, port) -> last camera packet time
         self.extra_paths = []     # STUN-relay :3478 tuples to divert too
+        self.n_from_cam = self.n_to_cam = 0   # forwarding health
+        self._warned = False
 
     def _latch(self, ip, port, cam_port, how):
         """Arm on (ip, port). Every latch records the tuple as tried so
@@ -260,6 +290,9 @@ class RelayFlowWatcher:
         # the ~1.1s CH-to-camera-flight gap, not to session lifetime.
         if src == self.target:
             self.cam_ports.add(pkt.sport)
+            self.n_from_cam += 1
+        elif dst == self.masq_ip and pkt.dport in self.cam_ports:
+            self.n_to_cam += 1
         if dst == self.target or (dst == self.masq_ip
                                   and pkt.dport in self.cam_ports):
             if (is_plain_clienthello(payload)
@@ -361,11 +394,22 @@ class RelayFlowWatcher:
             try:
                 rawnet.sniff(iface_for(self.target), prog, rawnet.parse_udp,
                              self._cb, self.found.is_set,
-                             timeout=max(1, deadline - time.time()))
+                             timeout=max(1, min(20, deadline - time.time())))
+                self._health()
             except OSError as e:
                 print(f"[!] sniffer error ({e}); retrying in 5s")
                 time.sleep(5)
         return self.found.is_set()
+
+    def _health(self):
+        """Warn once if the camera talks but nothing comes back to it
+        through us: something on this host drops forwarded traffic."""
+        if self._warned or self.n_from_cam < 30 or self.n_to_cam:
+            return
+        self._warned = True
+        print("[!] the camera is sending through this host but no replies "
+              "come back: is forwarded traffic blocked here (an nftables "
+              "firewall, or Docker/ufw rules the tool could not override)?")
 
     def rearm(self):
         """Back to watching after a session is torn down."""
@@ -417,15 +461,19 @@ def _relatch_reason(engine, latch_time, last_packet, now, last_cam=None):
 class Splicer:
     """Watch -> divert -> splice -> tear down, repeated per app attempt.
 
-    Expects this host to already be on the camera's path (OnPath). Writes
-    to `out`: av.bin (decrypted media, see media.py), splice.log (engine
-    milestones), interpose.log (every wrapper seen and sent) and, with
-    journal=True, journal.jsonl (all key material, for offline analysis).
+    setup() before going on-path (it binds the TPROXY listener and checks
+    TPROXY works), run() once this host is on the camera's path, and
+    close() at the end. Writes to `out`: av.bin (decrypted media, see
+    media.py), splice.log (engine milestones), interpose.log (every
+    wrapper seen and sent) and, with journal=True, journal.jsonl (all key
+    material, for offline analysis).
     """
 
-    def __init__(self, target, enr, us, out, pass_through=False,
+    def __init__(self, changes, target, us, out, pass_through=False,
                  journal=False):
-        self.target, self.enr, self.us = target, enr, us
+        self.changes = changes
+        self.target, self.us = target, us
+        self.enr = None
         self.out = Path(out)
         self.pass_through, self.journal = pass_through, journal
         self.watcher = RelayFlowWatcher(target, masq_ip=us)
@@ -433,6 +481,8 @@ class Splicer:
         self.stats = {}
         self._send_errs = set()
         self.spliced_sessions = 0
+        self.tokens = []
+        self.sock = self.log = None
 
     # -- plumbing --------------------------------------------------------
     def _record(self, tag, data):
@@ -462,47 +512,48 @@ class Splicer:
                             journal=str(self.out / "journal.jsonl")
                             if self.journal else None)
 
-    def _setup(self):
-        self.out.mkdir(parents=True, exist_ok=True)
-        self.log = open(self.out / "interpose.log", "ab", buffering=0)
+    def setup(self):
         # catch-all transparent socket: TPROXY needs a listener on
         # SPLICE_PORT; the connected faces get the diverted flows, so only
         # strays land here
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_IP, IP_TRANSPARENT, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        for _ in range(30):
-            try:
-                sock.bind(("0.0.0.0", SPLICE_PORT))
-                break
-            except OSError:
-                # a predecessor may still hold the port for a moment
-                time.sleep(1)
-        else:
-            raise SystemExit(f"could not bind :{SPLICE_PORT}")
+        try:
+            sock.bind(("0.0.0.0", SPLICE_PORT))
+        except OSError as e:
+            sock.close()
+            raise SystemExit(f"UDP port {SPLICE_PORT} is busy ({e.strerror}); "
+                             f"another program is using it")
         sock.setblocking(False)
         self.sock = sock
+        probe_tproxy(self.changes)
+        self.tokens += install_policy_route(self.changes)
         # TPROXY'd packets are routed by a 'local 0.0.0.0/0' policy route
         # while their destination is not a local address; with rp_filter
         # on, the input route lookup rejects them as martians unless
         # accept_local is set, and they vanish between PREROUTING and
         # INPUT. conf/all: the flow may arrive on any interface.
-        self._accept_local = Path("/proc/sys/net/ipv4/conf/all/accept_local")
-        self._old_accept_local = self._accept_local.read_text().strip()
-        self._accept_local.write_text("1\n")
+        self.tokens.append(self.changes.sysctl(
+            "/proc/sys/net/ipv4/conf/all/accept_local", 1))
 
-    def _teardown(self):
-        self._accept_local.write_text(self._old_accept_local + "\n")
-        self.sock.close()
-        self.log.close()
+    def close(self):
+        self.changes.undo(self.tokens)
+        self.tokens = []
+        for f in (self.sock, self.log):
+            if f:
+                f.close()
+        self.sock = self.log = None
 
     # -- main loop -------------------------------------------------------
-    def run(self, sessions=None):
+    def run(self, enr, sessions=None):
         """Splice app attempts until Ctrl-C, or until `sessions` sessions
-        have been spliced end to end (both DTLS legs up)."""
-        self._setup()
-        print(f"[*] watching {self.target} for a live-view session "
-              f"(open the feed in the app)")
+        have been spliced end to end (both DTLS legs up; in pass-through
+        mode, both sides exchanged traffic)."""
+        self.enr = enr
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.log = open(self.out / "interpose.log", "ab", buffering=0)
+        print(f"[*] watching {self.target} for a live-view session: "
+              f"open the camera's live view in the Wyze app")
         try:
             while sessions is None or self.spliced_sessions < sessions:
                 if not self.watcher.wait(timeout=60):
@@ -514,8 +565,6 @@ class Splicer:
                 self.watcher.rearm()
         except KeyboardInterrupt:
             pass
-        finally:
-            self._teardown()
         return self.spliced_sessions
 
     def _session(self):
@@ -530,43 +579,43 @@ class Splicer:
         # sockets first, rules second: the first diverted packet must find
         # its reader
         paths = []
+        tokens = None
         try:
-            for peer in peers:
-                cf, rf = open_faces(cam_addr, peer, self.us)
-                paths.append({"peer": peer, "cam_face": cf, "relay_face": rf})
-        except OSError as e:
-            for pth in paths:
-                pth["cam_face"].close()
-                pth["relay_face"].close()
-            return f"could not open sockets ({e!r})"
-        cleanup = install_splice_rules(self.us, self.target, cam_port, peers)
-        if cleanup is None:
-            for pth in paths:
-                pth["cam_face"].close()
-                pth["relay_face"].close()
-            return "rule install failed"
-        # hand each flow's NAT address from the kernel to our relay-side
-        # socket: until its conntrack entry is gone, the relay's replies
-        # are de-NATed to the camera instead of reaching relay_face
-        for pip, pport in peers:
-            conntrack_delete(self.target, cam_port, pip, pport)
-        try:
+            try:
+                for peer in peers:
+                    cf, rf = open_faces(cam_addr, peer, self.us)
+                    paths.append({"peer": peer, "cam_face": cf,
+                                  "relay_face": rf})
+            except OSError as e:
+                return f"could not open sockets ({e!r})"
+            tokens = install_splice_rules(self.changes, self.us, self.target,
+                                          cam_port, peers)
+            if tokens is None:
+                return "rule install failed"
+            # hand each flow's NAT address from the kernel to our
+            # relay-side socket: until its conntrack entry is gone, the
+            # relay's replies are de-NATed to the camera instead of
+            # reaching relay_face
+            for pip, pport in peers:
+                conntrack_delete(self.target, cam_port, pip, pport)
             return self._splice(paths)
         finally:
-            for kind, cargs in reversed(cleanup):
-                (ipt if kind == "ipt" else ip_cmd)(*cargs)
-            for pth in paths:
-                pth["cam_face"].close()
-                pth["relay_face"].close()
-            # give the flows back to the kernel: the camera's next packet
-            # gets a fresh NAT entry on the same port, so the relays keep
-            # seeing the same public address
-            for pip, pport in peers:
-                for src in (self.us, self.target):
-                    conntrack_delete(src, cam_port, pip, pport)
-                conntrack_delete(pip, pport, self.us, cam_port)
-            self.stats["storm_dropped"] = self.storm_guard.dropped
-            print(f"[+] divert removed. stats: {self.stats}")
+            with signals_held():
+                if tokens:
+                    self.changes.undo(tokens)
+                for pth in paths:
+                    pth["cam_face"].close()
+                    pth["relay_face"].close()
+                if tokens:
+                    # give the flows back to the kernel: the camera's next
+                    # packet gets a fresh NAT entry on the same port, so
+                    # the relays keep seeing the same public address
+                    for pip, pport in peers:
+                        for src in (self.us, self.target):
+                            conntrack_delete(src, cam_port, pip, pport)
+                        conntrack_delete(pip, pport, self.us, cam_port)
+                    self.stats["storm_dropped"] = self.storm_guard.dropped
+                    print(f"[+] divert removed. stats: {self.stats}")
 
     def _splice(self, paths):
         engine = self._new_engine()
@@ -585,6 +634,9 @@ class Splicer:
                 return
             if engine.failed:
                 m = f"engine failed ({engine.failed}); forwarding verbatim"
+                if "decrypt" in str(engine.failed):
+                    m += ("\n[!] the ENR may be stale (camera re-paired?): "
+                          "rerun with --reharvest")
             elif engine.client_leg.handshake_done:
                 m = "spliced: both DTLS legs up, decrypting media"
             elif engine.server_leg.handshake_done:
@@ -687,6 +739,7 @@ class Splicer:
                                     and is_plain_clienthello(data)):
                                 print("[*] fresh phone ClientHello after "
                                       "engine failure; rebuilding engine")
+                                engine.close()
                                 engine = self._new_engine()
                                 latch_time = time.time()
                             if (engine and not engine.failed and dtls
@@ -701,6 +754,8 @@ class Splicer:
                         status()
                 if engine and engine.client_leg.handshake_done:
                     spliced = True
+                elif (not engine and stats["from_cam"] and stats["from_relay"]):
+                    spliced = True       # pass-through: traffic both ways
                 reason = _relatch_reason(
                     engine, latch_time, last_packet, time.time(),
                     last_cam if (engine is None
@@ -713,3 +768,5 @@ class Splicer:
         finally:
             if spliced:
                 self.spliced_sessions += 1
+            if engine:
+                engine.close()

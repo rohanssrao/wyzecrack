@@ -5,8 +5,8 @@ import tempfile
 from wyze_splice import media as av_extract
 
 
-def _rec(direction, payload):
-    return struct.pack("<BdI", direction, 0.0, len(payload)) + payload
+def _rec(direction, payload, ts=0.0):
+    return struct.pack("<BdI", direction, ts, len(payload)) + payload
 
 
 def _media(ft, ch, frame_no, cidx, paysize, payload, last=0):
@@ -25,44 +25,62 @@ def _media(ft, ch, frame_no, cidx, paysize, payload, last=0):
     return bytes(hdr) + payload
 
 
-def test_av_extract():
+def _write(blob):
+    f = tempfile.NamedTemporaryFile(delete=False)
+    f.write(blob)
+    f.close()
+    return f.name
+
+
+def test_reassembly_dedupe_frameinfo_strip():
     sps = b"\x00\x00\x00\x01\x27\x4d\x00\x32"
     p1 = b"\xAA" * 16
     p2 = b"\xBB" * 8
     frameinfo = b"\x4e\x00\x01\x00" + b"\x00" * 36  # H264 keyframe info
     endpayload = b"\xCC" * 12 + frameinfo
-    blob = b"".join([
+    path = _write(b"".join([
         _rec(0, b"\x0a\x08-command-not-media"),
-        _rec(1, _media(0x08, 5, 7, 0, len(sps + p1), sps + p1, last=2)),
-        _rec(1, _media(0x00, 5, 7, 1, len(p2), p2, last=2)),
+        # 3 packets: chunks 0 and 1, then the end packet
+        _rec(1, _media(0x08, 5, 7, 0, len(sps + p1), sps + p1, last=3)),
+        _rec(1, _media(0x00, 5, 7, 1, len(p2), p2, last=3)),
         _rec(1, _media(0x01, 5, 7, 0x0028, len(endpayload), endpayload,
-                       last=2)),
+                       last=3)),
         # duplicate chunk must be dropped
-        _rec(1, _media(0x00, 5, 7, 1, len(p2), p2, last=2)),
-        # different channel goes to its own stream
-        _rec(1, _media(0x01, 3, 1, 0x0028, 4, b"\x11\x22\x33\x44")),
+        _rec(1, _media(0x00, 5, 7, 1, len(p2), p2, last=3)),
+        # audio is not video
+        _rec(1, _media(0x01, 3, 1, 0x0028, 4, b"\x11\x22\x33\x44", last=1)),
         _rec(1, b"\x0c\x00-truncated"),
-    ])
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        f.write(blob)
-        path = f.name
+    ]))
     try:
-        out = av_extract.extract(path)
-        assert sorted(out) == [3, 5], sorted(out)
-        frames = out[5]
-        assert len(frames) == 1
-        frame_no, data, ended = frames[0]
-        assert frame_no == 7 and ended
-        assert data == sps + p1 + p2 + b"\xCC" * 12, data.hex()
-        assert out[3][0][1] == b"\x11\x22\x33\x44"
+        frames = av_extract.extract_combined(path)
+        assert [(f[1], f[2], f[4]) for f in frames] == [(5, 7, True)]
+        assert frames[0][3] == sps + p1 + p2 + b"\xCC" * 12
     finally:
         os.unlink(path)
-    print("ok av_extract reassembly, dedupe, FrameInfo strip")
 
 
-if __name__ == "__main__":
-    test_av_extract()
-    print("ALL TESTS PASSED")
+def test_missing_middle_chunk_is_incomplete():
+    path = _write(b"".join([
+        _rec(1, _media(0x08, 5, 7, 0, 4, b"\x00\x00\x01\x65", last=3)),
+        # chunk 1 lost
+        _rec(1, _media(0x01, 5, 7, 0x0028, 8, b"\xCC" * 8, last=3)),
+    ]))
+    try:
+        (f,) = av_extract.extract_combined(path)
+        assert f[4] is False
+    finally:
+        os.unlink(path)
+
+
+def test_sessions_split_on_frame_reset_and_gap():
+    one = lambda fno, ts: _rec(1, _media(0x01, 7, fno, 0x0028, 8, b"\x41" * 8, last=1), ts)
+    path = _write(b"".join([one(n, n * 0.05) for n in range(1, 120)]
+                           + [one(n, 10 + n * 0.05) for n in range(1, 5)]     # reset
+                           + [one(n, 30 + n * 0.05) for n in range(5, 9)]))   # gap
+    try:
+        assert [len(s) for s in av_extract.sessions(path)] == [119, 4, 4]
+    finally:
+        os.unlink(path)
 
 
 def test_single_packet_extended_frame():
@@ -72,7 +90,7 @@ def test_single_packet_extended_frame():
     body = pslice + frameinfo
     m = av_extract.parse_media(_media(0x09, 7, 20, 0x0028, len(body), body,
                                       last=1))
-    assert m == (7, 20, 0xFFFF, pslice, True)
+    assert m == (7, 20, 0xFFFF, pslice, True, 1)
 
 
 def test_decodable_drops_gop_after_incomplete_idr():
@@ -84,6 +102,10 @@ def test_decodable_drops_gop_after_incomplete_idr():
               (5, 5, 6, idr, True), (6, 7, 7, p, True)]
     kept = [f[2] for f in av_extract.decodable(frames)]
     assert kept == [1, 2, 6, 7]
+    # an incomplete P-frame breaks the rest of its GOP too
+    frames[3] = (3, 7, 4, p, False)
+    frames[2] = (2, 5, 3, idr, True)
+    assert [f[2] for f in av_extract.decodable(frames)] == [1, 2, 3, 6, 7]
 
 
 def test_segments_split_where_the_sps_changes():

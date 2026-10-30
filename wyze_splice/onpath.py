@@ -1,11 +1,10 @@
 """Getting on the camera's path (router mode)."""
-import subprocess
 import threading
-import time
 from pathlib import Path
 
 from . import rawnet
-from .netutil import ipt, route_get
+from .changes import run
+from .netutil import default_gateway, ipt
 
 
 class OnPath:
@@ -25,47 +24,81 @@ class OnPath:
     the new NAT mapping from its next keepalive, no reboot needed.
 
     poison=False skips the ARP step for hosts that already carry the
-    camera's traffic (a gateway, or the netns lab)."""
+    camera's traffic (a gateway, or the netns lab).
 
-    def __init__(self, cam_ip, iface, poison, gateway=None):
+    Every change goes through the Changes journal, so a crash is undone by
+    `wyze-splice cleanup` or the next run."""
+
+    def __init__(self, changes, cam_ip, iface, poison, gateway=None):
+        self.changes = changes
         self.cam_ip, self.iface, self.poison = cam_ip, iface, poison
-        self.gateway = gateway or route_get("8.8.8.8").split(" via ")[1].split()[0]
+        self.gateway = gateway
+        if poison and not gateway:
+            self.gateway = default_gateway(iface)
+            if not self.gateway:
+                raise SystemExit(f"no default gateway on {iface}: the camera "
+                                 f"must share this host's LAN and router")
         self.stop = threading.Event()
-        self.undo = []
+        self.threads = []
+        self.tokens = []
+        self.cam_mac = None
 
-    def _sysctl(self, path, value):
-        p = Path(path)
-        old = p.read_text().strip()
-        p.write_text(f"{value}\n")
-        self.undo.append(lambda: p.write_text(old + "\n"))
+    def _rule(self, table, chain, *spec, insert=False):
+        """Add an iptables rule unless an identical one exists, journaling
+        its removal first."""
+        if ipt("-t", table, "-C", chain, *spec).returncode == 0:
+            return
+        self.tokens.append(self.changes.add(
+            "ipt", args=["-t", table, "-D", chain, *spec]))
+        ipt("-t", table, "-I" if insert else "-A", chain,
+            *(["1"] if insert else []), *spec)
 
     def start(self):
-        self._sysctl("/proc/sys/net/ipv4/ip_forward", 1)
+        c = self.changes
+        # setting ip_forward rewrites every conf/*/forwarding and
+        # conf/all/accept_redirects; journal them first so they are put
+        # back after ip_forward is
+        for p in [*sorted(Path("/proc/sys/net/ipv4/conf").glob("*/forwarding")),
+                  Path("/proc/sys/net/ipv4/conf/all/accept_redirects")]:
+            self.tokens.append(c.remember_sysctl(p))
+        self.tokens.append(c.sysctl("/proc/sys/net/ipv4/ip_forward", 1))
         for dev in ("all", self.iface):
             # forwarding out the interface the packet came in on would
             # send the camera ICMP redirects naming the real gateway
-            self._sysctl(f"/proc/sys/net/ipv4/conf/{dev}/send_redirects", 0)
-        rule = ("-t", "nat", "POSTROUTING", "-s", self.cam_ip, "-o",
-                self.iface, "-j", "MASQUERADE")
-        if ipt(rule[0], rule[1], "-C", *rule[2:]).returncode != 0:
-            ipt(rule[0], rule[1], "-A", *rule[2:])
-            self.undo.append(lambda: ipt(rule[0], rule[1], "-D", *rule[2:]))
+            self.tokens.append(c.sysctl(
+                f"/proc/sys/net/ipv4/conf/{dev}/send_redirects", 0))
+        self._rule("nat", "POSTROUTING", "-s", self.cam_ip, "-o", self.iface,
+                   "-j", "MASQUERADE")
+        # firewalls that drop forwarded traffic by default (ufw, Docker,
+        # firewalld) would black-hole the camera
+        self._rule("filter", "FORWARD", "-s", self.cam_ip, "-j", "ACCEPT",
+                   insert=True)
+        self._rule("filter", "FORWARD", "-d", self.cam_ip, "-j", "ACCEPT",
+                   insert=True)
         if self.poison:
             self._arp_start()
-        print(f"[+] on-path: MASQUERADE {self.cam_ip} out {self.iface}"
-              f"{', camera-only ARP poison' if self.poison else ''}")
+        print(f"[+] on-path: routing {self.cam_ip} through this host "
+              f"({self.iface}{', ARP' if self.poison else ''})")
 
     def _arp_start(self):
         me = rawnet.mac_bytes(rawnet.iface_mac(self.iface))
-        cam_mac = rawnet.mac_bytes(self._mac(self.cam_ip))
+        self.cam_mac = self._mac(self.cam_ip)
+        cam_mac = rawnet.mac_bytes(self.cam_mac)
         gw_mac = rawnet.mac_bytes(self._mac(self.gateway))
         # unicast to the camera only: "the gateway is at our MAC"
         lie = rawnet.arp_reply(me, cam_mac, self.gateway, me,
                                self.cam_ip, cam_mac)
-        truth = rawnet.arp_reply(gw_mac, cam_mac, self.gateway, gw_mac,
+        # the restore carries the real gateway MAC in the ARP payload but
+        # our own MAC as the Ethernet source: on Wi-Fi a frame whose source
+        # is another station's MAC never makes it onto the air
+        truth = rawnet.arp_reply(me, cam_mac, self.gateway, gw_mac,
                                  self.cam_ip, cam_mac)
+        self.tokens.append(self.changes.add("arp", iface=self.iface,
+                                            frame=truth.hex()))
 
         def send(frame):
+            if self.stop.is_set():
+                return
             try:
                 with rawnet.open_raw(self.iface) as s:
                     s.send(frame)
@@ -90,30 +123,36 @@ class OnPath:
                     print(f"[!] ARP responder error ({e}); retrying")
                     self.stop.wait(2)
 
-        threading.Thread(target=tick, daemon=True).start()
-        threading.Thread(target=answer, daemon=True).start()
-
-        def restore():
-            for _ in range(5):
-                send(truth)
-                time.sleep(0.3)
-        self.undo.append(restore)
+        for fn in (tick, answer):
+            t = threading.Thread(target=fn, daemon=True)
+            t.start()
+            self.threads.append(t)
 
     def _mac(self, ip):
-        subprocess.run(["ping", "-c", "1", "-W", "1", ip], capture_output=True)
-        out = subprocess.run(["ip", "neigh", "show", ip], capture_output=True,
-                             text=True).stdout.split()
-        if "lladdr" not in out:
-            raise SystemExit(f"cannot resolve MAC for {ip}")
-        return out[out.index("lladdr") + 1]
+        mac = neighbor_mac(ip)
+        if not mac:
+            raise SystemExit(f"cannot resolve the MAC of {ip}: is it up and "
+                             f"on {self.iface}'s LAN?")
+        return mac
 
     def close(self):
+        """Stop the ARP threads, then undo everything start() did."""
         if self.stop.is_set():
             return
+        print("[*] restoring the camera's route (ARP, NAT, sysctls)...")
         self.stop.set()
-        for fn in reversed(self.undo):
-            try:
-                fn()
-            except Exception as e:  # noqa: BLE001
-                print(f"[!] on-path cleanup step failed: {e}")
+        for t in self.threads:
+            t.join(2)
+        self.changes.undo(self.tokens)
+        self.tokens = []
         print("[+] on-path mode off")
+
+
+def neighbor_mac(ip):
+    """The MAC of an on-link host, pinging it first to fill the neighbor
+    table, or None."""
+    run(["ping", "-c", "1", "-W", "1", ip])
+    out = run(["ip", "neigh", "show", ip]).stdout.split()
+    if "lladdr" not in out:
+        return None
+    return out[out.index("lladdr") + 1].lower()

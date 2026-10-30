@@ -449,20 +449,19 @@ class TestRelatchReason(unittest.TestCase):
                                                last_cam=130.0))
 
     def _install(self, peers):
+        from wyze_splice.changes import Changes
         from wyze_splice.splice import install_splice_rules
-        with unittest.mock.patch("wyze_splice.splice.ipt_restore") as restore, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        changes = Changes(tempfile.mkdtemp())
+        with unittest.mock.patch("wyze_splice.splice.ipt_restore") as restore:
             restore.return_value.returncode = 0
-            ip_cmd.return_value.returncode = 0
-            cleanup = install_splice_rules("192.168.1.2", "192.168.1.20", 52586,
-                                           peers)
+            tokens = install_splice_rules(changes, "192.168.1.2", "192.168.1.20",
+                                          52586, peers)
             self.assertEqual(restore.call_count, 1)   # one spawn
-            self.assertTrue(any("rule" in " ".join(c.args)
-                                for c in ip_cmd.call_args_list))
-            return restore.call_args[0][0], cleanup
+            undo = [" ".join(i["args"]) for _t, i in changes.items]
+            return restore.call_args[0][0], tokens, undo
 
     def test_install_splice_rules_pins_the_camera_side(self):
-        blob, cleanup = self._install([("198.51.100.152", 44369)])
+        blob, tokens, undo = self._install([("198.51.100.152", 44369)])
         # only the camera's side is diverted; the relay reaches our own
         # address, through an INPUT hole
         self.assertEqual(blob.count("TPROXY"), 1)
@@ -471,21 +470,19 @@ class TestRelatchReason(unittest.TestCase):
         self.assertIn("-s 198.51.100.152 -p udp --sport 44369 -d 192.168.1.2 "
                       "--dport 52586 -j ACCEPT", blob)
         self.assertNotIn("SNAT", blob)
-        undo = [" ".join(a) for _k, a in cleanup]
-        self.assertTrue(any("mangle" in u and "--sport 52586" in u for u in undo))
-        self.assertTrue(any("INPUT" in u and "ACCEPT" in u for u in undo))
-        self.assertTrue(any(u.startswith("rule del") for u in undo))
-        self.assertTrue(any(u.startswith("route del") for u in undo))
-        self.assertEqual(len(cleanup), 4)
+        # every rule's removal is journaled before it is installed
+        self.assertEqual(len(tokens), 2)
+        self.assertTrue(any(u.startswith("-t mangle -D PREROUTING") for u in undo))
+        self.assertTrue(any(u.startswith("-t filter -D INPUT") for u in undo))
 
     def test_install_splice_rules_extra_stun_paths(self):
-        blob, cleanup = self._install([("198.51.100.151", 7345),
-                                       ("198.51.100.82", 3478),
-                                       ("198.51.100.52", 3478)])
+        blob, tokens, _ = self._install([("198.51.100.151", 7345),
+                                         ("198.51.100.82", 3478),
+                                         ("198.51.100.52", 3478)])
         self.assertEqual(blob.count("TPROXY"), 3)
         self.assertIn("-d 198.51.100.82 --dport 3478", blob)
         self.assertEqual(blob.count("-j ACCEPT"), 3)
-        self.assertEqual(len(cleanup), 2 * 3 + 2)
+        self.assertEqual(len(tokens), 6)
 
     def test_watcher_sees_relay_replies_to_our_nat_address(self):
         from wyze_splice.rawnet import UdpPacket
@@ -512,13 +509,20 @@ class TestRelatchReason(unittest.TestCase):
         self.assertTrue(is_clienthello_flight(bytes(ch)))
 
     def test_install_splice_rules_fails_cleanly(self):
+        from wyze_splice.changes import Changes
         from wyze_splice.splice import install_splice_rules
-        with unittest.mock.patch("wyze_splice.splice.ipt_restore") as restore:
+        changes = Changes(tempfile.mkdtemp())
+        with unittest.mock.patch("wyze_splice.splice.ipt_restore") as restore, \
+                unittest.mock.patch("wyze_splice.changes.run") as run:
             bad = subprocess.CompletedProcess([], 1)
             bad.stderr = "iptables-restore: bad rule"
             restore.return_value = bad
             self.assertIsNone(install_splice_rules(
-                "192.168.1.2", "192.168.1.20", 59344, [("198.51.100.101", 34952)]))
+                changes, "192.168.1.2", "192.168.1.20", 59344,
+                [("198.51.100.101", 34952)]))
+            # a partly committed restore is undone, and the journal is empty
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(changes.items, [])
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and os.geteuid() == 0,

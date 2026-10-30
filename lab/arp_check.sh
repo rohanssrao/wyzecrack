@@ -13,10 +13,13 @@ GW=$(ip netns exec tfl-gw cat /sys/class/net/eth0/address)
 gwmac() { ip -n tfl-cam neigh show 10.99.0.1 | awk '{print $5}'; }
 before=$(gwmac)
 ip netns exec tfl-mid env PYTHONPATH=$REPO $PY - <<'PY' &
-import time
+import tempfile, time
+from wyze_splice.changes import Changes
 from wyze_splice.onpath import OnPath
-o = OnPath("10.99.0.20", "eth0", poison=True, gateway="10.99.0.1")
+c = Changes(tempfile.mkdtemp())
+o = OnPath(c, "10.99.0.20", "eth0", poison=True, gateway="10.99.0.1")
 o.start(); time.sleep(4); o.close()
+assert not c.items, c.items
 PY
 sleep 3; during=$(gwmac)
 # keep the camera talking so its entry stays live

@@ -88,3 +88,16 @@ class TestLiveFilter(unittest.TestCase):
         rx.close()
         tx.close()
         self.assertTrue(got and got[0].payload == b"hello")
+
+
+def test_wyze_ouis():
+    from wyze_splice.discover import is_wyze
+    assert is_wyze("D0:3F:27:A1:B2:C3") and is_wyze("2c:aa:8e:00:00:01")
+    assert is_wyze("a4:da:22:2f:00:01") and not is_wyze("a4:da:22:3f:00:01")
+    assert not is_wyze("02:00:00:00:00:01")
+
+
+def test_fragments_are_not_udp():
+    f = bytearray(_udp_frame("192.168.1.20", "1.2.3.4", 1, 2, b"x"))
+    f[20:22] = b"\x00\x10"          # fragment offset 16
+    assert rawnet.parse_udp(bytes(f)) is None

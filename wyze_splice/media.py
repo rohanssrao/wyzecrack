@@ -42,10 +42,11 @@ VIDEO_CHANNELS = (5, 6, 7)
 
 
 def parse_media(p):
-    """Camera->phone media record -> (ch, frame_no, cidx, payload, end),
-    or None for anything else. The end packet's chunk index comes back
-    as 0xFFFF so it sorts last; a 0x0028 marker there means the payload
-    ends with the 40-byte FrameInfo, which is stripped."""
+    """Camera->phone media record -> (ch, frame_no, cidx, payload, end,
+    count), or None for anything else. `count` is the frame's packet
+    count (chunks 0..count-2 plus the end packet). The end packet's chunk
+    index comes back as 0xFFFF so it sorts last; a 0x0028 marker there
+    means the payload ends with the 40-byte FrameInfo, which is stripped."""
     if len(p) < 40 or p[0] != 0x0C:
         return None
     ft = p[1]
@@ -53,6 +54,7 @@ def parse_media(p):
     if len(p) < 36 + o:
         return None
     ch = p[16 + o]
+    count = struct.unpack_from("<H", p, 20 + o)[0]
     cidx = struct.unpack_from("<H", p, 22 + o)[0]
     paysize = struct.unpack_from("<H", p, 24 + o)[0]
     frame_no = struct.unpack_from("<I", p, 32 + o)[0]
@@ -62,7 +64,7 @@ def parse_media(p):
         if cidx == 0x0028 and len(payload) >= 40:
             payload = payload[:-40]
         cidx = 0xFFFF
-    return ch, frame_no, cidx, payload, end
+    return ch, frame_no, cidx, payload, end, count
 
 
 def read_entries(path):
@@ -76,62 +78,65 @@ def read_entries(path):
         off += 13 + ln
 
 
-def extract(path, direction=1):
-    """-> {channel: [(frame_no, blob, ended), ...]} in capture order."""
-    frames, order = {}, []
-    for d, ts, p in direction_reader(path, direction):
+# a new camera AV session (another live view, or a rebuilt engine)
+# restarts frame numbers; a gap this long also starts a new session
+SESSION_GAP = 5.0
+
+
+def sessions(path, direction=1):
+    """Camera media records of av.bin, split per AV session:
+    [[(ts, parsed), ...], ...]. Frame numbers are only unique within one."""
+    out, cur, last_ts, top = [], [], None, {}
+    for d, ts, p in read_entries(path):
+        if d != direction:
+            continue
         m = parse_media(p)
         if m is None:
             continue
-        ch, frame_no, cidx, payload, end = m
-        key = (ch, frame_no)
-        if key not in frames:
-            frames[key] = {"pos": len(order), "pkts": [], "end": False}
-            order.append(key)
-        f = frames[key]
-        f["end"] |= end
-        f["pkts"].append((cidx, payload))
-    out = {}
-    for key in order:
-        ch, frame_no = key
-        f = frames[key]
-        seen, merged = set(), []
-        for c, pl in sorted(f["pkts"]):
-            if c in seen:
-                continue
-            seen.add(c)
-            merged.append(pl)
-        out.setdefault(ch, []).append((frame_no, b"".join(merged), f["end"]))
+        ch, frame_no = m[0], m[1]
+        if cur and ((last_ts is not None and ts - last_ts > SESSION_GAP)
+                    or frame_no + 50 < top.get(ch, 0)):
+            out.append(cur)
+            cur, top = [], {}
+        cur.append((ts, m))
+        top[ch] = max(top.get(ch, 0), frame_no)
+        last_ts = ts
+    if cur:
+        out.append(cur)
     return out
 
 
-def frame_times(path, direction=1):
-    """-> {(ch, frame_no): first-packet wall time} for media packets."""
-    times = {}
-    for d, ts, p in direction_reader(path, direction):
-        m = parse_media(p)
-        if m is not None:
-            times.setdefault((m[0], m[1]), ts)
-    return times
+def assemble(records):
+    """One session's records -> [(t, ch, frame_no, blob, complete)] in
+    arrival order of each frame's first packet. complete means the end
+    packet and every chunk before it arrived; duplicate chunks (the
+    camera sends each datagram twice) are merged."""
+    frames, order = {}, []
+    for ts, (ch, frame_no, cidx, payload, end, count) in records:
+        key = (ch, frame_no)
+        f = frames.get(key)
+        if f is None:
+            f = frames[key] = {"t": ts, "pkts": {}, "end": False, "count": 0}
+            order.append(key)
+        f["end"] |= end
+        f["count"] = max(f["count"], count)
+        f["pkts"].setdefault(cidx, payload)
+    out = []
+    for key in order:
+        f = frames[key]
+        chunks = set(f["pkts"]) - {0xFFFF}
+        complete = f["end"] and chunks >= set(range(max(0, f["count"] - 1)))
+        blob = b"".join(pl for _, pl in sorted(f["pkts"].items()))
+        out.append((f["t"], key[0], key[1], blob, complete))
+    return out
 
 
 def extract_combined(path, direction=1):
-    """All video frames (channels 5/6/7) merged in capture order — the
-    P-frames on one channel reference SPS/PPS delivered on another, so
-    this interleaving is what actually decodes."""
-    per_ch = extract(path, direction)
-    tagged = []
-    times = frame_times(path, direction)
-    for ch, frs in per_ch.items():
-        if ch not in VIDEO_CHANNELS:
-            continue
-        for frame_no, blob, ended in frs:
-            t = times.get((ch, frame_no))
-            if t is None:
-                continue
-            tagged.append((t, ch, frame_no, blob, ended))
-    tagged.sort(key=lambda x: x[0])
-    return tagged
+    """All video frames (channels 5/6/7) of the first AV session, merged
+    in arrival order. The P-frames on one channel reference SPS/PPS
+    delivered on another, so this interleaving is what decodes."""
+    s = sessions(path, direction)
+    return [t for t in assemble(s[0]) if t[1] in VIDEO_CHANNELS] if s else []
 
 
 def _has_idr(blob):
@@ -145,25 +150,23 @@ def _has_idr(blob):
 
 def decodable(tagged):
     """Frames a decoder can show cleanly: complete frames, minus every
-    frame that follows an incomplete IDR until the next complete one.
+    frame that follows an incomplete IDR until the next complete one,
+    and every frame after an incomplete P-frame until the next IDR (a
+    P-frame references the one before it).
     Once the viewer leaves, the camera keeps streaming to the dead
     session but stops completing I-frames (run14: the last chunk of every
     IDR from ~8 s after the phone left), and the P-frames after a broken
     IDR decode as smears in whatever moves."""
     out, gop_ok = [], True
     for t in tagged:
-        blob, ended = t[3], t[4]
+        blob, complete = t[3], t[4]
         if _has_idr(blob):
-            gop_ok = ended
-        if ended and gop_ok:
+            gop_ok = complete
+        elif not complete:
+            gop_ok = False
+        if gop_ok:
             out.append(t)
     return out
-
-
-def direction_reader(path, direction):
-    for d, ts, p in read_entries(path):
-        if d == direction:
-            yield d, ts, p
 
 
 def make_mp4(h264_path, mp4_path, frames):
@@ -258,12 +261,29 @@ def _size(h264_path):
 
 
 def export(av_bin, outdir):
-    """av.bin -> outdir/video.h264 (all clean GOPs), one true-speed MP4
-    per resolution (video.mp4 is the longest; others are named
-    video-WxH.mp4) and frame.jpg, the last picture of video.mp4.
-    Returns what was written."""
+    """av.bin -> per AV session (one per live view; a single session is
+    written to outdir itself, several to outdir/session-N): video.h264
+    (all clean GOPs), one true-speed MP4 per resolution (video.mp4 is the
+    longest; others video-WxH.mp4) and frame.jpg, the last picture of
+    video.mp4. Returns totals plus every MP4 written."""
+    res = {"frames": 0, "dropped": 0, "mp4s": [], "sessions": 0}
+    parts = [[t for t in assemble(recs) if t[1] in VIDEO_CHANNELS]
+             for recs in sessions(av_bin)]
+    parts = [p for p in parts if p]
+    for n, every in enumerate(parts, 1):
+        d = outdir if len(parts) == 1 else os.path.join(outdir, f"session-{n}")
+        r = _export_session(every, d)
+        res["sessions"] += 1
+        res["frames"] += r["frames"]
+        res["dropped"] += r["dropped"]
+        res["mp4s"] += r["mp4s"]
+        if "frame" in r and "frame" not in res:
+            res["frame"] = r["frame"]
+    return res
+
+
+def _export_session(every, outdir):
     os.makedirs(outdir, exist_ok=True)
-    every = extract_combined(av_bin)
     tagged = decodable(every)
     res = {"frames": len(tagged), "dropped": len(every) - len(tagged),
            "mp4s": []}
@@ -272,23 +292,25 @@ def export(av_bin, outdir):
     h264 = os.path.join(outdir, "video.h264")
     with open(h264, "wb") as f:
         f.write(b"".join(t[3] for t in tagged))
-    res["h264"] = h264
-    res["seconds"] = tagged[-1][0] - tagged[0][0]
     segs = segments(tagged)
     main = max(range(len(segs)), key=lambda i: len(segs[i]))
+    used = set()
     for i, seg in enumerate(segs):
         part = os.path.join(outdir, f".seg{i}.h264")
         with open(part, "wb") as f:
             f.write(b"".join(t[3] for t in seg))
         size = _size(part)
-        name = ("video.mp4" if i == main or size is None
-                else f"video-{size[0]}x{size[1]}.mp4")
+        stem = ("video" if i == main else
+                f"video-{size[0]}x{size[1]}" if size else f"video-part{i + 1}")
+        name, k = f"{stem}.mp4", 2
+        while name in used:
+            name, k = f"{stem}-{k}.mp4", k + 1
+        used.add(name)
         mp4 = os.path.join(outdir, name)
         make_mp4(part, mp4, seg)
         res["mp4s"].append({"path": mp4, "size": size, "frames": len(seg),
                             "seconds": seg[-1][0] - seg[0][0]})
         if i == main:
-            res["mp4"] = mp4
             jpg = os.path.join(outdir, "frame.jpg")
             if last_frame_jpeg(part, jpg):
                 res["frame"] = jpg

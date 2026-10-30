@@ -8,6 +8,7 @@ import time
 from collections import namedtuple
 
 ETH_P_ALL = 0x0003
+PACKET_OUTGOING = 4
 ETH_P_IP = 0x0800
 ETH_P_ARP = 0x0806
 SO_ATTACH_FILTER = 26
@@ -31,6 +32,7 @@ def udp_filter(hosts, dsts=()):
     or whose destination is in `dsts`."""
     # (code, jt, jf, k); jumps are relative to the next instruction
     tests = [(26, h) for h in hosts] + [(30, h) for h in (*hosts, *dsts)]
+    assert len(tests) < 100, "jump offsets are 8-bit"
     prog = [(LD_H_ABS, 0, 0, 12),
             (JEQ_K, 0, 0, ETH_P_IP),        # jf patched to DROP below
             (LD_B_ABS, 0, 0, 23),
@@ -64,11 +66,20 @@ def attach_filter(sock, prog):
 
 
 def open_raw(iface, prog=None):
-    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
-    if prog is not None:
-        attach_filter(s, prog)
-    s.bind((iface, 0))
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+    """AF_PACKET socket on iface. With a filter it is created with
+    protocol 0 (receives nothing), filtered, then bound for all
+    protocols, so no unfiltered frame is ever queued."""
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
+    try:
+        if prog is not None:
+            attach_filter(s, prog)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+            s.bind((iface, ETH_P_ALL))
+        else:
+            s.bind((iface, 0))           # send-only
+    except OSError:
+        s.close()
+        raise
     return s
 
 
@@ -77,8 +88,10 @@ def parse_udp(frame):
     if len(frame) < 42 or frame[12:14] != b"\x08\x00":
         return None
     ihl = (frame[14] & 0x0F) * 4
-    if frame[23] != socket.IPPROTO_UDP or len(frame) < 14 + ihl + 8:
+    if ihl < 20 or frame[23] != socket.IPPROTO_UDP or len(frame) < 14 + ihl + 8:
         return None
+    if struct.unpack("!H", frame[20:22])[0] & 0x3FFF:
+        return None                     # a fragment: no complete UDP header
     total = struct.unpack("!H", frame[16:18])[0]
     u = 14 + ihl
     sport, dport, ulen = struct.unpack("!HHH", frame[u:u + 6])
@@ -107,6 +120,14 @@ def arp_reply(src_mac, dst_mac, spa, sha, tpa, tha):
             + sha + socket.inet_aton(spa) + tha + socket.inet_aton(tpa))
 
 
+def arp_request(src_mac, src_ip, target_ip):
+    """Broadcast "who has target_ip" from src_mac/src_ip (MACs as bytes)."""
+    return (b"\xff" * 6 + src_mac + struct.pack("!H", ETH_P_ARP)
+            + struct.pack("!HHBBH", 1, ETH_P_IP, 6, 4, 1)
+            + src_mac + socket.inet_aton(src_ip) + b"\x00" * 6
+            + socket.inet_aton(target_ip))
+
+
 def iface_mac(iface):
     with open(f"/sys/class/net/{iface}/address") as f:
         return f.read().strip()
@@ -114,16 +135,19 @@ def iface_mac(iface):
 
 def sniff(iface, prog, parse, on_packet, stop, timeout=None):
     """Feed every parsed frame matching `prog` to on_packet until
-    stop() is true or `timeout` seconds pass. Raises OSError if the
-    interface goes away (callers retry)."""
-    deadline = time.time() + timeout if timeout else None
+    stop() is true or `timeout` seconds pass. Frames this host sends
+    (including the forwarded copies of what it receives) are skipped.
+    Raises OSError if the interface goes away (callers retry)."""
+    deadline = time.monotonic() + timeout if timeout else None
     s = open_raw(iface, prog)
     s.settimeout(0.5)
     try:
-        while not stop() and (deadline is None or time.time() < deadline):
+        while not stop() and (deadline is None or time.monotonic() < deadline):
             try:
-                frame = s.recv(65535)
+                frame, addr = s.recvfrom(65535)
             except socket.timeout:
+                continue
+            if addr[2] == PACKET_OUTGOING:
                 continue
             pkt = parse(frame)
             if pkt is not None:

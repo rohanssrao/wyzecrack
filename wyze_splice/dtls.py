@@ -349,7 +349,7 @@ class DTLSLeg:
             self._j(ev="adopted_decrypt_failed",
                     scheme=self.scheme.name, aad=self.aad_variant,
                     rtype=rtype, epoch=epoch, seq=seq, body=body.hex())
-            raise ValueError(
+            raise BadRecord(
                 f"decrypt failed with adopted {self.scheme.name}/"
                 f"{self.aad_variant}")
         for scheme in self.schemes:
@@ -670,6 +670,42 @@ _EMBEDDED = {
 }
 
 
+class BadRecord(ValueError):
+    """A record that does not authenticate under the adopted keys."""
+
+
+class ReplayWindow:
+    """Records seen per epoch, bounded: sequence numbers more than WINDOW
+    below the highest seen count as replays (as in RFC 6347 4.1.2.6), so
+    memory stays flat over a long session."""
+    WINDOW = 4096
+
+    def __init__(self):
+        self.seen = set()
+        self.top = {}
+
+    def check(self, epoch, seq):
+        """True if (epoch, seq) is new; records it."""
+        top = self.top.get(epoch, -1)
+        if seq <= top - self.WINDOW or (epoch, seq) in self.seen:
+            return False
+        self.seen.add((epoch, seq))
+        if seq > top:
+            self.top[epoch] = seq
+            if len(self.seen) > 2 * self.WINDOW:
+                floor = {e: t - self.WINDOW for e, t in self.top.items()}
+                self.seen = {(e, q) for e, q in self.seen if q > floor[e]}
+        return True
+
+    def __contains__(self, key):
+        epoch, seq = key
+        return (key in self.seen
+                or seq <= self.top.get(epoch, -1) - self.WINDOW)
+
+    def add(self, key):
+        self.check(*key)
+
+
 class Templates:
     def __init__(self, ch, sh, ske, cke, nst):
         self.ch, self.sh, self.ske, self.cke, self.nst = ch, sh, ske, cke, nst
@@ -763,8 +799,9 @@ class SpliceEngine:
         self.jr_f = open(journal, "a") if journal else None
         for leg in (self.server_leg, self.client_leg):
             leg.journal = self._journal
-        self.seen_phone_rec = set()
-        self.seen_cam_rec = set()
+        self.seen_phone_rec = ReplayWindow()
+        self.seen_cam_rec = ReplayWindow()
+        self.bad_records = 0
         self.cam_sh_retries = 0
         self.phone_fin_retries = 0
         # Flipping the NST-in-hash formula on a phone retransmit was a
@@ -797,6 +834,20 @@ class SpliceEngine:
         if self.ev_f:
             self.ev_f.write(f"{time.time():.3f} {msg}\n")
             self.ev_f.flush()
+
+    def close(self):
+        for f in (self.av_f, self.ev_f, self.jr_f):
+            if f:
+                f.close()
+        self.av_f = self.ev_f = self.jr_f = None
+
+    def _bad_record(self, side, e):
+        """DTLS discards records that fail authentication; one corrupt or
+        stray datagram must not end the user's session."""
+        self.bad_records += 1
+        if self.bad_records in (1, 10, 100, 1000):
+            self.log(f"dropped {self.bad_records} undecryptable {side} "
+                     f"record(s): {e}")
 
     def log_av(self, direction, plaintext):
         if self.av_f:
@@ -993,7 +1044,14 @@ class SpliceEngine:
                         to_phone_out.append(lw)
                 continue
             self.seen_phone_rec.add((epoch, seq))
-            pt = self.server_leg.decrypt_record(rtype, ver, epoch, seq, body)
+            try:
+                pt = self.server_leg.decrypt_record(rtype, ver, epoch, seq,
+                                                    body)
+            except BadRecord as e:
+                if not self.server_leg.handshake_done:
+                    raise
+                self._bad_record("phone", e)
+                continue
             if rtype == RT_HANDSHAKE:
                 flight = self.server_leg.server_on_fin(pt)
                 self.progress += 1
@@ -1058,7 +1116,14 @@ class SpliceEngine:
             if (epoch, seq) in self.seen_cam_rec:
                 continue
             self.seen_cam_rec.add((epoch, seq))
-            pt = self.client_leg.decrypt_record(rtype, ver, epoch, seq, body)
+            try:
+                pt = self.client_leg.decrypt_record(rtype, ver, epoch, seq,
+                                                    body)
+            except BadRecord as e:
+                if not self.client_leg.handshake_done:
+                    raise
+                self._bad_record("camera", e)
+                continue
             if rtype == RT_HANDSHAKE:
                 self.client_leg.client_on_fin(pt)
                 self.progress += 1

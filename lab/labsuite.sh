@@ -20,10 +20,17 @@ if os.path.exists(f"{o}/api.json"):
     clips = glob.glob(f"{o}/events/*/clip.mp4")
     clip_ok = bool(clips) and hashlib.sha256(open(clips[0], "rb").read()).hexdigest() == api.get("clip_sha")
     sni = open(f"{o}/api-sni.txt").read().split() if os.path.exists(f"{o}/api-sni.txt") else []
-    sni_ok = sni == ["api.wyzecam.com", "cpl-t-sightsafe.wyzecam.com"]
+    sni_ok = sni == ["api.wyzecam.com", "cpl-t-sightsafe.wyzecam.com", "wyze-iot.s3.us-west-2.amazonaws.com"]
     good = good and api.get("ok") and "ENR harvested" in out and clip_ok and sni_ok
     print(f"  ({name}: harvest={'ENR harvested' in out} clip={clip_ok} upstream_sni={sni})")
 spliced = "spliced: both DTLS legs up" in out
+left = open(f"{o}/leftovers.txt").read().strip() if os.path.exists(f"{o}/leftovers.txt") else ""
+killed = os.path.exists(f"{o}/killed.txt")
+if killed:
+    good = True          # a killed session need not deliver media
+if left:
+    good = False
+    print(f"  ({name}: left behind: {left!r})")
 ends = [l.split("session over: ")[1] for l in out.splitlines() if "session over:" in l]
 latches = [l.split("relay flow ")[1] for l in out.splitlines() if "relay flow (" in l]
 print(f"{name}: {'PASS' if good else 'FAIL'} phone={sess} expected={exp} spliced={spliced} "
@@ -38,7 +45,11 @@ for spec in "direct-plain::direct" "splice-plain::splice" \
             "direct-multipath:MULTIPATH=1:direct" \
             "splice-multipath:MULTIPATH=1:splice" \
             "splice-multipath-diefirst:MULTIPATH=1 DIE_FIRST=1 DUR=30:splice" \
-            "splice-harvest:HARVEST=1:splice"; do
+            "splice-harvest:HARVEST=1:splice" \
+            "teardown-sigterm:KILL_AT=6 KILL_SIG=TERM:splice" \
+            "teardown-sighup:KILL_AT=6 KILL_SIG=HUP:splice" \
+            "teardown-double-ctrl-c:KILL_AT=6 KILL_SIG=INT2:splice" \
+            "teardown-sigkill-then-cleanup:KILL_AT=6 KILL_SIG=KILL:splice"; do
   name=${spec%%:*}; rest=${spec#*:}; envs=${rest%%:*}; mode=${rest##*:}
   env $envs bash $L/lab_run.sh $mode > /tmp/wslab-$name.log 2>&1
   cp /tmp/wslab-out/splice.out /tmp/wslab-$name.splice.out 2>/dev/null

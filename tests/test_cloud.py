@@ -61,3 +61,35 @@ def test_request_tap_splits_pipelined_requests_and_names_events():
     folder, fname = enr.event_name(got[1][1])
     assert folder.endswith("_1767225600") and fname == "clip.mp4"
     assert enr.event_name(b"/device/alarm/upload_alarm") is None
+
+
+def _client_hello(sni):
+    import ssl
+    ctx = ssl.create_default_context()
+    inb, outb = ssl.MemoryBIO(), ssl.MemoryBIO()
+    obj = ctx.wrap_bio(inb, outb, server_hostname=sni)
+    try:
+        obj.do_handshake()
+    except ssl.SSLWantReadError:
+        pass
+    return outb.read()
+
+
+def test_client_hello_sni():
+    hello = _client_hello("cpl-t-sightsafe.wyzecam.com")
+    assert enr.client_hello_sni(hello) == "cpl-t-sightsafe.wyzecam.com"
+    assert enr.client_hello_sni(hello[:40]) is None            # partial
+    assert enr.client_hello_sni(b"GET / HTTP/1.1\r\n") is None  # not TLS
+    assert enr.intercepts("api.wyzecam.com")
+    assert not enr.intercepts("sinker-t-usw2.s3.us-west-2.amazonaws.com")
+    assert not enr.intercepts("")
+
+
+def test_long_sni_still_gets_a_leaf():
+    name = "a" * 70 + ".wyzecam.com"
+    certfile, _ = enr.mint_leaf(name, tempfile.mkdtemp())
+    assert open(certfile).read().startswith("-----BEGIN CERTIFICATE-----")
+
+
+def test_bad_enr_escape_is_ignored():
+    assert enr.find_enr(b'{"enr":"ab\\xcd"}') is None
