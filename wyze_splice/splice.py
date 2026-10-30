@@ -149,13 +149,19 @@ def install_policy_route(changes):
     whole run. Raises SystemExit if they cannot be installed."""
     rule = ["fwmark", TP_MARK, "pref", TP_TABLE, "table", TP_TABLE]
     route = ["local", "0.0.0.0/0", "dev", "lo", "table", TP_TABLE]
-    tokens = [changes.add("ip", args=["rule", "del", *rule]),
-              changes.add("ip", args=["route", "del", *route])]
-    for args in (["rule", "add", *rule], ["route", "add", *route]):
-        r = ip_cmd(*args)
-        if r.returncode and "File exists" not in r.stderr:
+    tokens = []
+    for add, undo in ((["rule", "add", *rule], ["rule", "del", *rule]),
+                      (["route", "add", *route], ["route", "del", *route])):
+        tok = changes.add("ip", args=undo)
+        r = ip_cmd(*add)
+        if r.returncode and "File exists" in r.stderr:
+            changes.forget([tok])        # not ours: leave it at exit
+        elif r.returncode:
+            changes.forget([tok])
             changes.undo(tokens)
-            raise SystemExit(f"ip {' '.join(args)} failed: {r.stderr.strip()}")
+            raise SystemExit(f"ip {' '.join(add)} failed: {r.stderr.strip()}")
+        else:
+            tokens.append(tok)
     return tokens
 
 
@@ -635,8 +641,9 @@ class Splicer:
             if engine.failed:
                 m = f"engine failed ({engine.failed}); forwarding verbatim"
                 if "decrypt" in str(engine.failed):
-                    m += ("\n[!] the ENR may be stale (camera re-paired?): "
-                          "rerun with --reharvest")
+                    m += ("\n[!] the ENR does not match this camera (stale "
+                          "cache after a re-pair, or a wrong --enr); rerun "
+                          "with --reharvest")
             elif engine.client_leg.handshake_done:
                 m = "spliced: both DTLS legs up, decrypting media"
             elif engine.server_leg.handshake_done:

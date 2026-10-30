@@ -7,7 +7,9 @@ from .changes import run
 
 
 def ipt(*a):
-    return run(["iptables", *a])
+    # -w: wait for the xtables lock instead of failing when Docker,
+    # firewalld or fail2ban hold it
+    return run(["iptables", "-w", *a])
 
 
 def ip_cmd(*a):
@@ -15,7 +17,7 @@ def ip_cmd(*a):
 
 
 def ipt_restore(blob):
-    return run(["iptables-restore", "--noflush"], input=blob)
+    return run(["iptables-restore", "-w", "--noflush"], input=blob)
 
 
 def route_get(dst):

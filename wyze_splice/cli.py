@@ -6,8 +6,9 @@
   sudo wyze-splice cleanup             undo what a crashed run left behind
   wyze-splice extract <capture>/av.bin rebuild the video from a capture
 
-run and events find the camera by itself when the LAN has exactly one
-Wyze device; otherwise pass --target <camera ip>.
+run and events find the camera by themselves when the LAN has one Wyze
+device, and ask which one when it has several; --target <camera ip> skips
+the search.
 """
 import argparse
 import atexit
@@ -64,9 +65,12 @@ def _inhibit_sleep():
     exe = shutil.which("systemd-inhibit")
     if not exe:
         return
+    # the lock is held by `tail --pid`, which ends with this process even
+    # when it is killed outright
     p = subprocess.Popen([exe, "--what=sleep:idle:handle-lid-switch",
                           "--who=wyze-splice", "--why=camera gateway",
-                          "sleep", "infinity"], start_new_session=True,
+                          "tail", f"--pid={os.getpid()}", "-f", "/dev/null"],
+                         start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     atexit.register(p.terminate)
 
@@ -93,10 +97,12 @@ def _cache_enr(mac, enr):
     if d.get(_mac_key(mac), {}).get("enr") == enr:
         return
     d[_mac_key(mac)] = {"enr": enr, "seen": int(time.time())}
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    path = STATE_DIR / "enr.json"
-    path.write_text(json.dumps(d, indent=1) + "\n")
-    os.chmod(path, 0o600)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = STATE_DIR / "enr.json.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(d, indent=1) + "\n")
+    os.replace(tmp, STATE_DIR / "enr.json")
 
 
 # -- picking and checking the target -------------------------------------
@@ -105,7 +111,7 @@ def _pick_target(a):
     from .netutil import iface_for
     if a.target:
         return a.target
-    iface = iface_for("8.8.8.8")
+    iface = _internet_iface()
     print(f"[*] looking for Wyze devices on {iface}...")
     cams = find_cameras(iface)
     if len(cams) == 1:
@@ -114,10 +120,31 @@ def _pick_target(a):
     if not cams:
         sys.exit(f"no Wyze device answered on {iface}'s LAN; is the camera "
                  f"on this network? Pass --target <camera ip> to skip the search")
-    print("[!] more than one Wyze device on this LAN:")
-    for ip, mac in cams:
-        print(f"      {ip}  {mac}")
-    sys.exit("pick one with --target <camera ip>")
+    known = {_mac_key(m) for m in _cache()}
+    print(f"[*] {len(cams)} Wyze devices on this LAN (plugs and bulbs share "
+          f"the vendor prefix):")
+    for i, (ip, mac) in enumerate(cams, 1):
+        note = "  (ENR cached)" if _mac_key(mac) in known else ""
+        print(f"    {i}) {ip}  {mac}{note}")
+    if not sys.stdin.isatty():
+        sys.exit("pick one with --target <camera ip>")
+    while True:
+        try:
+            pick = input("which one is the camera? number or IP: ").strip()
+        except EOFError:
+            sys.exit("pick one with --target <camera ip>")
+        if pick.isdigit() and 1 <= int(pick) <= len(cams):
+            return cams[int(pick) - 1][0]
+        if pick in {ip for ip, _ in cams}:
+            return pick
+
+
+def _internet_iface():
+    from .netutil import iface_for
+    try:
+        return iface_for("8.8.8.8")
+    except OSError:
+        sys.exit("this host has no internet route; is its network up?")
 
 
 def _check_target(target, on_path):
@@ -132,9 +159,9 @@ def _check_target(target, on_path):
     if not on_path and not on_link(target):
         sys.exit(f"{target} is not on a LAN this host is attached to")
     iface = iface_for(target)
-    if iface_for("8.8.8.8") != iface:
+    if _internet_iface() != iface:
         sys.exit(f"the camera is on {iface} but this host's internet route "
-                 f"is on {iface_for('8.8.8.8')} (a VPN?); the camera's "
+                 f"is on {_internet_iface()} (a VPN?); the camera's "
                  f"traffic must leave through the interface it arrives on")
     return iface, local_ip_for(target)
 
@@ -153,8 +180,7 @@ class Armed:
 
     def __enter__(self):
         from .changes import Changes
-        if os.geteuid() != 0:
-            sys.exit("needs root (ARP, iptables, raw and transparent sockets)")
+        _need_root_linux()
         self.changes = Changes()
         self.changes.acquire()
         atexit.register(self._teardown)
@@ -177,7 +203,8 @@ class Armed:
         self.cam_mac = neighbor_mac(target)
         if not self.cam_mac:
             sys.exit(f"{target} does not answer on {iface}; is the camera on?")
-        ensure_conntrack()
+        if self.want_splice:
+            ensure_conntrack()
         self.out.mkdir(parents=True, exist_ok=True)
         # bind and check everything before touching the camera's route
         if self.want_splice:
@@ -198,7 +225,8 @@ class Armed:
             self.tap.start()
 
     def _need_harvest(self):
-        return self.want_splice and not self.enr()
+        return (self.want_splice and not self.enr()
+                and not getattr(self.a, "pass_through", False))
 
     def enr(self):
         a = self.a
@@ -274,24 +302,36 @@ def _default_out(prefix=""):
     return Path(f"captures/{prefix}{time.strftime('%Y%m%d-%H%M%S')}")
 
 
+def _new_root(path):
+    """The topmost directory of `path` that does not exist yet (what this
+    run will create), or path itself if it exists."""
+    path = Path(path).absolute()
+    root = path
+    while not root.parent.exists():
+        root = root.parent
+    return root if not path.exists() else path
+
+
 # -- commands ---------------------------------------------------------------
 def cmd_run(a):
     started = time.time()
     out = Path(a.out) if a.out else _default_out()
+    root = _new_root(out)
     a.events_dir = None if a.no_events else out / "events"
-    spliced, armed = 0, Armed(a, out, splice=True)
+    spliced, armed, no_enr = 0, Armed(a, out, splice=True), False
     try:
         with armed:
             enr = armed.enr()
             if enr and not a.enr:
                 print("[*] using the cached ENR for this camera")
-            if not enr:
+            if not enr and not a.pass_through:
                 enr = armed.wait_enr(a.harvest_timeout)
-                if not enr:
-                    sys.exit("no ENR seen; pass --enr, or try again later")
-                if a.no_events:
+                no_enr = not enr
+                if enr and a.no_events:
                     armed.tap.stop()
-            spliced = armed.splicer.run(enr, sessions=None if a.keep_going else 1)
+            if not no_enr:
+                spliced = armed.splicer.run(
+                    enr, sessions=None if a.keep_going else 1)
     except KeyboardInterrupt:
         print()
     events = armed.tap.events if armed.tap else []
@@ -299,15 +339,18 @@ def cmd_run(a):
     if spliced and av.exists() and not a.no_video and not a.pass_through:
         _export(av, out)
     if out.exists():
-        _give_to_user(out, started)
-    print(f"[+] {spliced} live session(s) spliced, {len(events)} event "
-          f"file(s) saved; output in {out}/")
+        _give_to_user(root, started)
+        print(f"[+] {spliced} live session(s) spliced, {len(events)} event "
+              f"file(s) saved; output in {out}/")
+    if no_enr:
+        print("[!] no ENR seen; pass --enr, or try again later")
     return 0 if spliced else 1
 
 
 def cmd_events(a):
     started = time.time()
     out = Path(a.out) if a.out else _default_out("events-")
+    root = _new_root(out)
     a.events_dir = out
     armed = Armed(a, out, splice=False)
     try:
@@ -324,30 +367,28 @@ def cmd_events(a):
         print()
     events = armed.tap.events if armed.tap else []
     if out.exists():
-        _give_to_user(out, started)
-    print(f"[+] {len(events)} event file(s) in {out}/")
+        _give_to_user(root, started)
+        print(f"[+] {len(events)} event file(s) in {out}/")
     return 0
 
 
 def cmd_find(a):
     from .discover import find_cameras
-    from .netutil import iface_for
-    if os.geteuid() != 0:
-        sys.exit("needs root (raw ARP)")
-    iface = a.iface or iface_for("8.8.8.8")
+    _need_root_linux()
+    iface = a.iface or _internet_iface()
     cams = find_cameras(iface)
     if not cams:
         print(f"no Wyze devices answered on {iface}")
         return 1
+    known = {_mac_key(m) for m in _cache()}
     for ip, mac in cams:
-        print(f"{ip}  {mac}")
+        print(f"{ip}  {mac}{'  (ENR cached)' if _mac_key(mac) in known else ''}")
     return 0
 
 
 def cmd_cleanup(a):
     from .changes import RUN_DIR, Changes, load
-    if os.geteuid() != 0:
-        sys.exit("needs root")
+    _need_root_linux()
     if not load(RUN_DIR / "changes.json"):
         print("nothing to undo")
         return 0
@@ -373,6 +414,8 @@ def _export(av, outdir):
         print(f"[+] video: {m['path']} ({size}, {m['seconds']:.1f}s)")
     if r.get("frame"):
         print(f"[+] still: {r['frame']}")
+    for err in r.get("errors", []):
+        print(f"[!] {err}")
     if r["dropped"]:
         print(f"    {r['dropped']} frame(s) left out: incomplete, or after an "
               f"incomplete I-frame (the camera keeps streaming briefly "
@@ -393,9 +436,19 @@ def _target_args(p):
     p.add_argument("--target", help="camera IPv4 address (default: find the "
                                     "one Wyze device on this LAN)")
     p.add_argument("--on-path", action="store_true",
-                   help="this host already routes the camera (its gateway, "
-                        "or the lab): skip ARP poisoning")
+                   help="this host already carries the camera's traffic on "
+                        "the camera's LAN interface (e.g. the lab): skip ARP "
+                        "poisoning")
     p.add_argument("--out", help="output directory (default captures/<time>)")
+
+
+def _need_root_linux():
+    if not sys.platform.startswith("linux"):
+        sys.exit("this command runs on Linux (it needs AF_PACKET, iptables "
+                 "and TPROXY); only `extract` works elsewhere")
+    if os.geteuid() != 0:
+        sys.exit("this command needs root (ARP, iptables, raw and "
+                 "transparent sockets): run it with sudo")
 
 
 def main(argv=None):

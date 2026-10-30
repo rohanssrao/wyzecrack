@@ -157,7 +157,7 @@ def decodable(tagged):
     session but stops completing I-frames (run14: the last chunk of every
     IDR from ~8 s after the phone left), and the P-frames after a broken
     IDR decode as smears in whatever moves."""
-    out, gop_ok = [], True
+    out, gop_ok = [], False      # nothing decodes before the first IDR
     for t in tagged:
         blob, complete = t[3], t[4]
         if _has_idr(blob):
@@ -272,11 +272,16 @@ def export(av_bin, outdir):
     parts = [p for p in parts if p]
     for n, every in enumerate(parts, 1):
         d = outdir if len(parts) == 1 else os.path.join(outdir, f"session-{n}")
-        r = _export_session(every, d)
+        try:
+            r = _export_session(every, d)
+        except Exception as e:  # noqa: BLE001  (one bad session must not
+            res.setdefault("errors", []).append(f"{d}: {e!r}")  # cost the rest)
+            continue
         res["sessions"] += 1
         res["frames"] += r["frames"]
         res["dropped"] += r["dropped"]
         res["mp4s"] += r["mp4s"]
+        res.setdefault("errors", []).extend(r.get("errors", []))
         if "frame" in r and "frame" not in res:
             res["frame"] = r["frame"]
     return res
@@ -299,7 +304,10 @@ def _export_session(every, outdir):
         part = os.path.join(outdir, f".seg{i}.h264")
         with open(part, "wb") as f:
             f.write(b"".join(t[3] for t in seg))
-        size = _size(part)
+        try:
+            size = _size(part)
+        except Exception:  # noqa: BLE001
+            size = None
         stem = ("video" if i == main else
                 f"video-{size[0]}x{size[1]}" if size else f"video-part{i + 1}")
         name, k = f"{stem}.mp4", 2
@@ -307,12 +315,20 @@ def _export_session(every, outdir):
             name, k = f"{stem}-{k}.mp4", k + 1
         used.add(name)
         mp4 = os.path.join(outdir, name)
-        make_mp4(part, mp4, seg)
+        try:
+            make_mp4(part, mp4, seg)
+        except Exception as e:  # noqa: BLE001
+            res.setdefault("errors", []).append(f"{mp4}: {e!r}")
+            os.remove(part)
+            continue
         res["mp4s"].append({"path": mp4, "size": size, "frames": len(seg),
                             "seconds": seg[-1][0] - seg[0][0]})
         if i == main:
             jpg = os.path.join(outdir, "frame.jpg")
-            if last_frame_jpeg(part, jpg):
-                res["frame"] = jpg
+            try:
+                if last_frame_jpeg(part, jpg):
+                    res["frame"] = jpg
+            except Exception:  # noqa: BLE001
+                pass
         os.remove(part)
     return res

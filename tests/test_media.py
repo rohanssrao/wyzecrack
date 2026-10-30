@@ -96,15 +96,16 @@ def test_single_packet_extended_frame():
 def test_decodable_drops_gop_after_incomplete_idr():
     idr = b"\x00\x00\x00\x01\x67\x4d" + b"\x00\x00\x00\x01\x65\x88"
     p = b"\x00\x00\x00\x01\x41\x9a"
-    frames = [(0, 5, 1, idr, True), (1, 7, 2, p, True),
+    frames = [(-1, 7, 0, p, True),            # before any IDR: undecodable
+              (0, 5, 1, idr, True), (1, 7, 2, p, True),
               (2, 5, 3, idr, False),          # IDR missing its last chunk
               (3, 7, 4, p, True), (4, 7, 5, p, True),
               (5, 5, 6, idr, True), (6, 7, 7, p, True)]
     kept = [f[2] for f in av_extract.decodable(frames)]
     assert kept == [1, 2, 6, 7]
     # an incomplete P-frame breaks the rest of its GOP too
-    frames[3] = (3, 7, 4, p, False)
-    frames[2] = (2, 5, 3, idr, True)
+    frames[4] = (3, 7, 4, p, False)
+    frames[3] = (2, 5, 3, idr, True)
     assert [f[2] for f in av_extract.decodable(frames)] == [1, 2, 3, 6, 7]
 
 

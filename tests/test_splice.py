@@ -517,6 +517,7 @@ class TestRelatchReason(unittest.TestCase):
             bad = subprocess.CompletedProcess([], 1)
             bad.stderr = "iptables-restore: bad rule"
             restore.return_value = bad
+            run.return_value.returncode = 0
             self.assertIsNone(install_splice_rules(
                 changes, "192.168.1.2", "192.168.1.20", 59344,
                 [("198.51.100.101", 34952)]))

@@ -353,7 +353,10 @@ class CloudTap:
                                      "ACCEPT"])):
             self._tokens.append(self.changes.add(
                 "ipt", args=["-t", table, "-D", chain, *spec]))
-            ipt("-t", table, "-I", chain, "1", *spec)
+            r = ipt("-t", table, "-I", chain, "1", *spec)
+            if r.returncode:
+                raise SystemExit(f"iptables -t {table} {chain} failed: "
+                                 f"{r.stderr.strip()}")
 
     def stop(self):
         """Remove the redirect (new connections go straight to the cloud)

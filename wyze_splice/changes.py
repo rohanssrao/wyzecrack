@@ -35,25 +35,50 @@ def run(argv, **kw):
 
 @contextlib.contextmanager
 def signals_held():
-    """Defer SIGINT/SIGTERM/SIGHUP (main thread only) until the block ends."""
-    if threading.current_thread() is not threading.main_thread():
+    """Defer SIGINT/SIGTERM/SIGHUP until the block ends, then deliver them.
+    Done with handlers rather than the signal mask: a process-directed
+    signal goes to any thread that has it unblocked, and Python then
+    raises it in the main thread anyway. Main thread only; elsewhere (and
+    when nested) it is a no-op."""
+    if (threading.current_thread() is not threading.main_thread()
+            or getattr(_held, "on", False)):
         yield
         return
-    old = signal.pthread_sigmask(signal.SIG_BLOCK, _SIGNALS)
+    pending = []
+    old = {sig: signal.signal(sig, lambda n, f: pending.append(n))
+           for sig in _SIGNALS}
+    _held.on = True
     try:
         yield
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        _held.on = False
+        for sig, h in old.items():
+            signal.signal(sig, h)
+        for sig in dict.fromkeys(pending):
+            signal.raise_signal(sig)
+
+
+_held = threading.local()
+
+
+# errors that mean the thing to undo is already gone
+_GONE = ("does not exist", "Bad rule", "No chain", "No such file",
+         "No such process", "Cannot find")
 
 
 def _undo(item):
+    """Undo one change; raises RuntimeError if it could not be undone."""
     kind = item["kind"]
-    if kind == "ipt":
-        run(["iptables", *item["args"]])
-    elif kind == "ip":
-        run(["ip", *item["args"]])
+    if kind in ("ipt", "ip"):
+        argv = (["iptables", "-w", *item["args"]] if kind == "ipt"
+                else ["ip", *item["args"]])
+        r = run(argv)
+        if r.returncode and not any(g in r.stderr for g in _GONE):
+            raise RuntimeError(r.stderr.strip() or f"exit {r.returncode}")
     elif kind == "sysctl":
-        Path(item["path"]).write_text(item["value"] + "\n")
+        p = Path(item["path"])
+        if p.exists():            # an interface may be gone by now
+            p.write_text(item["value"] + "\n")
     elif kind == "arp":
         from . import rawnet
         frame = bytes.fromhex(item["frame"])
@@ -103,7 +128,12 @@ class Changes:
         if stale:
             print(f"[*] undoing {len(stale)} change(s) left by a previous "
                   f"run that did not exit cleanly")
-            replay(stale)
+            left = replay(stale)
+            if left:
+                self.path.write_text(json.dumps(left, indent=1))
+                raise SystemExit("some changes could not be undone (see "
+                                 "above); fix that, then run "
+                                 "`wyze-splice cleanup` again")
             self.path.unlink(missing_ok=True)
 
     def release(self):
@@ -127,6 +157,8 @@ class Changes:
             return token
 
     def undo(self, tokens):
+        """Undo these changes, newest first. One that cannot be undone
+        stays in the journal (for `wyze-splice cleanup`) and is reported."""
         tokens = set(tokens)
         with self._lock, signals_held():
             for tok, item in reversed(list(self.items)):
@@ -136,10 +168,18 @@ class Changes:
                     _undo(item)
                 except Exception as e:  # noqa: BLE001
                     print(f"[!] could not undo {DESCRIBE[item['kind']](item)}: {e}")
+                    continue
                 self.items = [(t, i) for t, i in self.items if t != tok]
                 self._save()
             if not self.items:
                 self.path.unlink(missing_ok=True)
+
+    def forget(self, tokens):
+        """Drop journal entries without undoing them (for changes that
+        turned out not to have been made by us)."""
+        with self._lock:
+            self.items = [(t, i) for t, i in self.items if t not in set(tokens)]
+            self._save()
 
     def undo_all(self):
         self.undo([t for t, _ in self.items])
@@ -168,6 +208,9 @@ def load(path):
 
 
 def replay(items):
+    """Undo journal items newest first; returns those that failed (in
+    journal order)."""
+    failed = []
     with signals_held():
         for item in reversed(items):
             try:
@@ -175,3 +218,5 @@ def replay(items):
                 print(f"    undone: {DESCRIBE[item['kind']](item)}")
             except Exception as e:  # noqa: BLE001
                 print(f"[!] could not undo {DESCRIBE.get(item.get('kind'), str)(item)}: {e}")
+                failed.insert(0, item)
+    return failed

@@ -50,8 +50,11 @@ class OnPath:
             return
         self.tokens.append(self.changes.add(
             "ipt", args=["-t", table, "-D", chain, *spec]))
-        ipt("-t", table, "-I" if insert else "-A", chain,
-            *(["1"] if insert else []), *spec)
+        r = ipt("-t", table, "-I" if insert else "-A", chain,
+                *(["1"] if insert else []), *spec)
+        if r.returncode:
+            raise SystemExit(f"iptables -t {table} {chain} failed: "
+                             f"{r.stderr.strip()}")
 
     def start(self):
         c = self.changes

@@ -19,6 +19,9 @@ Only use this against cameras you own or are authorized to test.
 
 ## Commands
 
+Run them as `sudo .venv/bin/wyze-splice <command>` from the repo (shortened
+to `wyze-splice` below).
+
 | command | does |
 |---|---|
 | `sudo wyze-splice run` | splice the next live view; also saves motion events meanwhile |
@@ -27,8 +30,9 @@ Only use this against cameras you own or are authorized to test.
 | `sudo wyze-splice cleanup` | undo the network changes of a run that was killed |
 | `wyze-splice extract <capture>` | rebuild the video from a capture's `av.bin` |
 
-`run` and `events` pick the camera themselves when the LAN has exactly one
-Wyze device; otherwise pass `--target <camera ip>` (see `find`).
+`run` and `events` find the camera by themselves: with one Wyze device on
+the LAN they use it, and with several (Wyze plugs and bulbs share the vendor
+prefix) they ask which one. `--target <camera ip>` skips the search.
 
 Useful `run` options:
 
@@ -37,8 +41,8 @@ Useful `run` options:
 - `--enr <ENR>` supplies the camera's ENR instead of harvesting it, and
   `--reharvest` ignores the cached one.
 - `--no-events` leaves motion-event uploads alone.
-- `--on-path` is for a host that already routes the camera (its gateway, or
-  the lab); it skips the ARP step.
+- `--on-path` skips the ARP step, for a host that already carries the
+  camera's traffic on the camera's LAN interface (the lab does this).
 - `--journal` also logs all key material; `--pass-through` diverts the
   session without decrypting it (an A/B control).
 
