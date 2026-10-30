@@ -140,7 +140,8 @@ class OnPath:
 
     def close(self):
         """Stop the ARP threads, then undo everything start() did."""
-        if self.stop.is_set():
+        if self.stop.is_set() or not self.tokens:
+            self.stop.set()
             return
         print("[*] restoring the camera's route (ARP, NAT, sysctls)...")
         self.stop.set()

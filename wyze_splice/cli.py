@@ -3,6 +3,7 @@
   sudo wyze-splice run                 splice the next live view, save events
   sudo wyze-splice events              only save motion-event clips
   sudo wyze-splice find                list Wyze devices on this LAN
+  sudo wyze-splice check               pre-flight checks, camera untouched
   sudo wyze-splice cleanup             undo what a crashed run left behind
   wyze-splice extract <capture>/av.bin rebuild the video from a capture
 
@@ -82,9 +83,12 @@ def _mac_key(mac):
 
 def _cache():
     try:
-        return json.loads((STATE_DIR / "enr.json").read_text())
+        d = json.loads((STATE_DIR / "enr.json").read_text())
     except (OSError, ValueError):
         return {}
+    # early versions keyed entries by camera IP, with the MAC inside
+    return {(_mac_key(v["mac"]) if v.get("mac") else k): v
+            for k, v in d.items()}
 
 
 def _cached_enr(mac):
@@ -172,8 +176,9 @@ class Armed:
     lock, on-path routing, the HTTPS interceptor and the splicer. Leaving
     it (normally, by exception, Ctrl-C, SIGTERM or SIGHUP) undoes it all."""
 
-    def __init__(self, a, out, splice):
-        self.a, self.out, self.want_splice = a, out, splice
+    def __init__(self, a, out, splice, dry=False):
+        self.a, self.out, self.want_splice, self.dry = a, out, splice, dry
+        self.iface = self.gateway = None
         self.onpath = self.tap = self.splicer = None
         self.cam_mac = None
         self.changes = None
@@ -203,9 +208,11 @@ class Armed:
         self.cam_mac = neighbor_mac(target)
         if not self.cam_mac:
             sys.exit(f"{target} does not answer on {iface}; is the camera on?")
+        self.iface = iface
         if self.want_splice:
             ensure_conntrack()
-        self.out.mkdir(parents=True, exist_ok=True)
+        if not self.dry:
+            self.out.mkdir(parents=True, exist_ok=True)
         # bind and check everything before touching the camera's route
         if self.want_splice:
             self.splicer = Splicer(self.changes, target, us, self.out,
@@ -217,9 +224,12 @@ class Armed:
                                 events_dir=getattr(a, "events_dir", None),
                                 on_event=lambda p: print(f"[+] motion event: {p}"))
             self.tap.listen()
-        _inhibit_sleep()
         self.onpath = OnPath(self.changes, target, iface,
                              poison=not a.on_path)
+        self.gateway = self.onpath.gateway
+        if self.dry:
+            return
+        _inhibit_sleep()
         self.onpath.start()
         if self.tap:
             self.tap.start()
@@ -372,6 +382,33 @@ def cmd_events(a):
     return 0
 
 
+def cmd_check(a):
+    """Every pre-flight check of `run`, without touching the camera."""
+    from .netutil import ipt
+    a.pass_through = a.journal = False
+    a.events_dir = None
+    armed = Armed(a, Path("."), splice=True, dry=True)
+    with armed:
+        print(f"[+] camera {a.target} ({armed.cam_mac}) on {armed.iface}, "
+              f"gateway {armed.gateway}")
+        print("[+] TPROXY, conntrack netlink, UDP 47821 and TCP 18443: ok")
+        print("[+] ENR: " + ("cached" if armed.enr() else
+                             "not cached yet; the first run harvests it"))
+        policy = ipt("-S", "FORWARD").stdout.splitlines()[:1]
+        if policy and policy[0].endswith("DROP"):
+            print("[*] iptables FORWARD policy is DROP; run adds accept "
+                  "rules for the camera")
+        if shutil.which("nft"):
+            nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True,
+                                 text=True).stdout
+            if "hook forward" in nft and "policy drop" in nft:
+                print("[!] an nftables chain drops forwarded traffic; iptables "
+                      "rules may not override it, and the camera would lose "
+                      "its connection")
+    print("[+] ready: `run` would work from here")
+    return 0
+
+
 def cmd_find(a):
     from .discover import find_cameras
     _need_root_linux()
@@ -486,6 +523,14 @@ def main(argv=None):
     ev.add_argument("--count", type=int, default=0,
                     help="stop after this many clips (default: until Ctrl-C)")
     ev.set_defaults(fn=cmd_events)
+
+    ck = sub.add_parser("check", help="run every pre-flight check without "
+                                      "touching the camera")
+    ck.add_argument("--target", help="camera IPv4 address (default: find it)")
+    ck.add_argument("--on-path", action="store_true", help=argparse.SUPPRESS)
+    ck.add_argument("--enr", help=argparse.SUPPRESS)
+    ck.add_argument("--reharvest", action="store_true", help=argparse.SUPPRESS)
+    ck.set_defaults(fn=cmd_check)
 
     f = sub.add_parser("find", help="list Wyze devices on this LAN")
     f.add_argument("--iface", help="interface to search (default: the one "
