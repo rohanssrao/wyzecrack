@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Autonomous live test: the real Wyze app in the emulator opens the
 # camera's live view through the TUTK relays while wyze-splice runs.
-# usage: sudo CAM=<camera ip> bash live/livetest.sh [splice|pass] [watch seconds]
+# usage: sudo CAM=<camera ip> bash live/livetest.sh [splice|pass|drive] [watch seconds]
+#   drive: only open the live view in the app (isolated); something else,
+#          such as the GUI, runs wyze-splice
 #   TILE_XY  where the camera's tile sits on the app's home screen
 #            (default "543 1700": the second tile on a Pixel 6 AVD)
 #   EMU_HOME emulator state (default ~/wyze-emu of the sudo user)
@@ -48,14 +50,19 @@ say "isolation on (public IP $PUB); mode $MODE"
 TD=$(nix build --no-link --print-out-paths nixpkgs#tcpdump 2>/dev/null)/bin/tcpdump
 $TD -ni enp10s0 -s0 -U -w $LOG/cam.pcap "host $CAM" > /dev/null 2>&1 &
 TDP=$!
+# the app's own traffic (all of it leaves as this host's address)
+$TD -ni any -s 200 -U -w $LOG/app.pcap "not host $CAM and not port 22 and not port 41641 and not port 443 and (udp or tcp)" > /dev/null 2>&1 &
+TDP="$TDP $!"
 ARGS="--target $CAM --out $OUT --journal"
 [ "$MODE" = pass ] && ARGS="$ARGS --pass-through"
 cd $R
-PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc .venv/bin/wyze-splice run $ARGS > $LOG/tool.out 2>&1 &
-TOOL=$!
-for i in $(seq 1 40); do grep -q "watching" $LOG/tool.out && break; sleep 1; done
-grep -q "watching" $LOG/tool.out || { say "tool did not start:"; cat $LOG/tool.out; exit 1; }
-say "tool watching; opening the app"
+if [ "$MODE" != drive ]; then
+  PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc .venv/bin/wyze-splice run $ARGS > $LOG/tool.out 2>&1 &
+  TOOL=$!
+  for i in $(seq 1 40); do grep -q "watching" $LOG/tool.out && break; sleep 1; done
+  grep -q "watching" $LOG/tool.out || { say "tool did not start:"; cat $LOG/tool.out; exit 1; }
+  say "tool watching; opening the app"
+fi
 
 adb shell monkey -p com.hualai -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
 sleep 12
@@ -73,6 +80,7 @@ for t in 3 6 10 15 20 25 30 40 50 60; do
 done
 say "leaving the live view"
 adb shell input keyevent 4; sleep 1; adb shell am force-stop com.hualai
+[ "$MODE" = drive ] && { chown -R $U $LOG; echo "logs: $LOG"; exit 0; }
 for i in $(seq 1 60); do kill -0 $TOOL 2>/dev/null || break; grep -q "session(s) spliced" $LOG/tool.out && break; sleep 1; done
 sleep 2
 cp -r $OUT/splice.log $LOG/ 2>/dev/null

@@ -426,6 +426,16 @@ class TestRelatchReason(unittest.TestCase):
             undo = [" ".join(i["args"]) for _t, i in changes.items]
             return restore.call_args[0][0], tokens, undo
 
+    def test_viewer_left_when_the_phone_goes_quiet(self):
+        from wyze_splice.splice import _relatch_reason
+        e = unittest.mock.Mock(started=True, failed=None)
+        e.client_leg.handshake_done = True
+        self.assertIsNone(_relatch_reason(e, 100.0, 120.0, 120.0,
+                                          last_cam=120.0, last_phone=117.0))
+        self.assertIn("viewer left", _relatch_reason(e, 100.0, 120.0, 120.0,
+                                                     last_cam=120.0,
+                                                     last_phone=115.9))
+
     def test_install_splice_rules_pins_the_camera_side(self):
         blob, tokens, undo = self._install([("198.51.100.152", 44369)])
         # only the camera's side is diverted; the relay reaches our own

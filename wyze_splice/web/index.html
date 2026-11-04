@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wyze-splice</title>
+<link rel="stylesheet" href="/assets/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5' fill='%232ee6b8'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="dot"></span>wyze-splice</div>
+  <div class="crumb" id="crumb"></div>
+  <button class="ghost" id="quit" title="Stop and exit">Quit</button>
+</header>
+
+<main>
+  <!-- camera picker -->
+  <section id="picker" class="view">
+    <div class="hero">
+      <h1>Pick a camera</h1>
+      <p>When someone opens its live view in the Wyze app from outside this network, you'll see it here too.</p>
+    </div>
+    <div id="scan" class="scan">
+      <div class="radar"><span></span><span></span><span></span></div>
+      <div>Looking for Wyze cameras on your network…</div>
+    </div>
+    <div id="cams" class="cams"></div>
+    <div id="nocams" class="empty hidden">
+      <p>No Wyze cameras answered. Is this computer on the same network as the camera?</p>
+    </div>
+    <div class="row-actions"><button class="ghost" id="rescan">Scan again</button></div>
+  </section>
+
+  <!-- one camera -->
+  <section id="session" class="view hidden">
+    <div class="stage" id="stage">
+      <canvas id="video"></canvas>
+      <div class="status" id="status">
+        <div class="status-icon" id="status-icon"></div>
+        <h2 id="status-title"></h2>
+        <p id="status-text"></p>
+        <div class="status-extra" id="status-extra"></div>
+      </div>
+      <div class="hud hidden" id="hud">
+        <div class="hud-tl"><span class="pill live"><i></i>LIVE</span><span class="pill" id="rec">0:00</span></div>
+        <div class="hud-tr"><span class="pill" id="res"></span></div>
+        <div class="hud-br">
+          <button class="icon" id="audio" title="Sound">🔇</button>
+          <button class="icon" id="shot" title="Save a still">📷</button>
+          <button class="icon" id="full" title="Full screen">⛶</button>
+        </div>
+      </div>
+    </div>
+    <div class="bar">
+      <div class="cam-title"><span id="cam-name"></span><span class="sub" id="cam-sub"></span></div>
+      <ol class="steps" id="steps">
+        <li data-step="onpath">On path</li>
+        <li data-step="enr">Key</li>
+        <li data-step="watch">Viewer</li>
+      </ol>
+      <button class="ghost" id="stop">Stop</button>
+    </div>
+    <h3 class="saved-h">Saved <span class="count" id="saved-count"></span></h3>
+    <div class="tiles" id="saved"><p class="muted">Live views you catch and the camera's motion clips are saved here.</p></div>
+  </section>
+</main>
+
+<div class="modal hidden" id="modal"><div class="modal-box"><button class="icon close" id="modal-close">✕</button><video id="player" controls playsinline></video></div></div>
+<div class="toasts" id="toasts"></div>
+<footer class="foot">For cameras you own or may test.</footer>
+<script src="/assets/app.js"></script>
+</body>
+</html>

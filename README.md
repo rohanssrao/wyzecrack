@@ -13,8 +13,10 @@ Only use this against cameras you own or are authorized to test.
 - `iptables` with the TPROXY target, and `ip` (iproute2). Everything else
   comes from the Python dependencies: packet capture and ARP use
   `AF_PACKET` sockets with kernel BPF filters (no libpcap), conntrack is
-  handled over netlink with pyroute2, and PyAV and Pillow write the MP4
-  and JPEG in-process.
+  handled over netlink with pyroute2, PyAV and Pillow write the MP4 and
+  JPEG in-process, and aiohttp serves the page.
+- For the page: a browser with WebCodecs (current Chrome, Edge, Firefox
+  or Safari) to play the live view.
 
 Tested against a Wyze Cam v3 (WYZE_CAKP2JFUS) on firmware 4.36.17.21, with
 the phone app on cellular, from a NixOS host. The lab suite also passes on
@@ -25,51 +27,56 @@ it in a throwaway container.
 
 ```
 uv sync
-sudo .venv/bin/wyze-splice run
+.venv/bin/wyze-splice
 ```
 
-1. The tool finds the camera and gets on its network path.
-2. On the first run it waits for the camera's ENR, the per-camera secret
-   the stream key is derived from. The camera sends it at boot, on motion
-   alarms and every few hours: walk past the camera to trigger one. The
-   ENR is then cached per camera in `/var/lib/wyze-splice/enr.json`, so
-   later runs skip this step.
-3. Open the camera's live view in the Wyze app, from anywhere (the app
-   reaches the camera through ThroughTek relays). The app plays normally.
-4. When the viewer leaves, the tool undoes its network changes and writes
-   the decrypted stream to `captures/<time>/video.mp4`, with a still in
-   `frame.jpg`.
+It asks for your password (it needs root to reroute the camera's traffic)
+and opens a page in your browser:
+
+1. **Pick a camera.** It lists the Wyze cameras on the network, with their
+   model.
+2. **The first time,** it waits for the camera's key (its ENR, which the
+   stream key is derived from). The camera sends it to Wyze at boot, on
+   motion alarms and every few hours; walk past the camera to trigger one.
+   It's then remembered.
+3. **Open the camera's live view in the Wyze app** from a phone that isn't
+   on the camera's network (on cellular, for example). On the same Wi-Fi
+   the app talks to the camera directly over the LAN, which never passes
+   through this computer.
+4. **Watch along.** The live view plays in the page, with sound if you
+   turn it on, while the app keeps playing normally. When the viewer
+   leaves, the video is saved with its audio, and the page waits for the
+   next one. Motion clips the camera uploads meanwhile are saved too.
+
+Stop or Quit in the page (or Ctrl-C in the terminal) puts the camera's
+network back.
 
 ## Commands
 
-Run commands as `sudo .venv/bin/wyze-splice <command>` from the repo. They
-are shortened to `wyze-splice` below.
+The page is the default. For scripts and headless hosts there are
+commands too; they also ask for the password themselves.
 
 | command | does |
 |---|---|
-| `wyze-splice run` | splice the next live view, saving motion events in the meantime |
+| `wyze-splice` | the page: pick a camera, watch along, everything saved |
+| `wyze-splice run` | splice the next live view from the terminal; also saves motion events meanwhile |
 | `wyze-splice events` | only save motion events (`clip.mp4` + `snapshot.jpg`), until Ctrl-C or `--count N` |
 | `wyze-splice find` | list Wyze devices on the LAN (by their IEEE MAC prefixes) |
 | `wyze-splice check` | run all of `run`'s pre-flight checks without touching the camera |
 | `wyze-splice cleanup` | undo the network changes of a run that was killed |
 | `wyze-splice extract <capture>` | rebuild the video from a capture's `av.bin` |
 
-`run` and `events` find the camera on their own. If there is one Wyze
-device on the LAN, they use it. If there are several (Wyze plugs and bulbs
-share the vendor prefix), they ask which one. `--target <camera ip>` skips
-the search.
-
-For each command's options, use `--help` or see
+`wyze-splice gui --listen <address>` serves the page on another address
+(a tailnet address, say) to watch from another device; `--no-browser`
+just prints the link. For each command's options, use `--help` or see
 [docs/guide.md](docs/guide.md#options).
 
 ## Output
 
-`captures/<time>/` holds:
-
-- `video.mp4`: the live view (its HD part), at true speed
-- `frame.jpg`
-- `events/<time>_<id>/clip.mp4` + `snapshot.jpg` for each motion event
-- the raw capture files described in [docs/guide.md](docs/guide.md#output-files)
+The page saves under `captures/<camera>/`: one folder per live view
+(`video.mp4` with sound, `frame.jpg`, `meta.json`) and `events/` for
+motion clips. `run` writes to `captures/<time>/` instead. The raw capture
+files are described in [docs/guide.md](docs/guide.md#output-files).
 
 ## More
 

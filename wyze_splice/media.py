@@ -169,7 +169,66 @@ def decodable(tagged):
     return out
 
 
-def make_mp4(h264_path, mp4_path, frames):
+AUDIO_CHANNEL = 3
+AUDIO_RATE = 8000          # the camera's live audio: s16le PCM, 8 kHz mono
+
+
+def audio_frames(records, t_from, t_to):
+    """[(t, pcm)] of a session's audio (codec 0x8C, PCM) between two times,
+    each frame once."""
+    seen, out = set(), []
+    for ts, (ch, frame_no, cidx, payload, end, count) in records:
+        if (ch == AUDIO_CHANNEL and end and frame_no not in seen
+                and t_from - 0.5 <= ts <= t_to + 0.5):
+            seen.add(frame_no)
+            out.append((ts, payload))
+    return out
+
+
+def _add_audio_stream(out):
+    from fractions import Fraction
+    stream = out.add_stream("aac", rate=AUDIO_RATE, layout="mono")
+    stream.time_base = Fraction(1, AUDIO_RATE)
+    return stream
+
+
+def _mux_audio(out, stream, audio, t0):
+    """Encode the PCM frames to AAC on `stream`. The audio is laid end to
+    end from its first frame's arrival (it arrives in bursts like the
+    video, but is captured at a steady rate)."""
+    import av
+    from fractions import Fraction
+    resampler = av.AudioResampler(format="fltp", layout="mono", rate=AUDIO_RATE)
+    fifo = av.AudioFifo()
+    pts = max(0, round((audio[0][0] - t0) * AUDIO_RATE))
+    tb = Fraction(1, AUDIO_RATE)
+
+    def encode(frame):
+        nonlocal pts
+        if frame is not None:
+            frame.pts, frame.time_base = pts, tb
+            pts += frame.samples
+        for pkt in stream.encode(frame):
+            out.mux(pkt)
+    for _t, pcm in audio:
+        n = len(pcm) // 2
+        if not n:
+            continue
+        f = av.AudioFrame(format="s16", layout="mono", samples=n)
+        f.planes[0].update(pcm[:n * 2])
+        f.sample_rate = AUDIO_RATE
+        for r in resampler.resample(f):
+            r.pts = None              # the fifo keeps its own sample count
+            fifo.write(r)
+        size = stream.codec_context.frame_size or 1024
+        while fifo.samples >= size:
+            encode(fifo.read(size))
+    if fifo.samples:
+        encode(fifo.read())
+    encode(None)
+
+
+def make_mp4(h264_path, mp4_path, frames, audio=None):
     """Remux the Annex-B stream into an MP4 without re-encoding, giving
     each frame its arrival time as its timestamp, so playback runs at
     true speed (relay delivery is bursty, so a fixed frame rate would
@@ -177,7 +236,8 @@ def make_mp4(h264_path, mp4_path, frames):
 
     frames: the [(t, ch, frame_no, blob, ended)] list that produced
     h264_path, in order. Each demuxed packet is mapped back to its frame
-    by byte offset. Returns the number of frames written."""
+    by byte offset. audio: [(t, pcm)] to add as an AAC track. Returns the
+    number of frames written."""
     import av
     from bisect import bisect_right
     from fractions import Fraction
@@ -192,6 +252,8 @@ def make_mp4(h264_path, mp4_path, frames):
         vin = inp.streams.video[0]
         vout = out.add_stream_from_template(vin)
         vout.time_base = Fraction(1, tb)
+        # every stream must exist before the first packet is written
+        aout = _add_audio_stream(out) if audio else None
         t0 = frames[0][0]
         for i, pkt in enumerate(inp.demux(vin)):
             if pkt.size == 0:
@@ -209,6 +271,11 @@ def make_mp4(h264_path, mp4_path, frames):
             pkt.stream = vout
             out.mux(pkt)
             n += 1
+        if aout is not None:
+            try:
+                _mux_audio(out, aout, audio, t0)
+            except Exception:  # noqa: BLE001  (video without sound beats none)
+                pass
     return n
 
 
@@ -267,13 +334,13 @@ def export(av_bin, outdir):
     longest; others video-WxH.mp4) and frame.jpg, the last picture of
     video.mp4. Returns totals plus every MP4 written."""
     res = {"frames": 0, "dropped": 0, "mp4s": [], "sessions": 0}
-    parts = [[t for t in assemble(recs) if t[1] in VIDEO_CHANNELS]
+    parts = [([t for t in assemble(recs) if t[1] in VIDEO_CHANNELS], recs)
              for recs in sessions(av_bin)]
-    parts = [p for p in parts if p]
-    for n, every in enumerate(parts, 1):
+    parts = [p for p in parts if p[0]]
+    for n, (every, recs) in enumerate(parts, 1):
         d = outdir if len(parts) == 1 else os.path.join(outdir, f"session-{n}")
         try:
-            r = _export_session(every, d)
+            r = _export_session(every, d, recs)
         except Exception as e:  # noqa: BLE001  (one bad session must not
             res.setdefault("errors", []).append(f"{d}: {e!r}")  # cost the rest)
             continue
@@ -287,7 +354,7 @@ def export(av_bin, outdir):
     return res
 
 
-def _export_session(every, outdir):
+def _export_session(every, outdir, records=()):
     os.makedirs(outdir, exist_ok=True)
     tagged = decodable(every)
     res = {"frames": len(tagged), "dropped": len(every) - len(tagged),
@@ -316,7 +383,8 @@ def _export_session(every, outdir):
         used.add(name)
         mp4 = os.path.join(outdir, name)
         try:
-            make_mp4(part, mp4, seg)
+            make_mp4(part, mp4, seg,
+                     audio_frames(records, seg[0][0], seg[-1][0]))
         except Exception as e:  # noqa: BLE001
             res.setdefault("errors", []).append(f"{mp4}: {e!r}")
             os.remove(part)

@@ -49,6 +49,19 @@ video goes to `session-N/`.
 
 ## Troubleshooting
 
+- **The live view plays in the app but nothing shows up here:** the phone
+  is probably on the camera's Wi-Fi. There the app reaches the camera
+  directly over the LAN, which doesn't pass through this computer; use a
+  phone on cellular or another network.
+
+- **"that live view did not pass through this host":** the camera opened
+  channels for a live view, but the stream never came through here. Some
+  of the camera's connections go straight through the router, probably
+  ones it opened before wyze-splice started. (Seen behind a home router
+  router: the camera's traffic to two of its relays never reached this
+  host while its other traffic did.) Unplugging the camera for 5 seconds
+  while wyze-splice runs should fix it: the connections it opens then
+  pass through here.
 - **"waiting for the camera's ENR" for a long time:** trigger a motion
   alarm. If the tool reports that the camera refuses the certificate, this
   firmware no longer trusts the eMudhra CA. Supply the ENR with `--enr`.

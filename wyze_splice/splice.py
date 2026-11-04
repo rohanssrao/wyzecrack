@@ -40,7 +40,7 @@ from .tutk import (CMD_CHANNEL_OPEN, STUN_RELAY_PORT, is_clienthello_flight,
                    is_dtls_wrap, is_hs_flight, is_plain_clienthello, wrap_cmd)
 from .dtls import SpliceEngine, session_key
 
-from . import rawnet
+from . import events, rawnet
 import threading
 
 # never latch on DNS or NTP
@@ -269,6 +269,7 @@ class RelayFlowWatcher:
         self.n_from_cam = self.n_to_cam = 0   # forwarding health
         self._warned = False
         self.sid = None           # TUTK session id of the latched session
+        self.stop = threading.Event()   # set to end wait()/learn_paths()
         self.sids_seen = {}       # session id -> first seen (SID_TTL)
 
     def _latch(self, ip, port, cam_port, how, sid=None):
@@ -421,10 +422,13 @@ class RelayFlowWatcher:
         # watcher survives the host sleeping.
         deadline = time.time() + timeout
         prog = rawnet.udp_filter([self.target], [self.masq_ip])
-        while not self.found.is_set() and time.time() < deadline:
+
+        def done():
+            return self.found.is_set() or self.stop.is_set()
+        while not done() and time.time() < deadline:
             try:
                 rawnet.sniff(iface_for(self.target), prog, rawnet.parse_udp,
-                             self._cb, self.found.is_set,
+                             self._cb, done,
                              timeout=max(1, min(20, deadline - time.time())))
                 self._health()
             except OSError as e:
@@ -444,7 +448,7 @@ class RelayFlowWatcher:
         deadline = time.time() + timeout
 
         def known():
-            return (self.found.is_set()
+            return (self.found.is_set() or self.stop.is_set()
                     or any(k[1] == STUN_RELAY_PORT for k in self.last_seen))
         while not known() and time.time() < deadline:
             try:
@@ -477,8 +481,21 @@ CH_WAIT_SESSION_START = 20
 CH_WAIT = 5
 
 
+BYPASS_HINT = (
+    "[!] that live view did not pass through this host: some of the "
+    "camera's\n    connections go straight through the router, probably ones "
+    "it opened\n    before wyze-splice started (routers often fast-path busy "
+    "connections).\n    Unplug the camera for 5 seconds while wyze-splice "
+    "runs; the connections\n    it opens then pass through here.")
+
+# the phone sends AV acknowledgements several times a second while it
+# watches; this long without any DTLS from it means the viewer left. The
+# camera keeps streaming into the dead session for tens of seconds after.
+PHONE_SILENT = 4
+
+
 def _relatch_reason(engine, latch_time, last_packet, now, last_cam=None,
-                    ch_wait=CH_WAIT):
+                    ch_wait=CH_WAIT, last_phone=None):
     """Why the armed session should be abandoned, or None to keep it.
 
     Live timing: an attempt can stall at the camera (HVR answered,
@@ -514,6 +531,8 @@ def _relatch_reason(engine, latch_time, last_packet, now, last_cam=None,
         return None
     if last_cam is not None and now - last_cam > CAM_SILENT:
         return f"camera silent {CAM_SILENT}s (channel closed)"
+    if last_phone is not None and now - last_phone > PHONE_SILENT:
+        return f"viewer left (phone silent {PHONE_SILENT}s)"
     if now - last_packet > 30:
         return "session quiet 30s"
     return None
@@ -645,6 +664,12 @@ class Splicer:
         self.spliced_sessions = 0
         self.tokens = []
         self.sock = self.log = None
+        # front-end hooks (the GUI); the CLI leaves them unset
+        self.stop = self.watcher.stop          # set() ends run() cleanly
+        self.session_dir = None    # () -> Path for one session's files
+        self.on_av = None          # (direction, ts, plaintext) live media
+        self.on_session_end = None  # (dir, spliced) after each session
+        self._sess_out = self.out
 
     # -- plumbing --------------------------------------------------------
     def _record(self, tag, data):
@@ -669,10 +694,11 @@ class Splicer:
     def _new_engine(self):
         if self.pass_through:
             return None
-        return SpliceEngine(self.enr, av_log=str(self.out / "av.bin"),
-                            event_log=str(self.out / "splice.log"),
-                            journal=str(self.out / "journal.jsonl")
-                            if self.journal else None)
+        out = self._sess_out
+        return SpliceEngine(self.enr, av_log=str(out / "av.bin"),
+                            event_log=str(out / "splice.log"),
+                            journal=str(out / "journal.jsonl")
+                            if self.journal else None, on_av=self.on_av)
 
     def setup(self):
         # catch-all transparent socket: TPROXY needs a listener on
@@ -714,18 +740,40 @@ class Splicer:
         self.enr = enr
         self.out.mkdir(parents=True, exist_ok=True)
         self.log = open(self.out / "interpose.log", "ab", buffering=0)
+        events.emit("learning")
         self.watcher.learn_paths()
         print(f"[*] watching {self.target} for a live-view session: "
               f"open the camera's live view in the Wyze app")
+        events.emit("watching")
         try:
-            while sessions is None or self.spliced_sessions < sessions:
+            while ((sessions is None or self.spliced_sessions < sessions)
+                   and not self.stop.is_set()):
                 if not self.watcher.wait(timeout=60):
                     continue
+                before = self.spliced_sessions
+                self._sess_out = (self.session_dir() if self.session_dir
+                                  else self.out)
+                self._sess_out.mkdir(parents=True, exist_ok=True)
+                events.emit("session", state="armed",
+                            how=self.watcher.sid and "session start" or "late")
                 reason = self._session()
-                if reason == "interrupted":
+                spliced = self.spliced_sessions > before
+                events.emit("session", state="ended", reason=reason,
+                            spliced=spliced)
+                if self.on_session_end:
+                    self.on_session_end(self._sess_out, spliced)
+                if reason in ("interrupted", "stopped"):
                     break
                 print(f"[*] session over: {reason}")
+                if (reason.startswith("stale latch") and self.watcher.sid
+                        and not spliced):
+                    # a session started (the camera opened channels) but no
+                    # ClientHello ever came through here: it took a path
+                    # that bypasses this host
+                    print(BYPASS_HINT)
+                    events.emit("missed")
                 self.watcher.rearm()
+                events.emit("watching")
         except KeyboardInterrupt:
             pass
         return self.spliced_sessions
@@ -809,7 +857,7 @@ class Splicer:
                       "send_err": 0})
         self.storm_guard.dropped = 0
         milestone = [""]
-        latch_time = last_packet = last_cam = time.time()
+        latch_time = last_packet = last_cam = last_phone = time.time()
         tx, record, storm_guard = self._tx, self._record, self.storm_guard
 
         def status():
@@ -832,6 +880,10 @@ class Splicer:
             if m and m != milestone[0]:
                 milestone[0] = m
                 print(f"[splice] {m}")
+                state = ("failed" if engine.failed else
+                         "live" if engine.client_leg.handshake_done else
+                         "handshake")
+                events.emit("session", state=state, detail=m.split("\n")[0])
 
         # packets to the camera mirror the relay side's arrival TTL;
         # packets to the relay mirror the camera's (64 -> 63)
@@ -892,6 +944,8 @@ class Splicer:
                 now = time.time()
                 if engine and not engine.failed:
                     deliver(*engine.tick(now))
+                if self.stop.is_set():
+                    return "stopped"
                 if now > next_stats:
                     next_stats = now + 10
                     stats["storm_dropped"] = storm_guard.dropped
@@ -943,6 +997,7 @@ class Splicer:
                             record(b"R", data)
                             if dtls:
                                 phone_path_for[wrap_cmd(data)] = pth
+                                last_phone = time.time()
                             # a failed engine would leave the app's retry
                             # un-spliced; a fresh PLAIN CH (never a ghost
                             # cookie-CH retransmit) rebuilds it
@@ -979,7 +1034,9 @@ class Splicer:
                                  or engine.client_leg.handshake_done)
                     else None,
                     ch_wait=(CH_WAIT_SESSION_START if self.watcher.sid
-                             else CH_WAIT))
+                             else CH_WAIT),
+                    last_phone=(last_phone if engine
+                                and engine.client_leg.handshake_done else None))
                 if reason:
                     return reason
         except KeyboardInterrupt:

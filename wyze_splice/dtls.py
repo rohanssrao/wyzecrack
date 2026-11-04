@@ -841,7 +841,8 @@ class SpliceEngine:
     """
 
     def __init__(self, enr, tpl=None, av_log=None, event_log=None,
-                 journal=None, retransmit_after=1.0, retransmit_max=4):
+                 journal=None, retransmit_after=1.0, retransmit_max=4,
+                 on_av=None):
         self.tpl = tpl or Templates.embedded()
         self.psk = derive_psk(enr)
         self.psk_full = hashlib.sha256(enr.encode()).digest()
@@ -860,6 +861,7 @@ class SpliceEngine:
         self.progress = 0
         self.retransmit_after = retransmit_after
         self.retransmit_max = retransmit_max
+        self.on_av = on_av      # (direction, timestamp, plaintext) -> None
         self.av_f = open(av_log, "ab") if av_log else None
         self.ev_f = open(event_log, "a") if event_log else None
         self.jr_f = open(journal, "a") if journal else None
@@ -916,10 +918,16 @@ class SpliceEngine:
                      f"record(s): {e}")
 
     def log_av(self, direction, plaintext):
+        now = time.time()
         if self.av_f:
-            self.av_f.write(struct.pack("<BdI", direction, time.time(),
+            self.av_f.write(struct.pack("<BdI", direction, now,
                                         len(plaintext)) + plaintext)
             self.av_f.flush()
+        if self.on_av:
+            try:
+                self.on_av(direction, now, plaintext)
+            except Exception:  # noqa: BLE001  (a viewer must never cost the splice)
+                pass
         if direction == 0 and len(plaintext) >= 22 and plaintext[:2] == b"\x09\x00":
             # TUTK AV-layer counters ACK from the phone (go2rtc Session25
             # msgAckCounters layout, matches the real phone byte-for-byte):

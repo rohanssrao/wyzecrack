@@ -1,5 +1,6 @@
 """wyze-splice: decrypt a Wyze Cam v3 live view while the app keeps playing.
 
+  wyze-splice                          open the app (pick a camera, watch along)
   sudo wyze-splice run                 splice the next live view, save events
   sudo wyze-splice events              only save motion-event clips
   sudo wyze-splice find                list Wyze devices on this LAN
@@ -18,6 +19,7 @@ import json
 import os
 import shutil
 import signal
+import threading
 import subprocess
 import sys
 import time
@@ -182,6 +184,10 @@ class Armed:
         self.onpath = self.tap = self.splicer = None
         self.cam_mac = None
         self.changes = None
+        self._down = threading.Lock()
+        # front-end hooks
+        self.stop = None                 # threading.Event: abandon waits
+        self.on_motion = lambda p: print(f"[+] motion event: {p}")
 
     def __enter__(self):
         from .changes import Changes
@@ -201,6 +207,7 @@ class Armed:
         from .netutil import ensure_conntrack
         from .onpath import OnPath, neighbor_mac
         from .splice import Splicer
+        from . import events
         a = self.a
         target = _pick_target(a)
         a.target = target
@@ -222,7 +229,7 @@ class Armed:
         if getattr(a, "events_dir", None) is not None or self._need_harvest():
             self.tap = CloudTap(self.changes, target,
                                 events_dir=getattr(a, "events_dir", None),
-                                on_event=lambda p: print(f"[+] motion event: {p}"))
+                                on_event=self.on_motion)
             self.tap.listen()
         self.onpath = OnPath(self.changes, target, iface,
                              poison=not a.on_path)
@@ -230,9 +237,11 @@ class Armed:
         if self.dry:
             return
         _inhibit_sleep()
+        events.emit("onpath", state="arming")
         self.onpath.start()
         if self.tap:
             self.tap.start()
+        events.emit("onpath", state="on")
 
     def _need_harvest(self):
         return (self.want_splice and not self.enr()
@@ -247,22 +256,30 @@ class Armed:
         return _cached_enr(self.cam_mac)
 
     def wait_enr(self, timeout):
+        from . import events
         tap = self.tap
         print("[*] waiting for the camera's ENR. It sends it at boot, on "
               "motion alarms (walk past the camera), and every few hours")
+        events.emit("enr", state="waiting", stats=dict(tap.stats))
         start = time.monotonic()
-        last, warned = None, False
-        while not tap.enr_found.wait(5):
+        last, printed, warned = None, None, False
+        while not tap.enr_found.wait(2):
+            if self.stop and self.stop.is_set():
+                return None
             st = dict(tap.stats)
-            if st != last and time.monotonic() - start > 30:
+            if st != last:
+                events.emit("enr", state="waiting", stats=st)
+                last = st
+            if st != printed and time.monotonic() - start > 30:
                 print(f"    camera HTTPS so far: {st['intercepted']} read, "
                       f"{st['passed']} passed through, {st['tls_failed']} "
                       f"refused our certificate")
-                last = st
+                printed = st
             if st["tls_failed"] >= 3 and not st["intercepted"] and not warned:
                 print("[!] the camera keeps refusing the eMudhra certificate: "
                       "this firmware may no longer trust that CA. Pass --enr "
                       "if you have the ENR some other way")
+                events.emit("enr", state="refused", stats=st)
                 warned = True
             if timeout and time.monotonic() - start > timeout:
                 return None
@@ -271,6 +288,7 @@ class Armed:
                   f"is {self.cam_mac}")
         print("[+] ENR harvested from the camera's own HTTPS")
         _cache_enr(self.cam_mac, tap.enr)
+        events.emit("enr", state="harvested")
         return tap.enr
 
     def __exit__(self, *exc):
@@ -279,21 +297,27 @@ class Armed:
 
     def _teardown(self):
         from .changes import signals_held
-        if self.changes is None:
-            return
-        with signals_held():
-            for part in (self.tap, self.splicer, self.onpath):
-                if part is None:
-                    continue
-                try:
-                    part.stop() if part is self.tap else part.close()
-                except Exception as e:  # noqa: BLE001
-                    print(f"[!] teardown step failed: {e!r}")
-            self.changes.undo_all()
-            self.changes.release()
-            if self.tap and self.tap.enr_found.is_set() and self.cam_mac:
-                _cache_enr(self.cam_mac, self.tap.enr)
-            self.changes = None
+        # atexit and the owner's `with` can both get here, from different
+        # threads: one does the work, the other waits for it
+        with self._down:
+            if self.changes is None:
+                return
+            with signals_held():
+                self._undo_everything()
+
+    def _undo_everything(self):
+        for part in (self.tap, self.splicer, self.onpath):
+            if part is None:
+                continue
+            try:
+                part.stop() if part is self.tap else part.close()
+            except Exception as e:  # noqa: BLE001
+                print(f"[!] teardown step failed: {e!r}")
+        self.changes.undo_all()
+        self.changes.release()
+        if self.tap and self.tap.enr_found.is_set() and self.cam_mac:
+            _cache_enr(self.cam_mac, self.tap.enr)
+        self.changes = None
 
 
 def _give_to_user(path, since):
@@ -479,6 +503,31 @@ def _target_args(p):
     p.add_argument("--out", help="output directory (default captures/<time>)")
 
 
+def _sudo_reexec():
+    """Re-run this command under sudo (it prompts for the password), so
+    users never need to type sudo themselves."""
+    if os.geteuid() == 0 or not sys.platform.startswith("linux"):
+        return
+    exe = shutil.which("sudo")
+    if not exe:
+        sys.exit("wyze-splice needs root; run it as root")
+    print("wyze-splice needs root to reroute the camera's traffic.")
+    keep = ",".join(k for k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+                                "DBUS_SESSION_BUS_ADDRESS", "PYTHONPATH")
+                    if k in os.environ)
+    argv = [exe] + ([f"--preserve-env={keep}"] if keep else []) + \
+        [sys.executable, "-m", "wyze_splice", *sys.argv[1:]]
+    os.execv(exe, argv)
+
+
+def cmd_gui(a):
+    _sudo_reexec()
+    _need_root_linux()
+    from .gui import serve
+    return serve(listen=a.listen, port=a.port, out=a.out or "captures",
+                 browser=not a.no_browser)
+
+
 def _need_root_linux():
     if not sys.platform.startswith("linux"):
         sys.exit("this command runs on Linux (it needs AF_PACKET, iptables "
@@ -489,12 +538,25 @@ def _need_root_linux():
 
 
 def main(argv=None):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # progress shows at once
+    except (AttributeError, ValueError):
+        pass
     sys.stdout = _QuietStream(sys.stdout)
     sys.stderr = _QuietStream(sys.stderr)
     _install_signals()
     ap = argparse.ArgumentParser(prog="wyze-splice", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
+    g = sub.add_parser("gui", help="the app (default): pick a camera, watch along")
+    g.add_argument("--listen", default="127.0.0.1",
+                   help="address to serve the page on (e.g. a tailnet address "
+                        "to watch from another device)")
+    g.add_argument("--port", type=int, default=0)
+    g.add_argument("--out", help="where recordings go (default ./captures)")
+    g.add_argument("--no-browser", action="store_true",
+                   help="print the link instead of opening a browser")
+    g.set_defaults(fn=cmd_gui)
 
     r = sub.add_parser("run", help="get on-path, splice the next live view, "
                                    "write the video")
@@ -548,6 +610,10 @@ def main(argv=None):
     e.set_defaults(fn=cmd_extract)
 
     a = ap.parse_args(argv)
+    if a.cmd is None:
+        a = ap.parse_args(["gui", *(argv or [])])
+    if a.cmd in ("run", "events", "find", "check", "cleanup"):
+        _sudo_reexec()
     try:
         return a.fn(a)
     except KeyboardInterrupt:
