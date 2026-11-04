@@ -2,7 +2,8 @@
 
 Every P2P/relay datagram is a 0xCC51 wrapper: a 28-byte header (magic
 `51 cc`, little-endian cmd at [4:6], plen at [6:8], ticket + session id at
-[14:24]), the payload, and a 20-byte trailer keyed on the header. DTLS
+[14:24]; the ticket differs per path, the session id at [16:24] does
+not), the payload, and a 20-byte trailer keyed on the header. DTLS
 records ride in the payload of two commands:
 
   0x1502  DTLS via the data relay (the session's main path)

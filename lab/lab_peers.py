@@ -59,15 +59,27 @@ def media_pt(i):
 
 
 def tag(w, port):
-    """Stamp a per-session wrapper ticket (bytes 14:16), as real sessions have."""
+    """Stamp a per-session wrapper ticket (bytes 14:16) and session id
+    (bytes 16:24), as real sessions have: both differ between sessions."""
     w = bytearray(w)
     w[14:16] = struct.pack("<H", port & 0xffff)
+    w[16:18] = struct.pack("<H", port & 0xffff)
     return bytes(w)
 
 
-def as_cmd(w, cmd):
+# live (2026-11-04): a session's 0x1402 wrappers on the STUN-relay path
+# carry a different ticket than its 0x1502 wrappers on the data relay;
+# the session id (16:24) is the same on both
+STUN_TICKET_XOR = 0xD18B
+
+
+def as_stun(w):
+    """The same wrapper as sent over the STUN relay: cmd 0x1402 and that
+    path's own ticket."""
     w = bytearray(w)
-    struct.pack_into("<H", w, 4, cmd)
+    struct.pack_into("<H", w, 4, 0x1402)
+    t = struct.unpack_from("<H", w, 14)[0]
+    struct.pack_into("<H", w, 14, t ^ STUN_TICKET_XOR)
     return bytes(w)
 
 
@@ -142,7 +154,7 @@ def run_cam(dur):
         c = cmd_of(d)
         if a == STUN and c == 0x1402:
             # same session, other path: the wrapper ticket names the session
-            ticket = struct.unpack("<H", d[14:16])[0]
+            ticket = struct.unpack("<H", d[14:16])[0] ^ STUN_TICKET_XOR
             a = next((r for r in sessions if r[1] & 0xffff == ticket), RELAYS[0])
             cs, c = sessions.get(a), 0x1502           # camera answers on the data relay
         else:
@@ -239,7 +251,7 @@ def run_phone(dur):
                 f = leg.client_hello() if ps.ch_sent == 0 else leg.last_flight
                 wch = tag(wrap(f, cam_side=False), ps.s.getsockname()[1])
                 if MULTIPATH and cam_via_stun[0]:
-                    stun.sendto(as_cmd(wch, 0x1402), cam_via_stun[0])
+                    stun.sendto(as_stun(wch), cam_via_stun[0])
                 else:
                     ps.s.sendto(wch, ps.cam)
                 ps.ch_sent += 1

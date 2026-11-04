@@ -670,6 +670,11 @@ _EMBEDDED = {
 }
 
 
+def session_key(w):
+    """The wrapper's TUTK session id (bytes 16:24)."""
+    return w[16:24]
+
+
 class BadRecord(ValueError):
     """A record that does not authenticate under the adopted keys."""
 
@@ -978,11 +983,14 @@ class SpliceEngine:
                 msgs = parse_hs(recs[0][4])
                 if msgs and msgs[0][0] == HS_CH:
                     self.started = True
-                    # wrapper ticket + session id of this TUTK session;
-                    # a later session on the same relay tuple carries a
-                    # different one and must bypass this engine (run8:
-                    # the app's retry sent its CKE over the old tuple)
-                    self.session_key = w[14:24]
+                    # the TUTK session id: a later session on the same
+                    # relay tuple carries a different one and must bypass
+                    # this engine (the app's retry can send its CKE over
+                    # the old tuple). Not the ticket at [14:16]: it differs
+                    # per path, and the phone's ClientHello may come via
+                    # a STUN relay (0x1402) while the rest of the session
+                    # runs on the data relay (0x1502).
+                    self.session_key = session_key(w)
                     self.log("phone CH -> terminating; starting client leg")
                     flight = self.server_leg.server_on_ch(msgs[0])
                     self.progress += 1

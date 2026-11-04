@@ -445,3 +445,16 @@ if __name__ == "__main__":
     test_engine_discovers_nonrfc()
     test_engine_cam_retry()
     print("ALL TESTS PASSED")
+
+
+def test_session_key_ignores_the_per_path_ticket():
+    """Live 2026-11-04: the phone's ClientHello came as 0x1402 with ticket
+    3e02 via a STUN relay; the camera's flights were 0x1502 with ticket
+    ef89 on the data relay. Same session id, same session."""
+    from wyze_splice.dtls import session_key
+    sid = bytes.fromhex("513361dc1b4ebf55")
+    via_stun = bytes(14) + bytes.fromhex("3e02") + sid + bytes(30)
+    via_data = bytes(14) + bytes.fromhex("ef89") + sid + bytes(30)
+    other = bytes(14) + bytes.fromhex("ef89") + bytes(8) + bytes(30)
+    assert session_key(via_stun) == session_key(via_data)
+    assert session_key(other) != session_key(via_data)

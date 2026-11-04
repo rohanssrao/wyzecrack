@@ -37,7 +37,7 @@ from .changes import signals_held
 from .netutil import conntrack_delete, iface_for, ip_cmd, ipt, ipt_restore
 from .tutk import (CMD_CHANNEL_OPEN, STUN_RELAY_PORT, is_clienthello_flight,
                    is_dtls_wrap, is_hs_flight, is_plain_clienthello, wrap_cmd)
-from .dtls import SpliceEngine
+from .dtls import SpliceEngine, session_key
 
 from . import rawnet
 import threading
@@ -726,7 +726,7 @@ class Splicer:
                                 cam_path_for[wrap_cmd(data)] = pth
                             if (engine and not engine.failed
                                     and engine.started and dtls
-                                    and data[14:24] == engine.session_key):
+                                    and session_key(data) == engine.session_key):
                                 deliver(*engine.on_cam_packet(data))
                                 if engine.failed:
                                     # never swallow the packet that broke it
@@ -750,7 +750,7 @@ class Splicer:
                                 engine = self._new_engine()
                                 latch_time = time.time()
                             if (engine and not engine.failed and dtls
-                                    and (data[14:24] == engine.session_key
+                                    and (session_key(data) == engine.session_key
                                          if engine.started
                                          else is_clienthello_flight(data))):
                                 deliver(*engine.on_phone_packet(data))
