@@ -89,6 +89,7 @@ const STATUS = {
   learning: ["⇄", "spin", "Almost ready", "Learning the camera's relay paths."],
   waiting: ["📱", "pulse", "Waiting for someone to watch", "Open this camera's live view in the Wyze app from a phone that isn't on this Wi-Fi (on cellular, or anywhere else). The feed shows up here as well."],
   connecting: ["⚡", "spin", "Someone opened the live view", "Joining the stream…"],
+  joined: ["⚡", "spin", "Joined", "Waiting for the first picture…"],
   saving: ["💾", "spin", "The viewer left", "Saving the video…"],
   stopping: ["⏻", "spin", "Stopping", "Putting the camera's network back the way it was."],
   error: ["!", "bad", "Something went wrong", ""],
@@ -124,6 +125,7 @@ function applyState(s) {
   if (steps.enr && steps.enr.status === "active" && s.phase !== "error") key = "enr";
   if (steps.enr && steps.enr.status === "problem") key = "enr_refused";
   if (s.phase === "starting" && steps.watch?.detail?.note === "learning") key = "learning";
+  if (s.phase === "connecting" && s.session?.state === "joined") key = "joined";
   let extra = "";
   if (key === "enr") { const n = steps.enr.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
   if (s.phase === "connecting" && s.session?.state === "failed") extra = "This attempt could not be joined; waiting for the app's retry.";
@@ -287,7 +289,8 @@ function connect() {
       case "viewer_left":
         $("#stage").classList.add("dim");
         resetVideo(true);
-        if (ev.spliced) { saving = true; setStatus("saving"); }
+        if (ev.spliced && ev.had_video) { saving = true; setStatus("saving"); }
+        else if (ev.spliced) toast("The camera hung up before sending a picture · waiting for the next try");
         break;
       case "library":
         if (saving) { saving = false; if (state.phase === "waiting") setStatus("waiting"); }

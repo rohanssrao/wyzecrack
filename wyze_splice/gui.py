@@ -195,14 +195,18 @@ class Controller:
             elif s == "handshake":
                 self.set(phase="connecting", session={"state": "handshake"})
             elif s == "live":
-                self.set(phase="live", hint=None,
-                         session={"state": "live", "since": time.time()})
+                # both handshakes are done; "live" waits for the first
+                # picture (the camera may still drop the session first)
+                self.set(phase="connecting", hint=None,
+                         session={"state": "joined"})
             elif s == "failed":
                 self.set(phase="connecting",
                          session={"state": "failed", "detail": ev.get("detail")})
             elif s == "ended":
-                was_live = ev.get("spliced")
-                self.hub.send_json({"kind": "viewer_left", "spliced": was_live})
+                was_live = self.state.get("phase") == "live"
+                self.hub.send_json({"kind": "viewer_left",
+                                    "spliced": bool(ev.get("spliced")),
+                                    "had_video": was_live})
 
     def _run(self):
         from .cli import Armed, _cached_enr, _give_to_user
@@ -258,6 +262,9 @@ class Controller:
             self.live.feed(direction, ts, plaintext)
 
     def _video(self, f):
+        if self.state.get("phase") != "live":
+            self.set(phase="live", session={"state": "live",
+                                            "since": time.time()})
         st = self.live_stats
         codec = codec_string(f.sps)
         size = self.live.size
@@ -312,6 +319,15 @@ class Controller:
             return
         main = next((m for m in r["mp4s"] if m["path"].endswith("/video.mp4")),
                     None)
+        if not main:
+            # joined, but the camera sent no picture before it hung up
+            keep = self.lib.root / ".missed" / out.name
+            keep.mkdir(parents=True, exist_ok=True)
+            if (out / "splice.log").exists():
+                shutil.move(str(out / "splice.log"), keep / "splice.log")
+            shutil.rmtree(out, ignore_errors=True)
+            self.hub.send_json({"kind": "dropped"})
+            return
         cam = self.camera or {}
         meta = {"mac": cam.get("mac"), "ip": cam.get("ip"),
                 "camera": cam.get("name") or cam.get("model"),
