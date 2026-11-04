@@ -111,7 +111,7 @@ engine_camera = None
 VERBOSE = os.environ.get("TRACE") == "1"
 
 
-def run_session(media_plaintexts, ack_plaintexts):
+def run_session(media_plaintexts, ack_plaintexts, split=False):
     global engine_phone, engine_camera
     engine = SpliceEngine(ENR)
     engine_phone = DTLSLeg("client", PSK, Templates.embedded())
@@ -124,6 +124,10 @@ def run_session(media_plaintexts, ack_plaintexts):
         while replies and rounds < 20:
             rounds += 1
             nxt = []
+            if split:
+                from wyze_splice.dtls import split_records
+                replies = [(side, r) for side, f in replies
+                           for r in (split_records(f) or [f])]
             for side, flight in replies:
                 if VERBOSE:
                     recs = parse_records(flight)
@@ -194,6 +198,16 @@ def test_engine_media_roundtrip():
     assert got_media == media, "camera media did not round-trip byte-exact"
     assert got_acks == acks, "phone acks did not round-trip byte-exact"
     assert engine.server_leg.handshake_done and engine.client_leg.handshake_done
+
+
+def test_engine_split_flights():
+    """Both peers send each record of a handshake flight in its own
+    datagram (live 2026-11-04): the engine must answer the same way, since
+    no whole-flight-sized wrapper ever arrives."""
+    media = [b"\x0a\x00" + bytes([i]) * (40 + i) for i in range(4)]
+    acks = [b"\x09\x00" + struct.pack("<I", 1) + b"\xff\xff\xff\xff"]
+    engine, got_media, got_acks = run_session(media, acks, split=True)
+    assert got_media == media and got_acks == acks
 
 
 def test_engine_media_roundtrip_varied_sizes():

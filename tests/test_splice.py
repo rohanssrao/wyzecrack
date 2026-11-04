@@ -248,27 +248,6 @@ class TestWatcherLatch(unittest.TestCase):
                                 self._wrapper(b"\x17\xfe\xfd" + b"\x00" * 30)))
             self.assertFalse(w.found.is_set())
 
-    def test_inbound_plain_ch_latches_fast(self):
-        """The phone's plain CH arrives ~1.1s before the camera's first
-        outbound flight: latching on it gives the rule install a wide
-        window and the engine a clean plain-CH entry (splice3-style)."""
-        w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
-            ipt.return_value.returncode = 0
-            ip_cmd.returncode.returncode = 0
-            # the camera's 0x1102 channel-open to the relay comes first
-            probe = self._wrapper(b"\x00" * 40, cmd=0x1102)
-            w._cb(self._pkt("192.168.1.20", "198.51.100.101", 50169, 24520, probe))
-            self.assertFalse(w.found.is_set())
-            # then the phone's plain CH from the same relay endpoint
-            w._cb(self._pkt("198.51.100.101", "192.168.1.20", 24520, 50169,
-                            self._plain_ch()))
-            self.assertTrue(w.found.is_set())
-            self.assertEqual((w.relay_ip, w.relay_port),
-                             ("198.51.100.101", 24520))
-            self.assertEqual(w.cam_port, 50169)
-
     def test_inbound_ch_from_unknown_flow_ignored(self):
         """A plain CH from a relay endpoint the camera never opened a
         flow to must not latch (the latch tuple must be a real camera
@@ -302,53 +281,40 @@ class TestWatcherLatch(unittest.TestCase):
                             self._hs_flight()))
             self.assertFalse(w.found.is_set())
 
-    def test_pre_ch_channel_open_latches(self):
-        """The camera's 0x1102 channel-open to a fresh tuple that answers
-        back is the data flow being born ~440ms before the phone's CH:
-        arming there gives the clean splice3 entry."""
-        w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
-            ipt.return_value.returncode = 0
-            ip_cmd.returncode.returncode = 0
-            ch_open = self._wrapper(b"\x00" * 40, cmd=0x1102)
-            w._cb(self._pkt("192.168.1.20", "198.51.100.101", 50169, 24520, ch_open))
-            self.assertFalse(w.found.is_set())
-            # the relay answers from the same tuple
-            w._cb(self._pkt("198.51.100.101", "192.168.1.20", 24520, 50169, ch_open))
-            self.assertFalse(w.found.is_set())
-            # the camera's next channel-open retransmit latches
-            w._cb(self._pkt("192.168.1.20", "198.51.100.101", 50169, 24520, ch_open))
-            self.assertTrue(w.found.is_set())
-            self.assertEqual((w.relay_ip, w.relay_port),
-                             ("198.51.100.101", 24520))
-            self.assertEqual(w.cam_port, 50169)
+    def _open(self, sid=b"\xaa" * 8):
+        w = bytearray(self._wrapper(b"\x00" * 40, cmd=0x1102))
+        w[16:24] = sid
+        return bytes(w)
 
-    def test_one_way_channel_open_spray_ignored(self):
-        """The camera sprays 0x1102s at unreachable candidates (run-6:
-        AWS-internal 10.80.246.69) with no response -- no latch."""
+    def test_session_start_latches_on_the_first_channel_open(self):
+        """A live view starts with the camera's 0x1102s carrying the new
+        session id, ~150 ms before the phone's ClientHello (live
+        2026-11-04): the first one arms, so nothing waits for a reply."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt:
-            ipt.return_value.returncode = 0
-            ch_open = self._wrapper(b"\x00" * 40, cmd=0x1102)
-            for _ in range(10):
-                w._cb(self._pkt("192.168.1.20", "198.51.100.30", 50169, 43001,
-                                ch_open))
-            self.assertFalse(w.found.is_set())
+        w.last_seen[("198.51.100.52", 3478)] = __import__("time").time()
+        w._cb(self._pkt("192.168.1.20", "203.0.113.213", 46906, 42727, self._open()))
+        self.assertTrue(w.found.is_set())
+        self.assertEqual((w.relay_ip, w.relay_port, w.cam_port, w.sid),
+                         ("203.0.113.213", 42727, 46906, b"\xaa" * 8))
+        # the camera's live STUN-relay paths are diverted with it
+        self.assertEqual(w.extra_paths, [("198.51.100.52", 3478)])
 
-    def test_old_flow_channel_open_ignored(self):
-        """A tuple the camera has been talking to for >10s is not a
-        fresh data flow (ghost keepalives, long-lived control flows)."""
-        import time as _time
+    def test_a_session_id_arms_once(self):
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt:
-            ipt.return_value.returncode = 0
-            w.seen[("198.51.100.31", 43002)] = [_time.time() - 15, 5]
-            ch_open = self._wrapper(b"\x00" * 40, cmd=0x1102)
-            w._cb(self._pkt("198.51.100.31", "192.168.1.20", 43002, 50169, ch_open))
-            w._cb(self._pkt("192.168.1.20", "198.51.100.31", 50169, 43002, ch_open))
-            w._cb(self._pkt("192.168.1.20", "198.51.100.31", 50169, 43002, ch_open))
-            self.assertFalse(w.found.is_set())
+        w._cb(self._pkt("192.168.1.20", "198.51.100.101", 50169, 24520, self._open()))
+        self.assertTrue(w.found.is_set())
+        w.rearm()
+        for _ in range(5):      # retransmits of the same session's opens
+            w._cb(self._pkt("192.168.1.20", "198.51.100.101", 50169, 24520, self._open()))
+        self.assertFalse(w.found.is_set())
+        w._cb(self._pkt("192.168.1.20", "198.51.100.109", 50169, 24521,
+                        self._open(b"\xbb" * 8)))
+        self.assertTrue(w.found.is_set())
+
+    def test_channel_open_to_a_private_address_does_not_arm(self):
+        w = self._watcher()
+        w._cb(self._pkt("192.168.1.20", "10.0.2.15", 46906, 33039, self._open()))
+        self.assertFalse(w.found.is_set())
 
     def test_tried_tuple_not_re_latched_but_plain_ch_still_latches(self):
         """After a teardown the same tuple must not re-latch on channel-

@@ -731,6 +731,37 @@ class Templates:
                      ("ch", "sh", "ske", "cke_body", "nst")))
 
 
+def split_records(payload):
+    """DTLS byte stream -> [record bytes], each with its 13-byte header."""
+    out, off = [], 0
+    while off + 13 <= len(payload):
+        ln = struct.unpack(">H", payload[off + 11:off + 13])[0]
+        if off + 13 + ln > len(payload):
+            break
+        out.append(payload[off:off + 13 + ln])
+        off += 13 + ln
+    return out
+
+
+def wrapped_payload(w):
+    """The DTLS bytes of a wrapped emission (one packet, or a split tuple)."""
+    if isinstance(w, tuple):
+        return b"".join(p[WRAPPER_HDR:-WRAPPER_TRL] for p in w)
+    return w[WRAPPER_HDR:-WRAPPER_TRL]
+
+
+def flatten(packets):
+    """Emission lists may hold split flights (tuples); the wire wants
+    packets."""
+    out = []
+    for p in packets:
+        if isinstance(p, tuple):
+            out.extend(p)
+        elif p:
+            out.append(p)
+    return out
+
+
 class WrapperCache:
     """Per-direction pool of (header28, trailer20) pairs keyed by payload
     length. Populated 1:1 from received packets; consumed by our emissions
@@ -738,7 +769,7 @@ class WrapperCache:
     step with the original flow and the header-keyed trailer stays valid."""
 
     def __init__(self):
-        self.pool = {}          # plen -> deque[(header, trailer)]
+        self.pool = {}          # plen -> deque[(header, trailer, first4)]
         self.last_header = None
 
     def add(self, wrapper_packet):
@@ -750,16 +781,46 @@ class WrapperCache:
         plen_field = struct.unpack("<H", header[6:8])[0]
         if plen_field != len(wrapper_packet) - 12:
             return              # not a plain single-payload wrapper; skip
-        self.pool.setdefault(payload_len, deque()).append((header, trailer))
+        first4 = wrapper_packet[WRAPPER_HDR:WRAPPER_HDR + 4]
+        self.pool.setdefault(payload_len, deque()).append(
+            (header, trailer, first4))
         self.last_header = header
 
     def take(self, payload):
         q = self.pool.get(len(payload))
         while q:
-            header, trailer = q.popleft()
+            header, trailer, _f4 = q.popleft()
             if struct.unpack("<H", header[6:8])[0] == len(payload) + 36:
                 return header + payload + trailer
         return None
+
+    def take_split(self, payload):
+        """A multi-record flight as one wrapper per record, mirroring a
+        peer that sends each record of a flight in its own datagram (the
+        camera and phone both do this at times). The trailer covers the
+        header and the payload's first 4 bytes, so each record must take a
+        wrapper whose original payload began the same way. Returns a tuple
+        of wrapped packets, or None (taking nothing) if any record lacks
+        one."""
+        recs = split_records(payload)
+        if len(recs) < 2:
+            return None
+        need = {}
+        for r in recs:
+            need.setdefault((len(r), r[:4]), []).append(r)
+        for (n, f4), rs in need.items():
+            have = sum(1 for e in self.pool.get(n, ()) if e[2] == f4)
+            if have < len(rs):
+                return None
+        out = []
+        for r in recs:
+            q = self.pool[len(r)]
+            for i, (header, trailer, f4) in enumerate(q):
+                if f4 == r[:4]:
+                    del q[i]
+                    out.append(header + r + trailer)
+                    break
+        return tuple(out)
 
     def synthesize(self, payload):
         """Fallback: patch plen into the most recent header, keep its
@@ -880,6 +941,11 @@ class SpliceEngine:
     def _emit(self, direction, payload, flight=False):
         cache = self.to_cam if direction == "to_cam" else self.to_phone
         wrapped = cache.take(payload)
+        if wrapped is None and flight:
+            wrapped = cache.take_split(payload)
+            if wrapped:
+                self.log(f"{direction} flight {len(payload)}B split into "
+                         f"{len(wrapped)} records")
         if wrapped is None:
             self.pending[direction].append((payload, time.time(), 0))
             self.log(f"pending {direction} {len(payload)}B (no wrapper)")
@@ -894,9 +960,19 @@ class SpliceEngine:
         """Reuse the last flight's wrapper header+trailer for a same-size
         rebuilt payload (adaptive retries)."""
         lw = self.last_flight_wrapped[direction]
-        if lw is None or len(lw) != len(payload) + WRAPPER_HDR + WRAPPER_TRL:
+        if lw is None:
             return None
-        wrapped = lw[:WRAPPER_HDR] + payload + lw[-WRAPPER_TRL:]
+        if isinstance(lw, tuple):
+            recs = split_records(payload)
+            if [len(r) for r in recs] != [len(p) - WRAPPER_HDR - WRAPPER_TRL
+                                          for p in lw]:
+                return None
+            wrapped = tuple(p[:WRAPPER_HDR] + r + p[-WRAPPER_TRL:]
+                            for p, r in zip(lw, recs))
+        elif len(lw) != len(payload) + WRAPPER_HDR + WRAPPER_TRL:
+            return None
+        else:
+            wrapped = lw[:WRAPPER_HDR] + payload + lw[-WRAPPER_TRL:]
         self.last_wrapped[direction] = wrapped
         self.last_flight_wrapped[direction] = wrapped
         return wrapped
@@ -912,10 +988,14 @@ class SpliceEngine:
         still = []
         for payload, ts, tries in self.pending[direction]:
             wrapped = cache.take(payload)
+            if wrapped is None and payload in (self.server_leg.last_flight,
+                                               self.client_leg.last_flight):
+                wrapped = cache.take_split(payload)
             if wrapped is None:
                 still.append((payload, ts, tries))
             else:
-                self.log(f"flushed pending {direction} {len(payload)}B")
+                n = f" as {len(wrapped)} records" if isinstance(wrapped, tuple) else ""
+                self.log(f"flushed pending {direction} {len(payload)}B{n}")
                 self.last_wrapped[direction] = wrapped
                 if payload in (self.server_leg.last_flight,
                                self.client_leg.last_flight):
@@ -943,7 +1023,7 @@ class SpliceEngine:
                          f"leg; CKE flight rebuilt")
                 # if the old flight was already sent, resend the rebuilt one
                 lw = self.last_flight_wrapped["to_cam"]
-                if lw is not None and lw[WRAPPER_HDR:-WRAPPER_TRL] == old:
+                if lw is not None and wrapped_payload(lw) == old:
                     w = self._rewrap_last("to_cam", new)
                     if w:
                         return w
@@ -968,7 +1048,8 @@ class SpliceEngine:
     def on_phone_packet(self, w):
         """Packet from the relay (phone side). Returns (to_cam, to_phone)."""
         try:
-            return self._on_phone_packet(w)
+            a, b = self._on_phone_packet(w)
+            return flatten(a), flatten(b)
         except Exception as e:  # noqa: BLE001
             self._fail(e)
             return [], []
@@ -1082,7 +1163,8 @@ class SpliceEngine:
     # --------------------------------------------------------------- cam in
     def on_cam_packet(self, w):
         try:
-            return self._on_cam_packet(w)
+            a, b = self._on_cam_packet(w)
+            return flatten(a), flatten(b)
         except Exception as e:  # noqa: BLE001
             self._fail(e)
             return [], []
@@ -1197,4 +1279,4 @@ class SpliceEngine:
             self.last_wrapped_at[direction] = now
             out[direction].append(lw)
             self.log(f"retransmit {direction} last flight")
-        return out["to_cam"], out["to_phone"]
+        return flatten(out["to_cam"]), flatten(out["to_phone"])

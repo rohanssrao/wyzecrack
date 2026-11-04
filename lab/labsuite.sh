@@ -45,6 +45,11 @@ for spec in "direct-plain::direct" "splice-plain::splice" \
             "direct-multipath:MULTIPATH=1:direct" \
             "splice-multipath:MULTIPATH=1:splice" \
             "splice-multipath-diefirst:MULTIPATH=1 DIE_FIRST=1 DUR=30:splice" \
+            "direct-split:SPLIT=1:direct" \
+            "splice-split:SPLIT=1:splice" \
+            "splice-split-multipath:SPLIT=1 MULTIPATH=1:splice" \
+            "direct-stunonly:STUNONLY=1 SPLIT=1:direct" \
+            "splice-stunonly:STUNONLY=1 SPLIT=1:splice" \
             "splice-harvest:HARVEST=1:splice" \
             "teardown-sigterm:KILL_AT=6 KILL_SIG=TERM:splice" \
             "teardown-sighup:KILL_AT=6 KILL_SIG=HUP:splice" \

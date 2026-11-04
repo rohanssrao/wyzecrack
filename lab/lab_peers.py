@@ -40,6 +40,29 @@ STUN = ("203.0.113.2", 3478)
 # retransmits) travel via the STUN relay as cmd 0x1402; the camera answers on
 # the data relay and the session continues there
 MULTIPATH = os.environ.get("MULTIPATH") == "1"
+# SPLIT=1: as seen live (2026-11-04), both TUTK stacks may send each record
+# of a handshake flight in its own datagram (SH, SKE, SHD as 3 packets)
+SPLIT = os.environ.get("SPLIT") == "1"
+# STUNONLY=1: as the emulator showed (2026-11-04): the whole session runs
+# over the camera's long-lived STUN-relay tuple as 0x1402. Before the
+# phone's ClientHello, the camera sends the session's 0x1102s only to
+# P2P candidates that never answer (blocked like a cellular phone's).
+STUNONLY = os.environ.get("STUNONLY") == "1"
+P2P_CANDIDATES = [("198.51.100.77", 42727), ("10.0.2.15", 33039)]
+
+
+def send_flight(sock, flight, port, addr, cam_side, stun=False):
+    """A handshake flight: one wrapper, or (SPLIT) one per record."""
+    from wyze_splice.dtls import split_records
+    parts = split_records(flight) if SPLIT else [flight]
+    for part in parts or [flight]:
+        w = tag(wrap(part, cam_side=cam_side), port)
+        sock.sendto(as_stun(w) if stun else w, addr)
+
+
+def channel_open(port):
+    """0x1102 carrying the session's ticket and id, as real ones do."""
+    return tag(ctl(0x1102, 52), port)
 FAIL_FIRST = os.environ.get("FAIL_FIRST") == "1"
 IGNORE_FIRST_CH = os.environ.get("CAM_IGNORE_FIRST_CH") == "1"
 # DIE_FIRST=1: run8's failure. The first session completes its handshake, the
@@ -115,20 +138,34 @@ def run_cam(dur):
     s.bind(CAM)
     s.settimeout(0.005)
     t0 = time.time()
-    sessions = {RELAYS[0]: CamSession(RELAYS[0], FAIL_FIRST)}
-    s.sendto(ctl(0x1102, 52), RELAYS[0])
-    sessions[RELAYS[0]].opens = 1
+    # a real camera keeps its STUN-relay paths alive all the time; its
+    # keepalives come long before any session
+    s.sendto(ctl(0x0502, 24), STUN)
+    time.sleep(0.3)
+    first = STUN if STUNONLY else RELAYS[0]
+    sessions = {first: CamSession(first, FAIL_FIRST)}
+    if not STUNONLY:
+        s.sendto(channel_open(RELAYS[0][1]), RELAYS[0])
+    sessions[first].opens = 1
+    p2p_at = t0 + 0.25 if STUNONLY else None
     srcs, last_ka = {}, 0.0
     n_media = int(MEDIA_SECS * MEDIA_PPS)
     while time.time() - t0 < dur:
         now = time.time()
         if (FAIL_FIRST or DIE_FIRST) and RELAYS[1] not in sessions and now - t0 > 13.0:
             sessions[RELAYS[1]] = CamSession(RELAYS[1], False)
-            s.sendto(ctl(0x1102, 52), RELAYS[1])
+            s.sendto(channel_open(RELAYS[1][1]), RELAYS[1])
             sessions[RELAYS[1]].opens = 1
+        if p2p_at and now >= p2p_at:
+            for c_ in P2P_CANDIDATES:      # never answered
+                try:
+                    s.sendto(channel_open(STUN[1]), c_)
+                except OSError:
+                    pass
+            p2p_at = p2p_at + 0.05 if now - t0 < 0.4 else None
         if now - last_ka > 1.0:
             for r, cs_ in sessions.items():
-                if not cs_.dead:
+                if not cs_.dead and r != STUN:
                     s.sendto(ctl(0x1202, 48), r)
             s.sendto(ctl(0x0502, 24), STUN)
             last_ka = now
@@ -136,12 +173,15 @@ def run_cam(dur):
             leg = cs.leg
             if cs.broken and cs.retx_at and now >= cs.retx_at:
                 # the 12977 failure: keep retransmitting the server flight
-                s.sendto(tag(wrap(leg.last_flight, cam_side=True), cs.relay[1]), cs.relay)
+                send_flight(s, leg.last_flight, cs.relay[1], cs.relay, True,
+                            stun=cs.relay == STUN)
                 cs.retx_gap *= 2
                 cs.retx_at = now + cs.retx_gap
             if (leg.handshake_done and not cs.dead and cs.media_i < n_media
                     and (cs.next_media is None or now >= cs.next_media)):
                 w = tag(wrap(leg.encrypt_record(RT_APPDATA, media_pt(cs.media_i)), cam_side=True), cs.relay[1])
+                if cs.relay == STUN:
+                    w = as_stun(w)
                 s.sendto(w, cs.relay)
                 s.sendto(w, cs.relay)
                 cs.media_i += 1
@@ -152,7 +192,9 @@ def run_cam(dur):
             continue
         srcs[f"{a[0]}:{a[1]}"] = srcs.get(f"{a[0]}:{a[1]}", 0) + 1
         c = cmd_of(d)
-        if a == STUN and c == 0x1402:
+        if a == STUN and c == 0x1402 and STUNONLY:
+            cs, c = sessions.get(STUN), 0x1502        # the STUN relay is the path
+        elif a == STUN and c == 0x1402:
             # same session, other path: the wrapper ticket names the session
             ticket = struct.unpack("<H", d[14:16])[0] ^ STUN_TICKET_XOR
             a = next((r for r in sessions if r[1] & 0xffff == ticket), RELAYS[0])
@@ -162,7 +204,7 @@ def run_cam(dur):
         if cs is None or cs.dead:
             continue
         if c == 0x1102 and cs.opens < 3:
-            s.sendto(ctl(0x1102, 52), a)
+            s.sendto(channel_open(a[1]), a)
             cs.opens += 1
         elif c == 0x1502:
             leg, out = cs.leg, b""
@@ -200,7 +242,7 @@ def run_cam(dur):
                             cs.dead = True
                             break
             if out and not cs.dead:
-                s.sendto(tag(wrap(out, cam_side=True), cs.relay[1]), a)
+                send_flight(s, out, cs.relay[1], a, True, stun=cs.relay == STUN)
     print(json.dumps({"role": "cam", "srcs": srcs, "sessions": {
         f"{r[1]}": {"handshake_done": cs.leg.handshake_done, "ch_seen": cs.ch_seen,
                     "sent_media": cs.media_i, "acks_unique": len(cs.acks),
@@ -234,6 +276,11 @@ def run_phone(dur):
     stun = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     stun.bind(STUN)
     stun.setblocking(False)
+    if STUNONLY:
+        # one session, on the STUN relay; the data relays stay silent
+        for ps in socks:
+            ps.s.close()
+        socks = [PhoneSession(stun)]
     cam_via_stun = [None]
     t0 = time.time()
     import select
@@ -250,7 +297,9 @@ def run_phone(dur):
                     and now - ps.last_ch > 1.0):
                 f = leg.client_hello() if ps.ch_sent == 0 else leg.last_flight
                 wch = tag(wrap(f, cam_side=False), ps.s.getsockname()[1])
-                if MULTIPATH and cam_via_stun[0]:
+                if STUNONLY:
+                    ps.s.sendto(as_stun(wch), ps.cam)
+                elif MULTIPATH and cam_via_stun[0]:
                     stun.sendto(as_stun(wch), cam_via_stun[0])
                 else:
                     ps.s.sendto(wch, ps.cam)
@@ -260,10 +309,11 @@ def run_phone(dur):
             if leg.handshake_done and now - ps.last_ack > 0.1:
                 p = leg.encrypt_record(RT_APPDATA, b"\x09\x00" + struct.pack("<I", int(now * 1000) & 0xffffffff)
                                        + struct.pack("<H", len(ps.got)) + b"\x00" * 14)
-                ps.s.sendto(tag(wrap(p, cam_side=False), ps.s.getsockname()[1]), ps.cam)
+                w = tag(wrap(p, cam_side=False), ps.s.getsockname()[1])
+                ps.s.sendto(as_stun(w) if STUNONLY else w, ps.cam)
                 ps.last_ack = now
-        ready, _, _ = select.select([ps.s for ps in socks] + [stun], [], [], 0.005)
-        if stun in ready:
+        ready, _, _ = select.select(list({ps.s for ps in socks} | {stun}), [], [], 0.005)
+        if stun in ready and not STUNONLY:
             while True:
                 try:
                     d, a = stun.recvfrom(65535)
@@ -282,13 +332,17 @@ def run_phone(dur):
                     break
                 ps.srcs[f"{a[0]}:{a[1]}"] = ps.srcs.get(f"{a[0]}:{a[1]}", 0) + 1
                 c = cmd_of(d)
-                if c == 0x1102:
+                if c == 0x0502:                 # STUNONLY: camera keepalive
                     ps.cam = a
-                    ps.s.sendto(ctl(0x1102, 52), a)
+                    ps.s.sendto(ctl(0x0502, 40), a)
+                    ps.opened_at = ps.opened_at or time.time()
+                elif c == 0x1102:
+                    ps.cam = a
+                    ps.s.sendto(channel_open(ps.s.getsockname()[1]), a)
                     ps.opened_at = ps.opened_at or time.time()
                 elif c == 0x1202:
                     ps.s.sendto(ctl(0x1202, 48), a)
-                elif c == 0x1502 and ps.cam and not ps.gave_up:
+                elif c in (0x1502, 0x1402) and ps.cam and not ps.gave_up:
                     leg, out = ps.leg, b""
                     for rtype, ver, epoch, seq, body in parse_records(unwrap(d)):
                         if rtype == RT_HANDSHAKE and epoch == 0:
@@ -316,7 +370,8 @@ def run_phone(dur):
                                 else:
                                     ps.bad += 1
                     if out:
-                        ps.s.sendto(tag(wrap(out, cam_side=False), ps.s.getsockname()[1]), ps.cam)
+                        send_flight(ps.s, out, ps.s.getsockname()[1], ps.cam, False,
+                                    stun=STUNONLY)
     print(json.dumps({"role": "phone", "expected_media": int(MEDIA_SECS * MEDIA_PPS), "sessions": {
         f"{ps.s.getsockname()[1]}": {"handshake_done": ps.leg.handshake_done, "ch_sent": ps.ch_sent,
                                      "gave_up": ps.gave_up, "media_ok": len(ps.got), "media_bad": ps.bad,
