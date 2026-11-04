@@ -60,8 +60,9 @@ video goes to `session-N/`.
   ones it opened before wyze-splice started. (Seen behind a home router
   router: the camera's traffic to two of its relays never reached this
   host while its other traffic did.) Unplugging the camera for 5 seconds
-  while wyze-splice runs should fix it: the connections it opens then
-  pass through here.
+  while wyze-splice runs fixes it: the connections it opens then pass
+  through here. (Before an unplug, 3 of 5 test views were missed; after
+  it, 3 of 3 were caught.)
 - **"waiting for the camera's ENR" for a long time:** trigger a motion
   alarm. If the tool reports that the camera refuses the certificate, this
   firmware no longer trusts the eMudhra CA. Supply the ENR with `--enr`.
