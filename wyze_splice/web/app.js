@@ -127,7 +127,8 @@ function applyState(s) {
   let extra = "";
   if (key === "enr") { const n = steps.enr.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
   if (s.phase === "connecting" && s.session?.state === "failed") extra = "This attempt could not be joined; waiting for the app's retry.";
-  if (key === "waiting" && s.hint === "bypass") extra = "The last live view went around this computer, probably over a connection the camera opened before you started. Unplug the camera for 5 seconds; its new connections will come through here.";
+  if (s.hint === "unplug" && (key === "waiting" || key === "learning")) extra = "One of the camera's connections goes around this computer, so some live views would be missed. Unplug the camera for 5 seconds now (and plug it back in); this page will tell you when it's fixed.";
+  else if (key === "waiting" && s.hint === "bypass") extra = "The last live view went around this computer, probably over a connection the camera opened before you started. Unplug the camera for 5 seconds; its new connections will come through here.";
   const stage = $("#stage");
   stage.classList.toggle("is-live", s.phase === "live");
   $("#hud").classList.toggle("hidden", s.phase !== "live");

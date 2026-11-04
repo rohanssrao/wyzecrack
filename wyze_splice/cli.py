@@ -111,6 +111,30 @@ def _cache_enr(mac, enr):
     os.replace(tmp, STATE_DIR / "enr.json")
 
 
+def _relays(mac):
+    """The STUN relays this camera used the last time all of them came
+    through this host."""
+    try:
+        d = json.loads((STATE_DIR / "relays.json").read_text())
+    except (OSError, ValueError):
+        return []
+    return d.get(_mac_key(mac), [])
+
+
+def _save_relays(mac, seen):
+    if sorted(seen) == sorted(_relays(mac)):
+        return
+    try:
+        d = json.loads((STATE_DIR / "relays.json").read_text())
+    except (OSError, ValueError):
+        d = {}
+    d[_mac_key(mac)] = sorted(seen)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = STATE_DIR / "relays.json.tmp"
+    tmp.write_text(json.dumps(d, indent=1) + "\n")
+    os.replace(tmp, STATE_DIR / "relays.json")
+
+
 # -- picking and checking the target -------------------------------------
 def _pick_target(a):
     from .discover import find_cameras
@@ -225,6 +249,9 @@ class Armed:
             self.splicer = Splicer(self.changes, target, us, self.out,
                                    pass_through=a.pass_through,
                                    journal=a.journal)
+            w = self.splicer.watcher
+            w.expected_relays = set(_relays(self.cam_mac))
+            w.on_relays = lambda seen: _save_relays(self.cam_mac, seen)
             self.splicer.setup()
         if getattr(a, "events_dir", None) is not None or self._need_harvest():
             self.tap = CloudTap(self.changes, target,

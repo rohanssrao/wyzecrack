@@ -537,3 +537,32 @@ class TestOpenFaces(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestBypassCheck(unittest.TestCase):
+    def _w(self, expected=()):
+        from wyze_splice.splice import RelayFlowWatcher
+        w = RelayFlowWatcher("192.168.1.20", masq_ip="192.168.1.2")
+        w.expected_relays = set(expected)
+        w.watch_since = 1000.0
+        return w
+
+    def test_undecided_until_the_camera_had_time(self):
+        w = self._w()
+        w.relays_seen = {"198.51.100.52": 1010.0}
+        self.assertIsNone(w.check_bypass(now=1020.0))
+
+    def test_missing_relay_is_reported_and_all_seen_is_saved(self):
+        saved = []
+        w = self._w(["198.51.100.52", "198.51.100.82", "198.51.100.146"])
+        w.on_relays = saved.append
+        w.relays_seen = {"198.51.100.52": 1050.0, "198.51.100.146": 1050.0}
+        self.assertEqual(w.check_bypass(now=1060.0), {"198.51.100.82"})
+        w.relays_seen["198.51.100.82"] = 1055.0
+        self.assertEqual(w.check_bypass(now=1060.0), set())
+        self.assertEqual(len(saved[0]), 3)
+
+    def test_without_history_three_relays_are_expected(self):
+        w = self._w()
+        w.relays_seen = {"198.51.100.52": 1050.0, "198.51.100.146": 1050.0}
+        self.assertEqual(len(w.check_bypass(now=1060.0)), 1)

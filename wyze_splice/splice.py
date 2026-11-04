@@ -268,6 +268,13 @@ class RelayFlowWatcher:
         self.extra_paths = []     # STUN-relay :3478 tuples to divert too
         self.n_from_cam = self.n_to_cam = 0   # forwarding health
         self._warned = False
+        # STUN relays the camera keeps (relay ip -> last seen through us);
+        # the ones it used last time it was fully on-path
+        self.relays_seen = {}
+        self.expected_relays = set()
+        self.watch_since = time.time()
+        self.bypass = None            # set of relays not seen, once judged
+        self.on_relays = None         # callback(set) when all are on-path
         self.sid = None           # TUTK session id of the latched session
         self.stop = threading.Event()   # set to end wait()/learn_paths()
         self.sids_seen = {}       # session id -> first seen (SID_TTL)
@@ -371,6 +378,8 @@ class RelayFlowWatcher:
             print(f"[*] new public flow: {key[0]}:{key[1]} (cam port {pkt.sport})")
         c[1] += 1
         self.last_seen[key] = time.time()
+        if pkt.dport == STUN_RELAY_PORT:
+            self.relays_seen[dst] = time.time()
         cmd = (wrap_cmd(payload)
                if len(payload) > 8 and payload[:2] == b"\x51\xcc" else 0)
         # PRE-CH LATCH (primary): the camera's 0x1102 channel-open to a
@@ -429,7 +438,7 @@ class RelayFlowWatcher:
             try:
                 rawnet.sniff(iface_for(self.target), prog, rawnet.parse_udp,
                              self._cb, done,
-                             timeout=max(1, min(20, deadline - time.time())))
+                             timeout=max(1, min(10, deadline - time.time())))
                 self._health()
             except OSError as e:
                 print(f"[!] sniffer error ({e}); retrying in 5s")
@@ -459,9 +468,51 @@ class RelayFlowWatcher:
                 time.sleep(1)
         return known()
 
+    def check_bypass(self, now=None):
+        """Judge, once the camera has had time to refresh all its relay
+        connections (BYPASS_JUDGE_AFTER), whether any it normally keeps
+        never shows up here. Its traffic on those goes around this host:
+        the router keeps forwarding connections the camera opened before
+        it was rerouted, and a live view that uses one is missed. Returns
+        the missing relays (empty: all good), or None while undecided."""
+        now = now or time.time()
+        seen = {ip for ip, t in self.relays_seen.items() if now - t < 120}
+        if now - self.watch_since < BYPASS_JUDGE_AFTER:
+            return None
+        # by count, not identity: Wyze may rotate the relays themselves
+        want = len(self.expected_relays) or TYPICAL_RELAYS
+        if len(seen) >= want:
+            if self.on_relays:
+                self.on_relays(seen)
+            return set()
+        known = self.expected_relays - seen
+        return known or {f"relay {i}" for i in range(want - len(seen))}
+
     def _health(self):
         """Warn once if the camera talks but nothing comes back to it
-        through us: something on this host drops forwarded traffic."""
+        through us: something on this host drops forwarded traffic; and
+        once whether some of its relay connections bypass this host."""
+        if self.bypass is None:
+            missing = self.check_bypass()
+            if missing is not None:
+                self.bypass = missing
+                if missing:
+                    n = len(missing)
+                    print(f"[!] {n} of the camera's relay connections "
+                          f"{'goes' if n == 1 else 'go'} around this host "
+                          f"(the router keeps forwarding connections the "
+                          f"camera opened before), so live views that use "
+                          f"{'it' if n == 1 else 'them'} would be missed.\n"
+                          f"    Unplug the camera for 5 seconds now; its new "
+                          f"connections will come through here.")
+                    events.emit("bypass", missing=n)
+        elif self.bypass:
+            # after an unplug every relay shows up again
+            if self.check_bypass() == set():
+                self.bypass = set()
+                print("[+] all of the camera's relay connections now come "
+                      "through this host")
+                events.emit("bypass", missing=0)
         if self._warned or self.n_from_cam < 30 or self.n_to_cam:
             return
         self._warned = True
@@ -480,6 +531,11 @@ class RelayFlowWatcher:
 CH_WAIT_SESSION_START = 20
 CH_WAIT = 5
 
+
+# the camera keeps connections to three STUN relays and refreshes each
+# every few seconds to tens of seconds
+TYPICAL_RELAYS = 3
+BYPASS_JUDGE_AFTER = 45
 
 BYPASS_HINT = (
     "[!] that live view did not pass through this host: some of the "
@@ -741,6 +797,7 @@ class Splicer:
         self.out.mkdir(parents=True, exist_ok=True)
         self.log = open(self.out / "interpose.log", "ab", buffering=0)
         events.emit("learning")
+        self.watcher.watch_since = time.time()
         self.watcher.learn_paths()
         print(f"[*] watching {self.target} for a live-view session: "
               f"open the camera's live view in the Wyze app")

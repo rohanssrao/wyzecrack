@@ -177,6 +177,14 @@ class Controller:
         elif k == "watching":
             self._step("watch", "active")
             self.set(phase="waiting", session=None)
+        elif k == "bypass":
+            if ev["missing"]:
+                self._step("onpath", "problem")
+                self.set(hint="unplug")
+            else:
+                self._step("onpath", "done")
+                self.set(hint=None)
+                self.hub.send_json({"kind": "toast", "text": "All set: the camera's connections now come through here"})
         elif k == "missed":
             self.set(hint="bypass")
             self.hub.send_json({"kind": "missed"})
@@ -279,6 +287,12 @@ class Controller:
     def _session_end(self, out, spliced):
         self._new_live()
         if not spliced:
+            # keep what explains a miss, under .missed/, out of the library
+            keep = self.lib.root / ".missed" / out.name
+            keep.mkdir(parents=True, exist_ok=True)
+            for f in ("splice.log",):
+                if (out / f).exists():
+                    shutil.move(str(out / f), keep / f)
             shutil.rmtree(out, ignore_errors=True)
             return
         t = threading.Thread(target=self._save, args=(out,), daemon=True)
@@ -478,6 +492,37 @@ def make_app(token, hub, ctl, lib):
     return app
 
 
+class _Tee:
+    def __init__(self, stream, f):
+        self.stream, self.f = stream, f
+
+    def write(self, data):
+        try:
+            self.f.write(time.strftime("%H:%M:%S ") + data if data.strip()
+                         else data)
+            self.f.flush()
+        except OSError:
+            pass
+        return self.stream.write(data)
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def _tee(path):
+    """Keep what the terminal shows in a log next to the recordings, for
+    working out what happened later."""
+    try:
+        f = open(path, "a")
+    except OSError:
+        return
+    f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} wyze-splice started\n")
+    sys.stdout = _Tee(sys.stdout, f)
+
+
 def open_browser(url):
     """Open url in the invoking user's desktop session, not as root."""
     user = os.environ.get("SUDO_USER")
@@ -507,6 +552,7 @@ def serve(listen="127.0.0.1", port=0, out="captures", browser=True):
     hub = Hub()
     lib = Library(out)
     lib.root.mkdir(parents=True, exist_ok=True)
+    _tee(lib.root / "wyze-splice.log")
     ctl = Controller(hub, lib)
     app = make_app(token, hub, ctl, lib)
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
