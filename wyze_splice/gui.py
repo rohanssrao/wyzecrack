@@ -34,7 +34,7 @@ from .live import LiveAssembler, codec_string
 
 WEB = Path(__file__).parent / "web"
 STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
-MSG_VIDEO, MSG_AUDIO = 1, 2
+MSG_VIDEO, MSG_AUDIO, MSG_JPEG = 1, 2, 3
 
 
 # -- camera directory -----------------------------------------------------
@@ -130,6 +130,7 @@ class Controller:
         self.state = {"phase": "idle"}
         self.camera = None
         self.live = None
+        self.jpeg = None            # jpegfeed.JpegFeed while a page wants it
         self.live_stats = {}
         self.saving = []            # export threads still running
         self.uid = int(os.environ.get("SUDO_UID", os.getuid()))
@@ -365,6 +366,9 @@ class Controller:
 
     # live media -> the page
     def _new_live(self):
+        if self.jpeg:
+            self.jpeg.close()       # the next stream starts at its own key frame
+            self.jpeg = None
         self.live = LiveAssembler(on_video=self._video, on_audio=self._audio)
         self.live_stats = {"frames": 0, "t0": None, "recent": [], "size": None,
                            "codec": None}
@@ -389,7 +393,14 @@ class Controller:
         now = time.time()
         st["t0"] = st["t0"] or now
         st["recent"] = [t for t in st["recent"] if now - t < 2] + [now]
-        self.hub.send_bytes(struct.pack(">BBd", MSG_VIDEO, f.key, f.t) + f.data)
+        self.hub.send_bytes(struct.pack(">BBd", MSG_VIDEO, f.key, f.t) + f.data,
+                            audience="h264")
+        if self.hub.jpeg:
+            if self.jpeg is None:
+                from .jpegfeed import JpegFeed
+                self.jpeg = JpegFeed(lambda t, jpg: self.hub.send_bytes(
+                    struct.pack(">Bd", MSG_JPEG, t) + jpg, audience="jpeg"))
+            self.jpeg.feed(f)
 
     def _audio(self, ts, pcm):
         self.hub.send_bytes(struct.pack(">Bd", MSG_AUDIO, ts) + pcm)
@@ -468,12 +479,18 @@ class Hub:
     def __init__(self):
         self.loop = None
         self.clients = set()
+        self.jpeg = set()           # pages that can't decode H.264 themselves
         self.backlog = {}
 
-    def _send(self, data):
+    def _send(self, data, audience=None):
         for ws in list(self.clients):
             if ws.closed:
                 self.clients.discard(ws)
+                self.jpeg.discard(ws)
+                continue
+            if audience == "h264" and ws in self.jpeg:
+                continue
+            if audience == "jpeg" and ws not in self.jpeg:
                 continue
             # a slow viewer drops media rather than queueing without bound;
             # status messages always go through
@@ -497,14 +514,16 @@ class Hub:
     def send_json(self, obj):
         self._post(json.dumps(obj))
 
-    def send_bytes(self, data):
+    def send_bytes(self, data, audience=None):
+        """Media to every page, or only to those that decode H.264
+        themselves ("h264") or only to those that want JPEG ("jpeg")."""
         if self.clients:
-            self._post(data)
+            self._post(data, audience)
 
-    def _post(self, data):
+    def _post(self, data, audience=None):
         try:
             if self.loop and not self.loop.is_closed():
-                self.loop.call_soon_threadsafe(self._send, data)
+                self.loop.call_soon_threadsafe(self._send, data, audience)
         except RuntimeError:      # the loop closed meanwhile (shutdown)
             pass
 
@@ -612,10 +631,19 @@ def make_app(token, hub, ctl, lib):
         hub.clients.add(sock)
         await sock.send_str(json.dumps({"kind": "state", **ctl.state}))
         try:
-            async for _ in sock:
-                pass
+            async for msg in sock:
+                if msg.type != web.WSMsgType.TEXT:
+                    continue
+                try:
+                    want = json.loads(msg.data)
+                except ValueError:
+                    continue
+                # the page can't decode H.264: send it still frames instead
+                if want.get("kind") == "want" and want.get("video") == "jpeg":
+                    hub.jpeg.add(sock)
         finally:
             hub.clients.discard(sock)
+            hub.jpeg.discard(sock)
         return sock
 
     async def ticker(app):

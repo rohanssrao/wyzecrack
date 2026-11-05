@@ -1,8 +1,8 @@
 # wyze-splice
 
-Watch and record a Wyze Cam v3 from its local network, with no phone and no
-Wyze account. It can also decrypt the live views the owner's Wyze app
-opens, and save the motion clips the camera uploads.
+Watch and record a Wyze Cam v3 or v2 from its local network, with no phone
+and no Wyze account. It can also decrypt the live views the owner's Wyze
+app opens, and save the motion clips the camera uploads.
 
 Only use this against cameras you own or are authorized to test.
 
@@ -17,11 +17,15 @@ Only use this against cameras you own or are authorized to test.
   `AF_PACKET` sockets with kernel BPF filters (no libpcap), conntrack is
   handled over netlink with pyroute2, PyAV and Pillow write the MP4 and
   JPEG in-process, and aiohttp serves the page.
-- For the page: a browser with WebCodecs (current Chrome, Edge, Firefox
-  or Safari) to play the live view.
+- For the page: a current browser. Chrome, Brave and Edge decode the
+  1080p stream themselves. Browsers that can't decode H.264 (Playwright's
+  Firefox, for example) get 720p still frames from the tool instead, about
+  10 a second. Not tried in Safari yet.
 
-Tested against a Wyze Cam v3 (WYZE_CAKP2JFUS) on firmware 4.36.17.21, with
-the phone app on cellular, from a NixOS host. The lab suite also passes on
+Tested from a NixOS host against three Wyze Cam v3s (WYZE_CAKP2JFUS,
+firmware 4.36.17.21 and 4.36.16.7064) and a Wyze Cam v2 (WYZEC1-JZ,
+4.9.9.3006). On the v2, only watching has been tried, with a key taken from
+elsewhere: the tool hasn't read a v2's key itself yet. The lab suite also passes on
 Debian 12 (iptables 1.8.9, nf_tables backend); `lab/debian-check.sh` runs
 it in a throwaway container.
 

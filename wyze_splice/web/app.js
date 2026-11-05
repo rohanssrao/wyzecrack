@@ -155,8 +155,13 @@ function applyState(s) {
   if (s.phase === "starting" && steps.watch?.detail?.note === "learning") key = "learning";
   if (s.phase === "connecting" && s.session?.state === "joined") key = "joined";
   let extra = "";
-  if (key === "enr" || key === "key") { const n = steps.enr.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
-  if (key === "key_nudge") { const r = steps.enr.detail?.resets || 0; extra = r ? `Reset ${r} of up to 8` : ""; }
+  if (key === "enr" || key === "key") { const n = steps.enr?.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
+  if (key === "key_nudge") { const r = steps.enr?.detail?.resets || 0; extra = r ? `Reset ${r} of up to 8` : ""; }
+  if (key === "direct") {
+    if (prev !== "connecting" || !connectSince) connectSince = Date.now();
+    const secs = Math.round((Date.now() - connectSince) / 1000);
+    if (secs >= 5) extra = `Still waiting for the camera to answer (${secs} s).`;
+  } else connectSince = null;
   if (s.phase === "connecting" && s.session?.state === "failed") extra = "This attempt could not be joined; waiting for the app's retry.";
   if (s.hint === "unplug" && (key === "waiting" || key === "learning")) extra = "One of the camera's connections goes around this computer, so some live views would be missed. Unplug the camera for 5 seconds now (and plug it back in); this page will tell you when it's fixed.";
   else if (key === "waiting" && s.hint === "bypass") extra = "The last live view went around this computer, probably over a connection the camera opened before you started. Unplug the camera for 5 seconds; its new connections will come through here.";
@@ -218,7 +223,28 @@ function toast(text, level) {
 // ---------------------------------------------------------------- live video
 const canvas = $("#video");
 const ctx2d = canvas.getContext("2d");
-let decoder = null, waitKey = true, recStart = null;
+let decoder = null, waitKey = true, recStart = null, connectSince = null;
+// "h264": the browser decodes the stream (WebCodecs); "jpeg": it can't, so
+// the server sends still frames instead
+let videoMode = "h264", framesShown = 0, sock = null;
+
+function wantJpeg() {
+  if (videoMode === "jpeg") return;
+  videoMode = "jpeg";
+  if (decoder && decoder.state !== "closed") decoder.close();
+  decoder = null;
+  if (sock && sock.readyState === 1) sock.send(JSON.stringify({ kind: "want", video: "jpeg" }));
+}
+
+function onJpeg(buf) {
+  const blob = new Blob([new Uint8Array(buf, 9)], { type: "image/jpeg" });
+  createImageBitmap(blob).then((bmp) => {
+    if (canvas.width !== bmp.width) { canvas.width = bmp.width; canvas.height = bmp.height; }
+    ctx2d.drawImage(bmp, 0, 0);
+    bmp.close();
+    framesShown++;
+  }).catch(() => {});
+}
 
 function resetVideo(keepLastFrame) {
   if (decoder && decoder.state !== "closed") decoder.close();
@@ -227,23 +253,27 @@ function resetVideo(keepLastFrame) {
   if (!keepLastFrame) { $("#stage").classList.remove("dim"); ctx2d.clearRect(0, 0, canvas.width, canvas.height); }
 }
 
-function configure(cfg) {
-  if (!("VideoDecoder" in window)) {
-    setStatus("connecting", "This browser can't decode video (no WebCodecs). The recording is still saved.");
-    return;
+async function configure(cfg) {
+  if (cfg.width) $("#res").textContent = `${cfg.height}p`;
+  if (videoMode === "jpeg") return;
+  let ok = "VideoDecoder" in window;
+  if (ok) {
+    try { ok = (await VideoDecoder.isConfigSupported({ codec: cfg.codec })).supported; } catch (e) { ok = false; }
   }
+  if (!ok) { wantJpeg(); return; }
   if (decoder && decoder.state !== "closed") decoder.close();
   decoder = new VideoDecoder({
     output: (frame) => {
       if (canvas.width !== frame.displayWidth) { canvas.width = frame.displayWidth; canvas.height = frame.displayHeight; }
       ctx2d.drawImage(frame, 0, 0);
       frame.close();
+      framesShown++;
     },
-    error: () => { waitKey = true; },
+    // a decoder that never managed a picture won't: use still frames
+    error: () => { if (!framesShown) wantJpeg(); else waitKey = true; },
   });
   decoder.configure({ codec: cfg.codec, optimizeForLatency: true });
   waitKey = true;
-  if (cfg.width) $("#res").textContent = `${cfg.height}p`;
 }
 
 function onVideo(buf) {
@@ -296,16 +326,19 @@ $("#full").onclick = () => { const s = $("#stage"); document.fullscreenElement ?
 
 setInterval(() => {
   if (state.phase === "live" && recStart) $("#rec").textContent = mmss(Date.now() / 1000 - recStart);
-}, 500);
+  if (state.phase === "connecting" && state.mode !== "splice" && connectSince) applyState(state);
+}, 1000);
 
 // ---------------------------------------------------------------- socket
 function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  sock = ws;
   ws.binaryType = "arraybuffer";
+  ws.onopen = () => { if (videoMode === "jpeg") ws.send(JSON.stringify({ kind: "want", video: "jpeg" })); };
   ws.onmessage = (m) => {
     if (typeof m.data !== "string") {
       const kind = new DataView(m.data).getUint8(0);
-      if (kind === 1) onVideo(m.data); else if (kind === 2) onAudio(m.data);
+      if (kind === 1) onVideo(m.data); else if (kind === 2) onAudio(m.data); else if (kind === 3) onJpeg(m.data);
       return;
     }
     const ev = JSON.parse(m.data);
