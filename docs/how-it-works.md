@@ -51,12 +51,12 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
 
    An earlier version cut all of the camera's traffic until it noticed.
    That produced the report only when the burst of connection events
-   happened to overflow the buffer, and on v3 C (4.36.16) and the v2
-   it left the camera offline in the Wyze app for half an hour or more.
-   And when the network stays unavailable past the firmware's retry limit
-   (`exceed_network_connection_retry_limit` in `netChange_callback`), the
-   camera plays a voice prompt (`notify/CN/user_need_check.wav`) and
-   resets its network.
+   happened to overflow the buffer, and it left v3 C (4.36.16)
+   offline in the Wyze app for about half an hour and the v2 for over an
+   hour. The firmware also has a path for a network that stays
+   unavailable past a retry limit (`exceed_network_connection_retry_limit`
+   in `netChange_callback`): it plays a voice prompt
+   (`notify/CN/user_need_check.wav`) and resets the network.
 
 3. **Ask Wyze for the UID** (`cloud.fetch_uid`). Wyze's device API
    authenticates a camera only by the `mac` and `enr` in the JSON body.

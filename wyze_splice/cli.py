@@ -31,7 +31,8 @@ STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
 # Models on which the ENR nudge (nudge.py: resetting the camera's MQTT
 # connection until it sends its metrics report) has been tried live. On
 # the Wyze Cam v2 an outage left the camera offline in the Wyze app for
-# over half an hour, so it gets no nudge.
+# over an hour, so it gets no nudge until one has been tried with someone
+# there to power-cycle it.
 NUDGE_MODELS = {"WYZE_CAKP2JFUS"}
 # firmware to quote to Wyze when the camera's own report didn't say
 DEFAULT_FW = "4.36.17.21"
