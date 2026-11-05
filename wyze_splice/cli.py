@@ -618,8 +618,13 @@ def cmd_watch(a):
               f"recording to {out}/ (Ctrl-C to stop)")
         ok = True
         end = time.monotonic() + a.seconds if a.seconds else None
+        tick = time.monotonic() + 5
         while end is None or time.monotonic() < end:
             d.pump(0.5)
+            if os.environ.get("WYZE_SPLICE_DEBUG") and time.monotonic() >= tick:
+                print(f"[d] {time.strftime('%T')} rx {d.stats['rx']} "
+                      f"ignored {d.stats.get('ignored', 0)} tx {d.stats['tx']}")
+                tick += 5
     except KeyboardInterrupt:
         print()
     except (CameraGone, ValueError) as e:
