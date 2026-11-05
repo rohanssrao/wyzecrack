@@ -28,7 +28,7 @@ function camCard(c) {
   const thumb = el("div", "thumb", (c.thumb ? `<img src="${esc(c.thumb)}" alt="">` : `<span class="ph">📷</span>`) + `<div class="go">Watch</div>`);
   const body = el("div", "body");
   const name = el("div", "name", `<span>${esc(displayName(c))}</span><button class="edit" title="Rename">✎</button>`);
-  const bits = [c.name ? c.model : null, c.ip, c.key_known ? "key saved" : null, c.tested ? null : "untested model"].filter(Boolean);
+  const bits = [c.name ? c.model : null, c.ip, c.ready ? "ready" : c.key_known ? "key saved" : null, c.tested ? null : "untested model"].filter(Boolean);
   const meta = el("div", "meta", esc(bits.join(" · ")));
   name.querySelector(".edit").onclick = (ev) => { ev.stopPropagation(); rename(c, name); };
   card.onclick = () => start(c);
@@ -83,6 +83,10 @@ function showPicker() {
 
 const STATUS = {
   starting: ["⌁", "spin", "Starting", "Checking the network and the camera."],
+  key: ["🔑", "pulse", "Getting the camera's key", "It's read from the camera's own connection to Wyze. This happens once per camera."],
+  key_nudge: ["🔑", "pulse", "Getting the camera's key", "The camera is offline for about a minute. When it reconnects, it reports in to Wyze with its key. This happens once per camera."],
+  uid: ["🪪", "spin", "Asking Wyze for the camera's ID", "With the camera's own key, the way the camera itself asks."],
+  direct: ["⚡", "spin", "Connecting to the camera", "Straight over your network; nothing is rerouted."],
   onpath: ["⇄", "spin", "Getting on the camera's path", "Only this camera is rerouted through this computer; everything else on the network is untouched."],
   enr: ["🔑", "pulse", "Waiting for the camera's key", "The camera sends it to Wyze when it sees motion. Walk in front of it (or wave at it) to speed this up. This only happens once per camera."],
   enr_refused: ["🔒", "bad", "The camera refused our certificate", "This firmware no longer trusts the eMudhra CA, so its key can't be read this way."],
@@ -92,6 +96,7 @@ const STATUS = {
   joined: ["⚡", "spin", "Joined", "Waiting for the first picture…"],
   saving: ["💾", "spin", "The viewer left", "Saving the video…"],
   stopping: ["⏻", "spin", "Stopping", "Putting the camera's network back the way it was."],
+  stopping_direct: ["⏻", "spin", "Stopping", "Saving the recording."],
   error: ["!", "bad", "Something went wrong", ""],
 };
 
@@ -105,6 +110,18 @@ function setStatus(key, extra) {
   $("#status-extra").textContent = extra || "";
 }
 
+const STEPS = {
+  direct: [["enr", "Key"], ["uid", "Camera ID"], ["live", "Live"]],
+  splice: [["onpath", "On path"], ["enr", "Key"], ["watch", "Viewer"]],
+};
+let stepsMode = null;
+
+function renderSteps(mode) {
+  if (mode === stepsMode) return;
+  stepsMode = mode;
+  $("#steps").innerHTML = STEPS[mode].map(([k, label]) => `<li data-step="${k}">${label}</li>`).join("");
+}
+
 function applyState(s) {
   const prev = state.phase;
   state = s;
@@ -113,21 +130,28 @@ function applyState(s) {
     return;
   }
   if (s.camera && $("#session").classList.contains("hidden")) showSession(s.camera);
+  const direct = s.mode !== "splice";
+  renderSteps(direct ? "direct" : "splice");
   const steps = s.steps || {};
   for (const li of document.querySelectorAll("#steps li")) {
     const st = steps[li.dataset.step];
     li.className = st ? st.status : "";
   }
-  if (s.phase === "live" || s.phase === "connecting") document.querySelector('#steps li[data-step="watch"]').className = "done";
+  const last = document.querySelector('#steps li[data-step="' + (direct ? "live" : "watch") + '"]');
+  if (s.phase === "live" || (!direct && s.phase === "connecting")) last.className = "done";
+  else if (direct && s.phase === "connecting") last.className = "active";
 
   let key = s.phase;
   if (s.phase === "starting" && steps.onpath) key = "onpath";
-  if (steps.enr && steps.enr.status === "active" && s.phase !== "error") key = "enr";
+  if (steps.enr && steps.enr.status === "active" && s.phase !== "error") key = direct ? (steps.enr.detail?.nudging ? "key_nudge" : "key") : "enr";
   if (steps.enr && steps.enr.status === "problem") key = "enr_refused";
+  if (direct && steps.uid && steps.uid.status === "active") key = "uid";
+  if (direct && s.phase === "connecting") key = "direct";
+  if (direct && s.phase === "stopping") key = "stopping_direct";
   if (s.phase === "starting" && steps.watch?.detail?.note === "learning") key = "learning";
   if (s.phase === "connecting" && s.session?.state === "joined") key = "joined";
   let extra = "";
-  if (key === "enr") { const n = steps.enr.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
+  if (key === "enr" || key === "key") { const n = steps.enr.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
   if (s.phase === "connecting" && s.session?.state === "failed") extra = "This attempt could not be joined; waiting for the app's retry.";
   if (s.hint === "unplug" && (key === "waiting" || key === "learning")) extra = "One of the camera's connections goes around this computer, so some live views would be missed. Unplug the camera for 5 seconds now (and plug it back in); this page will tell you when it's fixed.";
   else if (key === "waiting" && s.hint === "bypass") extra = "The last live view went around this computer, probably over a connection the camera opened before you started. Unplug the camera for 5 seconds; its new connections will come through here.";
@@ -144,9 +168,9 @@ $("#stop").onclick = async () => {
   await api("/api/stop", {});
 };
 $("#quit").onclick = async () => {
-  if (!confirm("Stop wyze-splice and put the camera's network back?")) return;
+  if (!confirm("Quit wyze-splice? Anything it changed on the network is put back.")) return;
   await api("/api/quit", {});
-  document.body.innerHTML = `<main><div class="hero"><h1>wyze-splice stopped</h1><p>The camera's network is back to normal. You can close this tab.</p></div></main>`;
+  document.body.innerHTML = `<main><div class="hero"><h1>wyze-splice stopped</h1><p>The network is back to normal. You can close this tab.</p></div></main>`;
 };
 $("#rescan").onclick = scan;
 
@@ -160,7 +184,7 @@ async function loadLibrary(fresh) {
   ].sort((a, b) => b.t - a.t);
   const box = $("#saved");
   $("#saved-count").textContent = items.length || "";
-  if (!items.length) { box.innerHTML = `<p class="muted">Live views you catch and the camera's motion clips are saved here.</p>`; return; }
+  if (!items.length) { box.innerHTML = `<p class="muted">Live views you watch are saved here.</p>`; return; }
   box.innerHTML = "";
   for (const it of items) {
     const t = el("div", "tile" + (fresh && it.src === fresh ? " fresh" : ""));
@@ -302,6 +326,7 @@ function connect() {
         loadLibrary();
         break;
       case "toast": toast(ev.text, ev.level); break;
+      case "saving": toast("Saving the recording…"); break;
       case "missed": toast("A live view went around this computer · see the tip above"); break;
     }
   };

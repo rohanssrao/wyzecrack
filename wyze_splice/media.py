@@ -31,6 +31,12 @@ first chunk and most single-packet P-frames use it (run14: 40 of ~560
 frames), so parsing them with the 36-byte layout corrupts exactly the
 frames that start a new picture. Bit 0x01 marks a frame's last packet.
 
+That is the resend ("wrapped") format the Wyze app asks for. A direct
+session (direct.py, which logs in like go2rtc) gets the plain format: the
+same records without the first 8 bytes of the outer header, so [0] is the
+channel and the fields above sit 8 bytes earlier (channel at [8], or [16]
+with the 0x08 bit; payload at [28] or [36]).
+
 Output: one Annex-B .h264 per channel, ordered by first appearance.
 Verified against live captures (fw 4.36.17.21): H.264 640x360.
 """
@@ -39,6 +45,7 @@ import os
 import struct
 
 VIDEO_CHANNELS = (5, 6, 7)
+MEDIA_CHANNELS = (3, 5, 6, 7)
 
 
 def parse_media(p):
@@ -46,19 +53,26 @@ def parse_media(p):
     count), or None for anything else. `count` is the frame's packet
     count (chunks 0..count-2 plus the end packet). The end packet's chunk
     index comes back as 0xFFFF so it sorts last; a 0x0028 marker there
-    means the payload ends with the 40-byte FrameInfo, which is stripped."""
-    if len(p) < 40 or p[0] != 0x0C:
+    means the payload ends with the 40-byte FrameInfo, which is stripped.
+    Takes both the wrapped (resend) and the plain record format."""
+    if len(p) < 28:
+        return None
+    if p[0] == 0x0C:
+        base = 16                       # wrapped: 16-byte outer header
+    elif p[0] in MEDIA_CHANNELS and p[2] == 0x0C:
+        base = 8                        # plain: 8-byte outer header
+    else:
         return None
     ft = p[1]
-    o = 8 if ft & 0x08 else 0
-    if len(p) < 36 + o:
+    o = base + (8 if ft & 0x08 else 0)
+    if len(p) < o + 20:
         return None
-    ch = p[16 + o]
-    count = struct.unpack_from("<H", p, 20 + o)[0]
-    cidx = struct.unpack_from("<H", p, 22 + o)[0]
-    paysize = struct.unpack_from("<H", p, 24 + o)[0]
-    frame_no = struct.unpack_from("<I", p, 32 + o)[0]
-    payload = p[36 + o : 36 + o + paysize]
+    ch = p[o]
+    count = struct.unpack_from("<H", p, o + 4)[0]
+    cidx = struct.unpack_from("<H", p, o + 6)[0]
+    paysize = struct.unpack_from("<H", p, o + 8)[0]
+    frame_no = struct.unpack_from("<I", p, o + 16)[0]
+    payload = p[o + 20 : o + 20 + paysize]
     end = bool(ft & 0x01)
     if end:
         if cidx == 0x0028 and len(payload) >= 40:

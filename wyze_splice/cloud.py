@@ -1,4 +1,5 @@
-"""Reading the camera's own HTTPS: its ENR and its motion-event uploads.
+"""Reading the camera's own HTTPS (its ENR, its motion-event uploads), and
+asking the Wyze cloud for the camera's P2P UID with that ENR.
 
 The camera's TLS client still trusts the eMudhra "EM OV TLS CA - G3C"
 intermediate, whose private key is public (the October 2026 eMudhra
@@ -9,8 +10,9 @@ server, so the camera's cloud calls keep working. Two things are read off
 the camera's requests:
 
 - the ENR, the per-camera secret the DTLS PSK is derived from, in the JSON
-  body of its POSTs to api.wyzecam.com (at boot, on motion alarms, and
-  every few hours);
+  body of its POSTs to api.wyzecam.com and device-api.wyzecam.com (at
+  boot, on motion alarms, in the metrics report it sends after its
+  internet connection comes back, and every few hours);
 - motion events: for each alarm the camera PUTs a snapshot (jpg) and a
   12 s clip (mp4, H.264 + A-law audio) to cpl-t-sightsafe.wyzecam.com via
   pre-signed URLs, with no encryption beyond TLS.
@@ -124,8 +126,24 @@ DEBUG = bool(os.environ.get("WYZE_SPLICE_DEBUG"))
 EVENT_PATH_RE = re.compile(rb"^/[0-9A-F]{12}/[0-9-]+/([0-9A-F]+)_(\d{13})_\d+_(\d)_\d+/"
                            rb"[0-9a-f]+_\d+\.(jpg|mp4)")
 MAX_BODY = 64 << 20
-ENR_RE = re.compile(rb'"enr"\s*:\s*"((?:[^"\\]|\\.)+)"')
-MAC_RE = re.compile(rb'"mac"\s*:\s*"([0-9A-Fa-f]{12})"')
+ENR_RE = re.compile(rb'"(?:device_)?enr"\s*:\s*"((?:[^"\\]|\\.)+)"')
+MAC_RE = re.compile(rb'"(?:mac|device_id)"\s*:\s*"([0-9A-Fa-f]{12})"')
+# the camera's device calls name these fields two ways: alarm uploads use
+# the first, the metrics report the second
+DEVICE_FIELDS = {"model": ("product_model", "device_model"),
+                 "fw": ("firmware_ver", "firmware_version"),
+                 "hw": ("hardware_ver", "hardware_version")}
+
+# Wyze's device API. It authenticates a camera by the mac and enr in the
+# JSON body; sc and sv are fixed per call (from firmware 4.36.17.21's
+# iCamera, where each path follows its sv). get_p2pid is what the
+# firmware calls when it has no UID stored: it returns the camera's TUTK
+# P2P UID.
+DEVICE_API = "https://api.wyzecam.com"
+SC = "360a7068374548a2853526f5e0231ad2"
+SV_GET_P2PID = "8cac16a7ea504b2daf5b9044bec44d7d"
+P2P_ID_TYPE_TUTK = 3
+UID_RE = re.compile(r"^[A-Z0-9]{20}$")
 
 
 def emudhra_chain():
@@ -177,6 +195,13 @@ def mint_leaf(host, workdir):
 
 def find_enr(buf):
     """(enr, mac or None) from an HTTP request buffer, or None."""
+    info = device_info(buf)
+    return (info["enr"], info.get("mac")) if info else None
+
+
+def device_info(buf):
+    """{"enr", "mac", "model", "fw", "hw"} (what is present) from a camera
+    request body, or None without an ENR."""
     m = ENR_RE.search(buf)
     if not m:
         return None
@@ -184,8 +209,56 @@ def find_enr(buf):
         enr = json.loads(b'"' + m.group(1) + b'"')
     except ValueError:
         return None
+    info = {"enr": enr}
     mac = MAC_RE.search(buf)
-    return enr, mac.group(1).decode().upper() if mac else None
+    if mac:
+        info["mac"] = mac.group(1).decode().upper()
+    for key, names in DEVICE_FIELDS.items():
+        for name in names:
+            v = re.search(rb'"' + name.encode() + rb'"\s*:\s*"([^"\\]{1,40})"', buf)
+            if v:
+                info[key] = v.group(1).decode()
+                break
+    return info
+
+
+def _trust():
+    """A verifying TLS context. certifi's bundle, because a standalone
+    Python (uv's) can't find the CA store on some distributions (NixOS)."""
+    import certifi
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+class CloudError(Exception):
+    """The Wyze cloud did not hand out what we asked for."""
+
+
+def fetch_uid(mac, enr, model, fw, hw="0.0.0.0", timeout=20):
+    """The camera's TUTK P2P UID, from Wyze's device API, asking as the
+    camera itself (the call its firmware makes when it has no UID)."""
+    import urllib.error
+    import urllib.request
+    body = {"mac": mac.replace(":", "").upper(), "enr": enr,
+            "product_model": model, "product_type": "camera",
+            "hardware_ver": hw, "firmware_ver": fw, "sc": SC,
+            "sv": SV_GET_P2PID, "ts": str(int(time.time() * 1000)),
+            "p2p_id_type": P2P_ID_TYPE_TUTK}
+    req = urllib.request.Request(
+        DEVICE_API + "/device/system/get_p2pid", method="POST",
+        data=json.dumps(body, separators=(",", ":")).encode(),
+        headers={"Content-Type": "application/json",
+                 "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_trust()) as r:
+            reply = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise CloudError(f"Wyze answered HTTP {e.code}") from None
+    except (OSError, ValueError) as e:
+        raise CloudError(f"could not reach Wyze ({e})") from None
+    uid = (reply.get("data") or {}).get("p2p_id") if isinstance(reply, dict) else None
+    if str(reply.get("code")) != "1" or not uid or not UID_RE.match(uid):
+        raise CloudError(f"Wyze did not return a UID ({reply.get('msg') or reply})")
+    return uid
 
 
 # Only Wyze's own names are terminated; everything else the camera sends
@@ -311,6 +384,7 @@ class CloudTap:
         self.on_event = on_event
         self.enr_found = threading.Event()
         self.enr = self.mac = None
+        self.device = {}           # model/fw/hw from the ENR's request
         self.events = []
         self.stats = {"connections": 0, "intercepted": 0, "passed": 0,
                       "tls_failed": 0}
@@ -449,9 +523,10 @@ class CloudTap:
 
     def _on_request(self, method, path, headers, body):
         if not self.enr_found.is_set():
-            hit = find_enr(body)
-            if hit:
-                self.enr, self.mac = hit
+            info = device_info(body)
+            if info:
+                self.enr, self.mac = info["enr"], info.get("mac")
+                self.device = {k: info[k] for k in DEVICE_FIELDS if k in info}
                 self.enr_found.set()
         if method == "PUT" and self.events_dir is not None and body:
             name = event_name(path)

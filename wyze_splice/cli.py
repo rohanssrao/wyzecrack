@@ -1,6 +1,8 @@
-"""wyze-splice: decrypt a Wyze Cam v3 live view while the app keeps playing.
+"""wyze-splice: watch a Wyze Cam v3 from the local network.
 
-  wyze-splice                          open the app (pick a camera, watch along)
+  wyze-splice                          open the app (pick a camera, watch it)
+  sudo wyze-splice watch               record the live view straight from the camera
+  sudo wyze-splice key                 get and save the camera's ENR and UID
   sudo wyze-splice run                 splice the next live view, save events
   sudo wyze-splice events              only save motion-event clips
   sudo wyze-splice find                list Wyze devices on this LAN
@@ -26,6 +28,12 @@ import time
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
+# (seconds of waiting before, seconds cut off): the camera notices a dead
+# link after about 50 s and sends its metrics report, with its ENR, about
+# 20 s after the link is back (fw 4.36.17.21)
+NUDGES = ((20, 75), (180, 150))
+# firmware to quote to Wyze when the camera's own report didn't say
+DEFAULT_FW = "4.36.17.21"
 
 
 class _QuietStream:
@@ -78,7 +86,8 @@ def _inhibit_sleep():
     atexit.register(p.terminate)
 
 
-# -- ENR cache (keyed by camera MAC) ------------------------------------
+# -- camera key cache (keyed by camera MAC) -------------------------------
+# enr.json: {MAC: {"enr", "seen", and once known "uid", "model", "fw", "hw"}}
 def _mac_key(mac):
     return mac.replace(":", "").upper()
 
@@ -93,16 +102,29 @@ def _cache():
             for k, v in d.items()}
 
 
+def _cached(mac):
+    return (_cache().get(_mac_key(mac)) or {}) if mac else {}
+
+
 def _cached_enr(mac):
-    e = _cache().get(_mac_key(mac)) if mac else None
-    return e["enr"] if e else None
+    return _cached(mac).get("enr")
 
 
-def _cache_enr(mac, enr):
+def _cached_uid(mac):
+    return _cached(mac).get("uid")
+
+
+def _cache_enr(mac, enr, **fields):
+    """Remember the camera's ENR, plus uid/model/fw/hw when given. A new
+    ENR keeps the UID: the UID is the camera's for life, the ENR changes
+    when it is set up again."""
     d = _cache()
-    if d.get(_mac_key(mac), {}).get("enr") == enr:
+    old = d.get(_mac_key(mac), {})
+    new = {**old, **{k: v for k, v in fields.items() if v}, "enr": enr}
+    if old == new or (old.get("enr") == enr and not fields and old):
         return
-    d[_mac_key(mac)] = {"enr": enr, "seen": int(time.time())}
+    new["seen"] = int(time.time())
+    d[_mac_key(mac)] = new
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = STATE_DIR / "enr.json.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -202,8 +224,9 @@ class Armed:
     lock, on-path routing, the HTTPS interceptor and the splicer. Leaving
     it (normally, by exception, Ctrl-C, SIGTERM or SIGHUP) undoes it all."""
 
-    def __init__(self, a, out, splice, dry=False):
+    def __init__(self, a, out, splice, dry=False, harvest=False):
         self.a, self.out, self.want_splice, self.dry = a, out, splice, dry
+        self.want_harvest = harvest
         self.iface = self.gateway = None
         self.onpath = self.tap = self.splicer = None
         self.cam_mac = None
@@ -271,6 +294,8 @@ class Armed:
         events.emit("onpath", state="on")
 
     def _need_harvest(self):
+        if self.want_harvest:
+            return True
         return (self.want_splice and not self.enr()
                 and not getattr(self.a, "pass_through", False))
 
@@ -282,20 +307,54 @@ class Armed:
             return None
         return _cached_enr(self.cam_mac)
 
-    def wait_enr(self, timeout):
+    def wait_enr(self, timeout, nudge=True):
+        """Wait for the camera to send its ENR. With nudge, cut its internet
+        for a while if it hasn't (see NUDGES): when it comes back online it
+        reports in to Wyze, ENR included."""
+        cut = []
+        try:
+            return self._wait_enr(timeout, nudge, cut)
+        finally:
+            if cut:
+                self.changes.undo(cut)
+
+    def _wait_enr(self, timeout, nudge, cut):
         from . import events
         tap = self.tap
         print("[*] waiting for the camera's ENR. It sends it at boot, on "
-              "motion alarms (walk past the camera), and every few hours")
+              "motion alarms, and every few hours"
+              + ("; if it doesn't soon, this cuts the camera's internet for "
+                 "a minute to make it report in" if nudge else ""))
         events.emit("enr", state="waiting", stats=dict(tap.stats))
         start = time.monotonic()
         last, printed, warned = None, None, False
+        plan = list(NUDGES) if nudge else []
+        cut_until = None
         while not tap.enr_found.wait(2):
             if self.stop and self.stop.is_set():
                 return None
+            now = time.monotonic()
+            if cut_until is None and plan and now - start >= plan[0][0]:
+                seconds = plan.pop(0)[1]
+                tok = self._cut_internet()
+                if tok is not None:
+                    cut.append(tok)
+                    cut_until = now + seconds
+                    print(f"[*] no ENR yet: cutting the camera off the "
+                          f"internet for {seconds} s; it reports in when it "
+                          f"is back online")
+                    events.emit("enr", state="nudging", seconds=seconds)
+            if cut_until is not None and now >= cut_until:
+                self.changes.undo(cut)
+                cut.clear()
+                cut_until = None
+                print("[*] the camera's internet is back; waiting for it to "
+                      "report in")
+                events.emit("enr", state="waiting", stats=dict(tap.stats))
             st = dict(tap.stats)
             if st != last:
-                events.emit("enr", state="waiting", stats=st)
+                events.emit("enr", state="nudging" if cut_until else "waiting",
+                            stats=st)
                 last = st
             if st != printed and time.monotonic() - start > 30:
                 print(f"    camera HTTPS so far: {st['intercepted']} read, "
@@ -314,9 +373,23 @@ class Armed:
             print(f"[!] the ENR came from MAC {tap.mac}, but {self.a.target} "
                   f"is {self.cam_mac}")
         print("[+] ENR harvested from the camera's own HTTPS")
-        _cache_enr(self.cam_mac, tap.enr)
+        _cache_enr(self.cam_mac, tap.enr, **tap.device)
         events.emit("enr", state="harvested")
         return tap.enr
+
+    def _cut_internet(self):
+        """Drop everything the camera sends through us (journaled); returns
+        the token, or None if iptables refused."""
+        from .netutil import ipt
+        spec = ["-s", self.a.target, "-j", "DROP"]
+        tok = self.changes.add("ipt", args=["-t", "raw", "-D", "PREROUTING",
+                                            *spec])
+        if ipt("-t", "raw", "-I", "PREROUTING", "1", *spec).returncode:
+            self.changes.forget([tok])
+            print("[!] could not cut the camera's internet (iptables raw "
+                  "table); waiting for it to report in on its own")
+            return None
+        return tok
 
     def __exit__(self, *exc):
         self._teardown()
@@ -343,7 +416,7 @@ class Armed:
         self.changes.undo_all()
         self.changes.release()
         if self.tap and self.tap.enr_found.is_set() and self.cam_mac:
-            _cache_enr(self.cam_mac, self.tap.enr)
+            _cache_enr(self.cam_mac, self.tap.enr, **self.tap.device)
         self.changes = None
 
 
@@ -386,7 +459,7 @@ def cmd_run(a):
             if enr and not a.enr:
                 print("[*] using the cached ENR for this camera")
             if not enr and not a.pass_through:
-                enr = armed.wait_enr(a.harvest_timeout)
+                enr = armed.wait_enr(a.harvest_timeout, nudge=not a.no_nudge)
                 no_enr = not enr
                 if enr and a.no_events:
                     armed.tap.stop()
@@ -431,6 +504,136 @@ def cmd_events(a):
         _give_to_user(root, started)
         print(f"[+] {len(events)} event file(s) in {out}/")
     return 0
+
+
+def obtain_key(armed, a, nudge=True):
+    """(enr, uid) for the armed camera: from the cache, else the ENR from
+    the camera's HTTPS and the UID from Wyze. Returns (enr, None) when
+    Wyze won't give the UID, and (None, None) without an ENR."""
+    from . import events
+    from .cloud import CloudError
+    mac = armed.cam_mac
+    enr = armed.enr()
+    if enr:
+        events.emit("enr", state="harvested", cached=True)
+    else:
+        enr = armed.wait_enr(getattr(a, "harvest_timeout", 0), nudge=nudge)
+    if not enr:
+        return None, None
+    uid = None if getattr(a, "reharvest", False) else _cached_uid(mac)
+    if uid:
+        events.emit("uid", state="done", cached=True)
+        return enr, uid
+    events.emit("uid", state="active")
+    try:
+        uid = uid_from_wyze(a.target, mac, enr, armed.gateway)
+    except CloudError as e:
+        print(f"[!] {e}")
+        events.emit("uid", state="problem", detail=str(e))
+        return enr, None
+    events.emit("uid", state="done")
+    return enr, uid
+
+
+def uid_from_wyze(target, mac, enr, gateway=None):
+    """Ask Wyze for the camera's UID with its ENR (see cloud.fetch_uid) and
+    cache it. Raises cloud.CloudError."""
+    from .cloud import fetch_uid
+    from .discover import describe
+    from .netutil import default_gateway, iface_for
+    known = _cached(mac)
+    model = known.get("model")
+    if not model:
+        gw = gateway or default_gateway(iface_for(target))
+        model = describe(target, mac, gw).get("model_id") or "WYZE_CAKP2JFUS"
+    print("[*] asking Wyze for the camera's P2P UID, as the camera")
+    uid = fetch_uid(mac, enr, model, known.get("fw") or DEFAULT_FW,
+                    known.get("hw") or "0.0.0.0")
+    print(f"[+] UID {uid}")
+    _cache_enr(mac, enr, uid=uid)
+    return uid
+
+
+def _direct_key(a):
+    """(target, mac, enr, uid), getting on-path once to learn what isn't
+    cached yet."""
+    from .cloud import CloudError
+    from .onpath import neighbor_mac
+    target = _pick_target(a)
+    a.target = target
+    mac = neighbor_mac(target)
+    if not mac:
+        sys.exit(f"{target} does not answer; is the camera on?")
+    enr = getattr(a, "enr", None) or (None if a.reharvest else _cached_enr(mac))
+    uid = None if a.reharvest else _cached_uid(mac)
+    if enr and not uid:
+        try:
+            uid = uid_from_wyze(target, mac, enr)
+        except CloudError as e:
+            sys.exit(f"{e}; `wyze-splice run` still works, by catching a "
+                     f"live view the app opens")
+    if enr and uid:
+        return target, mac, enr, uid
+    print("[*] first time with this camera: reading its key (ENR) off its "
+          "own HTTPS, then its UID from Wyze")
+    armed = Armed(a, Path("."), splice=False, harvest=True)
+    a.events_dir = None
+    with armed:
+        enr, uid = obtain_key(armed, a, nudge=not a.no_nudge)
+    if not enr:
+        sys.exit("no ENR seen; trigger a motion alarm and try again, or "
+                 "pass --enr")
+    if not uid:
+        sys.exit("Wyze didn't hand out the camera's UID; `wyze-splice run` "
+                 "still works, by catching a live view the app opens")
+    return target, mac, enr, uid
+
+
+def cmd_key(a):
+    target, mac, enr, uid = _direct_key(a)
+    print(f"[+] {target} ({mac}): ENR and UID saved in {STATE_DIR}/enr.json")
+    return 0
+
+
+def cmd_watch(a):
+    """The live view straight from the camera, recorded until Ctrl-C (or
+    --seconds)."""
+    from .changes import Changes, signals_held
+    from .direct import CameraGone, Direct, open_firewall
+    from .netutil import local_ip_for
+    started = time.time()
+    target, mac, enr, uid = _direct_key(a)
+    out = Path(a.out) if a.out else _default_out("watch-")
+    root = _new_root(out)
+    out.mkdir(parents=True, exist_ok=True)
+    changes = Changes()
+    changes.acquire()
+    d = Direct(target, uid, enr, mac, local_ip=local_ip_for(target),
+               av_log=str(out / "av.bin"))
+    ok = False
+    try:
+        open_firewall(changes, target, d.port)
+        t0 = time.monotonic()
+        d.open()
+        print(f"[+] live from {target} after {time.monotonic() - t0:.1f} s; "
+              f"recording to {out}/ (Ctrl-C to stop)")
+        ok = True
+        end = time.monotonic() + a.seconds if a.seconds else None
+        while end is None or time.monotonic() < end:
+            d.pump(0.5)
+    except KeyboardInterrupt:
+        print()
+    except CameraGone as e:
+        print(f"[!] {e}")
+    finally:
+        d.close()
+        with signals_held():
+            changes.undo_all()
+        changes.release()
+    if ok and not a.no_video:
+        _export(out / "av.bin", out)
+    _give_to_user(root, started)
+    return 0 if ok else 1
 
 
 def cmd_check(a):
@@ -530,6 +733,21 @@ def _target_args(p):
     p.add_argument("--out", help="output directory (default captures/<time>)")
 
 
+def _key_args(p):
+    p.add_argument("--target", help="camera IPv4 address (default: find the "
+                                    "one Wyze device on this LAN)")
+    p.add_argument("--enr", help="camera ENR (default: harvest it once, then "
+                                 "reuse it)")
+    p.add_argument("--reharvest", action="store_true",
+                   help="ignore the saved ENR and UID and get them again")
+    p.add_argument("--no-nudge", action="store_true",
+                   help="never cut the camera's internet to make it report "
+                        "its ENR; wait for a motion alarm instead")
+    p.add_argument("--harvest-timeout", type=int, default=0, metavar="SECONDS",
+                   help="give up waiting for the ENR (default: wait)")
+    p.add_argument("--on-path", action="store_true", help=argparse.SUPPRESS)
+
+
 def _sudo_reexec():
     """Re-run this command under sudo (it prompts for the password), so
     users never need to type sudo themselves."""
@@ -594,6 +812,9 @@ def main(argv=None):
                    help="ignore the cached ENR and read it from the camera again")
     r.add_argument("--harvest-timeout", type=int, default=0, metavar="SECONDS",
                    help="give up waiting for the ENR (default: wait)")
+    r.add_argument("--no-nudge", action="store_true",
+                   help="never cut the camera's internet to make it report "
+                        "its ENR; wait for a motion alarm instead")
     r.add_argument("--keep-going", action="store_true",
                    help="splice every live view until Ctrl-C, not just the first")
     r.add_argument("--no-events", action="store_true",
@@ -605,6 +826,21 @@ def main(argv=None):
     r.add_argument("--journal", action="store_true",
                    help="also write journal.jsonl with all key material")
     r.set_defaults(fn=cmd_run)
+
+    w = sub.add_parser("watch", help="watch and record the camera directly "
+                                     "over the LAN (no phone needed)")
+    _key_args(w)
+    w.add_argument("--out", help="output directory (default captures/watch-<time>)")
+    w.add_argument("--seconds", type=float, default=0,
+                   help="stop after this long (default: until Ctrl-C)")
+    w.add_argument("--no-video", action="store_true",
+                   help="skip the MP4 export at the end")
+    w.set_defaults(fn=cmd_watch)
+
+    k = sub.add_parser("key", help="get and save the camera's ENR and UID "
+                                   "(once per camera)")
+    _key_args(k)
+    k.set_defaults(fn=cmd_key)
 
     ev = sub.add_parser("events", help="get on-path and save motion-event "
                                        "clips and snapshots until Ctrl-C")
@@ -639,7 +875,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd is None:
         a = ap.parse_args(["gui", *(argv or [])])
-    if a.cmd in ("run", "events", "find", "check", "cleanup"):
+    if a.cmd in ("run", "watch", "key", "events", "find", "check", "cleanup"):
         _sudo_reexec()
     try:
         return a.fn(a)

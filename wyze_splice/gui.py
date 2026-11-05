@@ -2,13 +2,18 @@
 
 `wyze-splice` (no command) starts it: a server on 127.0.0.1 with a
 one-time token in its URL, opened in the invoking user's browser. The page
-lists the Wyze cameras on the LAN; picking one arms the tool on it, shows
-what it is doing step by step, plays the decrypted live view in the page
-while someone watches it in the Wyze app (video decoded by the browser
-with WebCodecs, audio with WebAudio), and saves every live view and every
-motion event the camera uploads.
+lists the Wyze cameras on the LAN; picking one plays its live view in the
+page (video decoded by the browser with WebCodecs, audio with WebAudio)
+and records it.
 
-The server runs in the main thread (asyncio); the armed session runs in a
+The first time with a camera, the tool gets on its path to read its ENR
+off its HTTPS (cutting its internet for a minute if it doesn't send it
+soon), then asks Wyze for its UID with that ENR; both are cached. After
+that a live view is a direct LAN session (direct.py): nothing on the
+network is changed. If Wyze won't give the UID, the page falls back to
+splicing the live views the Wyze app opens (splice.py).
+
+The server runs in the main thread (asyncio); the session runs in a
 worker thread and reports through `events`.
 """
 import asyncio
@@ -144,7 +149,7 @@ class Controller:
         self.camera = cam
         self.stop.clear()
         self.state = {"phase": "starting", "camera": cam, "steps": {},
-                      "error": None}
+                      "error": None, "mode": "direct"}
         self.set()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -166,12 +171,21 @@ class Controller:
             self._step("onpath", "active" if ev["state"] == "arming" else "done")
         elif k == "enr":
             st = ev.get("stats") or {}
-            if ev["state"] == "waiting":
-                self._step("enr", "active", {"seen": st.get("intercepted", 0)})
+            if ev["state"] in ("waiting", "nudging"):
+                prev = (self.state.get("steps") or {}).get("enr") or {}
+                detail = {"seen": st.get("intercepted", 0) if st else
+                          (prev.get("detail") or {}).get("seen", 0),
+                          "nudging": ev["state"] == "nudging"}
+                self._step("enr", "active", detail)
             elif ev["state"] == "refused":
                 self._step("enr", "problem", {"refused": st.get("tls_failed")})
             else:
-                self._step("enr", "done", {"how": "harvested"})
+                self._step("enr", "done", {"how": "cached" if ev.get("cached")
+                                           else "harvested"})
+        elif k == "uid":
+            status = {"active": "active", "done": "done"}.get(ev["state"],
+                                                              "problem")
+            self._step("uid", status, {"detail": ev.get("detail")})
         elif k == "learning":
             self._step("watch", "active", {"note": "learning"})
         elif k == "watching":
@@ -209,36 +223,19 @@ class Controller:
                                     "had_video": was_live})
 
     def _run(self):
-        from .cli import Armed, _cached_enr, _give_to_user
-        from .splice import Splicer  # noqa: F401  (import errors show early)
+        from .cli import _give_to_user
         unsub = events.subscribe(self._on_event)
         cam = self.camera
         cam_dir = self.lib.camera_dir(cam["mac"], cam.get("name") or cam["model"])
-        args = SimpleNamespace(target=cam["ip"], on_path=False, enr=None,
-                               reharvest=False, pass_through=False,
-                               journal=False, events_dir=cam_dir / "events")
-        armed = Armed(args, cam_dir, splice=True)
-        armed.stop = self.stop
-        armed.on_motion = self._motion
         started = time.time()
         try:
-            self._step("onpath", "active")
-            with armed:
-                enr = armed.enr()
-                if enr:
-                    self._step("enr", "done", {"how": "cached"})
-                else:
-                    self._step("enr", "active", {"seen": 0})
-                    enr = armed.wait_enr(0)
-                if not enr or self.stop.is_set():
-                    return
-                sp = armed.splicer
-                sp.stop = sp.watcher.stop = self.stop
-                sp.session_dir = lambda: cam_dir / time.strftime("%Y%m%d-%H%M%S")
-                sp.on_av = self._on_av
-                sp.on_session_end = self._session_end
-                self._new_live()
-                sp.run(enr)
+            enr, uid = self._key(cam, cam_dir)
+            if self.stop.is_set() or not enr:
+                return
+            if uid:
+                self._watch(cam, cam_dir, enr, uid)
+            else:
+                self._run_splice(cam, cam_dir)
         except SystemExit as e:
             self.set(phase="error", error=str(e.code or e))
         except Exception as e:  # noqa: BLE001
@@ -250,6 +247,113 @@ class Controller:
             if self.state.get("phase") != "error":
                 self.set(phase="idle", session=None)
             self.hub.send_json({"kind": "library"})
+
+    def _key(self, cam, cam_dir):
+        """(enr, uid) for the camera: cached, or read once while on its
+        path (motion clips it uploads meanwhile are saved too)."""
+        from .cli import (Armed, _cached_enr, _cached_uid, obtain_key,
+                          uid_from_wyze)
+        from .cloud import CloudError
+        mac = cam["mac"]
+        enr, uid = _cached_enr(mac), _cached_uid(mac)
+        self.set(mode="direct")
+        if enr:
+            self._step("enr", "done", {"how": "cached"})
+        if enr and uid:
+            self._step("uid", "done")
+            return enr, uid
+        if enr:
+            self._step("uid", "active")
+            try:
+                uid = uid_from_wyze(cam["ip"], mac, enr)
+                self._step("uid", "done")
+                return enr, uid
+            except CloudError as e:
+                self._step("uid", "problem", {"detail": str(e)})
+                return enr, None
+        args = SimpleNamespace(target=cam["ip"], on_path=False, enr=None,
+                               reharvest=False, pass_through=False,
+                               journal=False, events_dir=cam_dir / "events",
+                               harvest_timeout=0)
+        armed = Armed(args, cam_dir, splice=False, harvest=True)
+        armed.stop = self.stop
+        armed.on_motion = self._motion
+        self._step("enr", "active", {"seen": 0})
+        with armed:
+            return obtain_key(armed, args)
+
+    def _watch(self, cam, cam_dir, enr, uid):
+        """Live views straight from the camera until Stop; reconnects when
+        the camera hangs up, saving each stretch as its own recording."""
+        from .changes import Changes, signals_held
+        from .direct import CameraGone, Direct, open_firewall
+        from .netutil import local_ip_for
+        failures = 0
+        while not self.stop.is_set():
+            self.set(phase="connecting", hint=None,
+                     session={"state": "direct"})
+            out = cam_dir / time.strftime("%Y%m%d-%H%M%S")
+            out.mkdir(parents=True, exist_ok=True)
+            self._new_live()
+            changes = Changes()
+            changes.acquire()
+            d = Direct(cam["ip"], uid, enr, cam["mac"],
+                       local_ip=local_ip_for(cam["ip"]), on_av=self._on_av,
+                       av_log=str(out / "av.bin"))
+            got_video = False
+            try:
+                open_firewall(changes, cam["ip"], d.port)
+                d.open()
+                print(f"[+] live from {cam['ip']}")
+                while not self.stop.is_set():
+                    d.pump(0.3)
+            except CameraGone as e:
+                print(f"[*] {e}")
+                got_video = self.state.get("phase") == "live"
+                if not got_video:
+                    failures += 1
+            finally:
+                d.close()
+                with signals_held():
+                    changes.undo_all()
+                changes.release()
+            had_video = self.live_stats.get("frames", 0) > 0
+            self._session_end(out, had_video)
+            if self.stop.is_set():
+                break
+            if failures >= 3:
+                self.set(phase="error",
+                         error="The camera doesn't answer. Is it switched on "
+                               "in the Wyze app? (A camera that is turned "
+                               "off can't be watched.)")
+                return
+            self.hub.send_json({"kind": "toast", "text":
+                                "The camera hung up · reconnecting"
+                                if had_video else "Trying again…"})
+            self.stop.wait(1.5)
+
+    def _run_splice(self, cam, cam_dir):
+        """The fallback: splice the live views the Wyze app opens."""
+        from .cli import Armed
+        args = SimpleNamespace(target=cam["ip"], on_path=False, enr=None,
+                               reharvest=False, pass_through=False,
+                               journal=False, events_dir=cam_dir / "events")
+        armed = Armed(args, cam_dir, splice=True)
+        armed.stop = self.stop
+        armed.on_motion = self._motion
+        self.set(mode="splice")
+        self._step("onpath", "active")
+        with armed:
+            enr = armed.enr()
+            if not enr or self.stop.is_set():
+                return
+            sp = armed.splicer
+            sp.stop = sp.watcher.stop = self.stop
+            sp.session_dir = lambda: cam_dir / time.strftime("%Y%m%d-%H%M%S")
+            sp.on_av = self._on_av
+            sp.on_session_end = self._session_end
+            self._new_live()
+            sp.run(enr)
 
     # live media -> the page
     def _new_live(self):
@@ -398,7 +502,7 @@ class Hub:
 
 
 def _cameras(lib):
-    from .cli import _cached_enr
+    from .cli import _cached_enr, _cached_uid
     from .discover import describe, find_cameras
     from .netutil import default_gateway, iface_for
     iface = iface_for("8.8.8.8")
@@ -411,6 +515,7 @@ def _cameras(lib):
         out.append({"ip": ip, "mac": mac, **d,
                     "name": names.get(_key(mac), {}).get("name"),
                     "key_known": bool(_cached_enr(mac)),
+                    "ready": bool(_cached_enr(mac) and _cached_uid(mac)),
                     "thumb": lib.thumb(mac),
                     "recordings": len(lib.recordings(mac))})
     return out
