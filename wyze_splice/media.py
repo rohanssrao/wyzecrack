@@ -59,7 +59,7 @@ def parse_media(p):
         return None
     if p[0] == 0x0C:
         base = 16                       # wrapped: 16-byte outer header
-    elif p[0] in MEDIA_CHANNELS and p[2] == 0x0C:
+    elif p[0] in MEDIA_CHANNELS and p[2] in (0x0B, 0x0C):
         base = 8                        # plain: 8-byte outer header
     else:
         return None
@@ -341,6 +341,10 @@ def _size(h264_path):
     return None
 
 
+# a resolution other than the main one gets its own MP4 only if it lasted
+MIN_SIDE_SECONDS = 2.0
+
+
 def export(av_bin, outdir):
     """av.bin -> per AV session (one per live view; a single session is
     written to outdir itself, several to outdir/session-N): video.h264
@@ -382,6 +386,8 @@ def _export_session(every, outdir, records=()):
     main = max(range(len(segs)), key=lambda i: len(segs[i]))
     used = set()
     for i, seg in enumerate(segs):
+        if i != main and seg[-1][0] - seg[0][0] < MIN_SIDE_SECONDS:
+            continue          # e.g. the first SD moment before HD kicks in
         part = os.path.join(outdir, f".seg{i}.h264")
         with open(part, "wb") as f:
             f.write(b"".join(t[3] for t in seg))

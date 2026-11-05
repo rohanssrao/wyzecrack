@@ -93,3 +93,60 @@ def test_long_sni_still_gets_a_leaf():
 
 def test_bad_enr_escape_is_ignored():
     assert enr.find_enr(b'{"enr":"ab\\xcd"}') is None
+
+
+def test_device_info_reads_both_request_shapes():
+    alarm = (b'{"alarm_ts":1,"mac":"D03F27A1B2C3","enr":"gekMdn0XjZoWF\\/mD",'
+             b'"product_model":"WYZE_CAKP2JFUS","hardware_ver":"0.0.0.0",'
+             b'"firmware_ver":"4.36.17.21"}')
+    metrics = (b'{"request_id":"x","device_id":"D03F27A1B2C3",'
+               b'"device_enr":"gekMdn0XjZoWF/mD","device_model":"WYZE_CAKP2JFUS",'
+               b'"firmware_version":"4.36.17.21","hardware_version":"0.0.0.0"}')
+    want = {"enr": "gekMdn0XjZoWF/mD", "mac": "D03F27A1B2C3",
+            "model": "WYZE_CAKP2JFUS", "fw": "4.36.17.21", "hw": "0.0.0.0"}
+    assert enr.device_info(alarm) == want
+    assert enr.device_info(metrics) == want
+
+
+class _Reply:
+    def __init__(self, body):
+        self.body = body
+
+    def read(self, *a):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_fetch_uid_asks_as_the_camera(monkeypatch):
+    import json
+    import urllib.request
+    sent = {}
+
+    def fake(req, timeout, context):
+        sent["url"], sent["body"] = req.full_url, json.loads(req.data)
+        return _Reply(b'{"code":"1","msg":"SUCCESS","data":{"p2p_id":'
+                      b'"ABCDEFGHJKLMNPQR111A","p2p_id_type":3}}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    uid = enr.fetch_uid("d0:3f:27:a1:b2:c3", "gekMdn0XjZoWF/mD",
+                        "WYZE_CAKP2JFUS", "4.36.17.21")
+    assert uid == "ABCDEFGHJKLMNPQR111A"
+    assert sent["url"].endswith("/device/system/get_p2pid")
+    b = sent["body"]
+    assert (b["mac"], b["enr"], b["p2p_id_type"]) == (
+        "D03F27A1B2C3", "gekMdn0XjZoWF/mD", 3)
+    assert b["sv"] == enr.SV_GET_P2PID and b["sc"] == enr.SC
+
+
+def test_fetch_uid_refusal_is_a_cloud_error(monkeypatch):
+    import urllib.request
+    import pytest
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Reply(
+        b'{"code":"1000","msg":"service is error","data":null}'))
+    with pytest.raises(enr.CloudError):
+        enr.fetch_uid("D03F27A1B2C3", "x", "WYZE_CAKP2JFUS", "4.36.17.21")

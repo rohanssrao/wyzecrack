@@ -28,10 +28,14 @@ import time
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
-# (seconds of waiting before, seconds cut off): the camera notices a dead
-# link after about 50 s and sends its metrics report, with its ENR, about
-# 20 s after the link is back (fw 4.36.17.21)
-NUDGES = ((20, 75), (180, 150))
+# When to cut the camera's internet while waiting for its ENR, and for how
+# long: (seconds after the wait starts, seconds cut off). The camera notices
+# a dead link after about 50 s and posts its metrics report, ENR included,
+# about 20 s after the link is back (fw 4.36.17.21). One cut in two worked
+# in testing: the camera can decide it is back online while still cut off
+# (I think because some of its traffic bypasses this host) and then not
+# report in until the next outage, so the cuts repeat.
+NUDGES = ((30, 90), (150, 120), (300, 150), (480, 150))
 # firmware to quote to Wyze when the camera's own report didn't say
 DEFAULT_FW = "4.36.17.21"
 
@@ -709,8 +713,7 @@ def _export(av, outdir):
         print(f"[!] {err}")
     if r["dropped"]:
         print(f"    {r['dropped']} frame(s) left out: incomplete, or after an "
-              f"incomplete I-frame (the camera keeps streaming briefly "
-              f"after the viewer leaves, without completing I-frames)")
+              f"incomplete I-frame")
     return True
 
 

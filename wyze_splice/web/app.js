@@ -142,7 +142,10 @@ function applyState(s) {
   else if (direct && s.phase === "connecting") last.className = "active";
 
   let key = s.phase;
-  if (s.phase === "starting" && steps.onpath) key = "onpath";
+  if (direct && s.phase === "starting") {
+    // the key, then the ID, then connecting; on-path is an internal detail here
+    key = steps.enr?.status !== "done" ? "key" : steps.uid?.status !== "done" ? "uid" : "direct";
+  } else if (s.phase === "starting" && steps.onpath) key = "onpath";
   if (steps.enr && steps.enr.status === "active" && s.phase !== "error") key = direct ? (steps.enr.detail?.nudging ? "key_nudge" : "key") : "enr";
   if (steps.enr && steps.enr.status === "problem") key = "enr_refused";
   if (direct && steps.uid && steps.uid.status === "active") key = "uid";

@@ -1,15 +1,17 @@
 # wyze-splice
 
-Decrypt a Wyze Cam v3's live view from the local network while the owner's
-phone app keeps playing it, and save the motion clips the camera uploads.
+Watch and record a Wyze Cam v3 from its local network, with no phone and no
+Wyze account. It can also decrypt the live views the owner's Wyze app
+opens, and save the motion clips the camera uploads.
 
 Only use this against cameras you own or are authorized to test.
 
 ## Requirements
 
 - Root on a Linux host with a wired or Wi-Fi link on the camera's LAN,
-  using the same interface for its internet route. No access to the
-  camera, the phone or the Wyze account is needed.
+  using the same interface for its internet route, and internet access the
+  first time with each camera. No access to the camera, the phone or the
+  Wyze account is needed.
 - `iptables` with the TPROXY target, and `ip` (iproute2). Everything else
   comes from the Python dependencies: packet capture and ARP use
   `AF_PACKET` sockets with kernel BPF filters (no libpcap), conntrack is
@@ -30,26 +32,26 @@ uv sync
 .venv/bin/wyze-splice
 ```
 
-It asks for your password (it needs root to reroute the camera's traffic)
-and opens a page in your browser:
+It asks for your password (it needs root) and opens a page in your
+browser:
 
 1. **Pick a camera.** It lists the Wyze cameras on the network, with their
    model.
-2. **The first time,** it waits for the camera's key (its ENR, which the
-   stream key is derived from). The camera sends it to Wyze at boot, on
-   motion alarms and every few hours; walk past the camera to trigger one.
-   It's then remembered.
-3. **Open the camera's live view in the Wyze app** from a phone that isn't
-   on the camera's network (on cellular, for example). On the same Wi-Fi
-   the app talks to the camera directly over the LAN, which never passes
-   through this computer.
-4. **Watch along.** The live view plays in the page, with sound if you
-   turn it on, while the app keeps playing normally. When the viewer
-   leaves, the video is saved with its audio, and the page waits for the
-   next one. Motion clips the camera uploads meanwhile are saved too.
+2. **The first time with a camera** takes about a minute, sometimes a few.
+   The tool reroutes the camera's traffic through this computer and reads
+   the camera's key (its ENR) off the camera's own HTTPS. If the camera
+   doesn't send it within 30 seconds, the tool cuts the camera's internet
+   for a minute or two; the camera reports in with its key when it's back
+   online. The tool then asks Wyze for the camera's ID, presenting that key
+   as the camera does. Both are saved, and the camera's network goes back
+   to normal.
+3. **Watch.** The live view plays in the page in 1080p, with sound if you
+   turn it on, straight from the camera over the LAN. Stop saves it.
 
-Stop or Quit in the page (or Ctrl-C in the terminal) puts the camera's
-network back.
+After the first time, a camera's live view starts within seconds and
+nothing on the network is rerouted. If Wyze won't return a camera's ID,
+the page instead waits for someone to open the camera in the Wyze app and
+plays that live view ([how](docs/how-it-works.md)).
 
 ## Commands
 
@@ -58,8 +60,10 @@ commands too; they also ask for the password themselves.
 
 | command | does |
 |---|---|
-| `wyze-splice` | the page: pick a camera, watch along, everything saved |
-| `wyze-splice run` | splice the next live view from the terminal; also saves motion events meanwhile |
+| `wyze-splice` | the page: pick a camera, watch it, everything saved |
+| `wyze-splice watch` | record the live view straight from the camera, until Ctrl-C or `--seconds N` |
+| `wyze-splice key` | get and save a camera's ENR and ID (the page and `watch` do this themselves) |
+| `wyze-splice run` | splice the next live view the Wyze app opens; also saves motion events meanwhile |
 | `wyze-splice events` | only save motion events (`clip.mp4` + `snapshot.jpg`), until Ctrl-C or `--count N` |
 | `wyze-splice find` | list Wyze devices on the LAN (by their IEEE MAC prefixes) |
 | `wyze-splice check` | run all of `run`'s pre-flight checks without touching the camera |
@@ -75,7 +79,7 @@ just prints the link. For each command's options, use `--help` or see
 
 The page saves under `captures/<camera>/`: one folder per live view
 (`video.mp4` with sound, `frame.jpg`, `meta.json`) and `events/` for
-motion clips. `run` writes to `captures/<time>/` instead. The raw capture
+motion clips. `watch` and `run` write to `captures/<time>/` instead. The raw capture
 files are described in [docs/guide.md](docs/guide.md#output-files).
 
 ## More

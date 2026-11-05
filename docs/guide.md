@@ -2,6 +2,24 @@
 
 ## Options
 
+`watch`:
+
+- `--target <ip>` names the camera (default: find it).
+- `--seconds <n>` stops after that long (default: until Ctrl-C).
+- `--out <dir>` sets the capture directory (default:
+  `captures/watch-<time>`).
+- `--no-video` skips the MP4 export.
+- `--enr <ENR>` supplies the camera's ENR instead of harvesting it.
+- `--reharvest` ignores the saved ENR and ID and gets them again.
+- `--no-nudge` never cuts the camera's internet to make it send its ENR;
+  it waits for a motion alarm instead.
+- `--harvest-timeout <seconds>` stops waiting for the ENR after that many
+  seconds.
+
+`key` takes the same options as `watch`, apart from `--seconds`, `--out`
+and `--no-video`. The ENR and ID are saved in
+`/var/lib/wyze-splice/enr.json`.
+
 `run`:
 
 - `--target <ip>` names the camera (default: find it).
@@ -12,6 +30,7 @@
 - `--reharvest` ignores the cached ENR.
 - `--harvest-timeout <seconds>` stops waiting for the ENR after that many
   seconds.
+- `--no-nudge` never cuts the camera's internet to make it send its ENR.
 - `--no-events` leaves motion-event uploads alone.
 - `--no-video` skips the MP4 export.
 - `--on-path` skips the ARP step. Use it on a host that already carries the
@@ -49,6 +68,16 @@ video goes to `session-N/`.
 
 ## Troubleshooting
 
+- **"the camera did not answer (discovery)":** the camera is off (switched
+  off in the Wyze app, or on a schedule) or unplugged. A camera that is
+  turned off stops all its P2P traffic, so it can't be watched.
+- **"Wyze did not return a UID":** the Wyze cloud refused the camera's
+  key, or changed this call. `wyze-splice run` still works: it catches a
+  live view that the Wyze app opens.
+- **The first time takes long:** the camera only sends its ENR at certain
+  moments. The tool cuts its internet up to four times to make it report
+  in; a motion alarm also does it. Each cut takes the camera offline for
+  1.5 to 2.5 minutes.
 - **The live view plays in the app but nothing shows up here:** the phone
   is probably on the camera's Wi-Fi. There the app reaches the camera
   directly over the LAN, which doesn't pass through this computer; use a
