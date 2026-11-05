@@ -29,11 +29,12 @@ import json
 import os
 import socket
 import struct
+import threading
 import time
 
 from .dtls import (HS_SH, HS_SHD, HS_SKE, RT_ALERT, RT_APPDATA, RT_CCS,
-                   RT_HANDSHAKE, DTLSLeg, Templates, derive_psk, parse_hs,
-                   parse_records)
+                   RT_HANDSHAKE, BadRecord, DTLSLeg, ReplayWindow, Templates,
+                   derive_psk, parse_hs, parse_records)
 
 DISCO_PORT = 32761
 CMD_DISCO, CMD_KEEPALIVE, CMD_DTLS = 0x1002, 0x1202, 0x1502
@@ -50,6 +51,47 @@ SILENT_AFTER = 6.0                          # camera quiet this long: gone
 
 class CameraGone(Exception):
     """The camera did not answer (or hung up)."""
+
+
+def disco_packet(key, sid, seq=0, ticket=0):
+    """A 0x1002 discovery packet (52 bytes) with its HMAC trailer."""
+    b = bytearray(32)
+    b[0:2] = b"\x51\xcc"
+    struct.pack_into("<HH", b, 4, CMD_DISCO, 0x28)
+    struct.pack_into("<HH", b, 12, seq, ticket)
+    b[16:24] = sid
+    b[24:28] = SDK_VERSION
+    b[28] = 0x1D
+    return bytes(b) + hmac.new(key, bytes(b), hashlib.sha1).digest()
+
+
+def answers(ip, uid, enr, mac, iface, timeout=1.5):
+    """True if the camera answers LAN discovery, i.e. it is switched on and
+    its P2P stack runs. The answer is read off an AF_PACKET socket, so no
+    firewall rule is needed (the host firewall may then drop it)."""
+    from .rawnet import parse_udp, sniff, udp_filter
+    key = uid.encode() + auth_key(enr, mac)
+    got = threading.Event()
+
+    def on(p):
+        d = p.payload
+        if (p.src == ip and len(d) >= 52 and d[:2] == b"\x51\xcc"
+                and struct.unpack_from("<HH", d, 4)[0] == CMD_DISCO
+                and struct.unpack_from("<H", d, 12)[0] == 1):
+            got.set()
+
+    t = threading.Thread(target=sniff, daemon=True,
+                         args=(iface, udp_filter([ip]), parse_udp, on,
+                               got.is_set, timeout + 0.5))
+    t.start()
+    time.sleep(0.1)                       # the sniffer is listening
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        pkt = disco_packet(key, os.urandom(8))
+        for _ in range(3):
+            s.sendto(pkt, (ip, DISCO_PORT))
+            if got.wait(timeout / 3):
+                break
+    return got.is_set()
 
 
 def open_firewall(changes, ip, port):
@@ -131,8 +173,9 @@ class Direct:
     pump() then runs the session (call it in a loop); close() hangs up."""
 
     def __init__(self, ip, uid, enr, mac, local_ip=None, on_av=None,
-                 av_log=None, log=print):
+                 av_log=None, log=print, stop=None):
         self.ip, self.enr, self.mac, self.log = ip, enr, mac, log
+        self.stop = stop                      # threading.Event: give up
         self.key = uid.encode() + auth_key(enr, mac)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((local_ip or "0.0.0.0", 0))
@@ -150,7 +193,9 @@ class Direct:
         self.on_av = on_av
         self.av_f = open(av_log, "ab") if av_log else None
         self.info = {}                        # the camera's K10003 JSON
-        self.stats = {"rx": 0, "tx": 0, "bad_trailer": 0}
+        self.seen = ReplayWindow()            # the camera sends media twice
+        self.stats = {"rx": 0, "tx": 0, "bad_trailer": 0, "bad_record": 0,
+                      "duplicate": 0}
 
     @property
     def port(self):
@@ -161,14 +206,7 @@ class Direct:
         return hmac.new(self.key, head, hashlib.sha1).digest()
 
     def _disco(self, seq):
-        b = bytearray(32)
-        b[0:2] = b"\x51\xcc"
-        struct.pack_into("<HH", b, 4, CMD_DISCO, 0x28)
-        struct.pack_into("<HH", b, 12, seq, self.ticket)
-        b[16:24] = self.sid
-        b[24:28] = SDK_VERSION
-        b[28] = 0x1D
-        return bytes(b) + self._trailer(bytes(b))
+        return disco_packet(self.key, self.sid, seq, self.ticket)
 
     def _wrap(self, records, channel=0):
         h = bytearray(28)
@@ -233,6 +271,8 @@ class Direct:
         """Send `send()` every `every` s, pumping replies, until done()."""
         nxt = 0
         while not done():
+            if self.stop is not None and self.stop.is_set():
+                raise CameraGone("stopped")
             now = time.monotonic()
             if now > deadline:
                 raise CameraGone(f"the camera did not answer ({what})")
@@ -403,7 +443,16 @@ class Direct:
                 elif rtype == RT_CCS:
                     self.leg.client_on_ccs()
                 continue
-            pt = self.leg.decrypt_record(rtype, ver, epoch, seq, body)
+            if not self.seen.check(epoch, seq):
+                self.stats["duplicate"] += 1
+                continue
+            try:
+                pt = self.leg.decrypt_record(rtype, ver, epoch, seq, body)
+            except BadRecord:
+                if not self.leg.handshake_done:
+                    raise
+                self.stats["bad_record"] += 1     # drop it, keep the session
+                continue
             if rtype == RT_HANDSHAKE:
                 self.leg.client_on_fin(pt)
             elif rtype == RT_APPDATA:

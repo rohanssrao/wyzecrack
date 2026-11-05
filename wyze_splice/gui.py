@@ -286,51 +286,58 @@ class Controller:
         """Live views straight from the camera until Stop; reconnects when
         the camera hangs up, saving each stretch as its own recording."""
         from .changes import Changes, signals_held
+        from .cli import _inhibit_sleep, _release_inhibitor
         from .direct import CameraGone, Direct, open_firewall
         from .netutil import local_ip_for
-        failures = 0
-        while not self.stop.is_set():
-            self.set(phase="connecting", hint=None,
-                     session={"state": "direct"})
-            out = cam_dir / time.strftime("%Y%m%d-%H%M%S")
-            out.mkdir(parents=True, exist_ok=True)
-            self._new_live()
-            changes = Changes()
-            changes.acquire()
-            d = Direct(cam["ip"], uid, enr, cam["mac"],
-                       local_ip=local_ip_for(cam["ip"]), on_av=self._on_av,
-                       av_log=str(out / "av.bin"))
-            got_video = False
-            try:
-                open_firewall(changes, cam["ip"], d.port)
-                d.open()
-                print(f"[+] live from {cam['ip']}")
-                while not self.stop.is_set():
-                    d.pump(0.3)
-            except CameraGone as e:
-                print(f"[*] {e}")
-                got_video = self.state.get("phase") == "live"
-                if not got_video:
-                    failures += 1
-            finally:
-                d.close()
-                with signals_held():
-                    changes.undo_all()
-                changes.release()
-            had_video = self.live_stats.get("frames", 0) > 0
-            self._session_end(out, had_video)
-            if self.stop.is_set():
-                break
-            if failures >= 3:
-                self.set(phase="error",
-                         error="The camera doesn't answer. Is it switched on "
-                               "in the Wyze app? (A camera that is turned "
-                               "off can't be watched.)")
-                return
-            self.hub.send_json({"kind": "toast", "text":
-                                "The camera hung up · reconnecting"
-                                if had_video else "Trying again…"})
-            self.stop.wait(1.5)
+        failures = 0                 # attempts in a row without a picture
+        sleep_lock = _inhibit_sleep("showing a live view")
+        try:
+            while not self.stop.is_set():
+                self.set(phase="connecting", hint=None,
+                         session={"state": "direct"})
+                out = cam_dir / time.strftime("%Y%m%d-%H%M%S")
+                out.mkdir(parents=True, exist_ok=True)
+                self._new_live()
+                changes = Changes()
+                changes.acquire()
+                d = None
+                try:
+                    d = Direct(cam["ip"], uid, enr, cam["mac"],
+                               local_ip=local_ip_for(cam["ip"]),
+                               on_av=self._on_av, av_log=str(out / "av.bin"),
+                               stop=self.stop)
+                    open_firewall(changes, cam["ip"], d.port)
+                    d.open()
+                    print(f"[+] live from {cam['ip']}")
+                    while not self.stop.is_set():
+                        d.pump(0.3)
+                except (CameraGone, ValueError, OSError) as e:
+                    # ValueError: a DTLS handshake that went wrong; OSError:
+                    # no route (the host's network is still coming up)
+                    print(f"[*] {e}")
+                finally:
+                    if d:
+                        d.close()
+                    with signals_held():
+                        changes.undo_all()
+                    changes.release()
+                had_video = self.live_stats.get("frames", 0) > 0
+                self._session_end(out, had_video)
+                if self.stop.is_set():
+                    break
+                failures = 0 if had_video else failures + 1
+                if failures >= 3:
+                    self.set(phase="error",
+                             error="The camera doesn't answer. Is it switched "
+                                   "on in the Wyze app? (A camera that is "
+                                   "turned off can't be watched.)")
+                    return
+                self.hub.send_json({"kind": "toast", "text":
+                                    "The camera hung up · reconnecting"
+                                    if had_video else "Trying again…"})
+                self.stop.wait(1.5)
+        finally:
+            _release_inhibitor(sleep_lock)
 
     def _run_splice(self, cam, cam_dir):
         """The fallback: splice the live views the Wyze app opens."""
@@ -516,9 +523,31 @@ def _cameras(lib):
                     "name": names.get(_key(mac), {}).get("name"),
                     "key_known": bool(_cached_enr(mac)),
                     "ready": bool(_cached_enr(mac) and _cached_uid(mac)),
+                    "online": None,
                     "thumb": lib.thumb(mac),
                     "recordings": len(lib.recordings(mac))})
+    _check_online([c for c in out if c["ready"]], iface)
     return out
+
+
+def _check_online(cams, iface):
+    """Mark which ready cameras answer on the LAN (in parallel, ~1.5 s): a
+    camera that is switched off in the Wyze app, or offline, can't be
+    watched."""
+    from .cli import _cached_enr, _cached_uid
+    from .direct import answers
+
+    def one(c):
+        try:
+            c["online"] = answers(c["ip"], _cached_uid(c["mac"]),
+                                  _cached_enr(c["mac"]), c["mac"], iface)
+        except OSError:
+            c["online"] = None
+    threads = [threading.Thread(target=one, args=(c,)) for c in cams]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
 
 
 def make_app(token, hub, ctl, lib):

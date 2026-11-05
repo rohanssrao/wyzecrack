@@ -122,7 +122,7 @@ class Changes:
         except BlockingIOError:
             f.close()
             raise SystemExit("another wyze-splice is already running "
-                             "(only one can be the camera's router)")
+                             "(only one runs at a time)")
         self._lockf = f
         stale = load(self.path)
         if stale:

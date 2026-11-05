@@ -19,3 +19,15 @@ def test_enr_cache_by_mac_and_old_ip_keyed_format(tmp_path, monkeypatch):
 def test_new_root_is_the_topmost_missing_directory(tmp_path):
     assert cli._new_root(tmp_path / "a" / "b" / "c") == tmp_path / "a"
     assert cli._new_root(tmp_path) == tmp_path
+
+
+def test_reconnect_lookup_is_a_wyzecam_dns_query_from_the_camera():
+    from wyze_splice.cli import reconnect_lookup
+    from wyze_splice.rawnet import UdpPacket
+    q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07aws-iot\x07wyzecam\x03com\x00\x00\x01\x00\x01"
+    assert reconnect_lookup(UdpPacket("192.168.1.22", "192.168.1.1", 40000, 53, q), "192.168.1.22")
+    assert not reconnect_lookup(UdpPacket("192.168.1.1", "192.168.1.22", 53, 40000, q), "192.168.1.22")
+    other = q.replace(b"\x07wyzecam", b"\x07example")
+    assert not reconnect_lookup(UdpPacket("192.168.1.22", "192.168.1.1", 40000, 53, other), "192.168.1.22")
+    api = q.replace(b"\x07aws-iot", b"\x03api")      # the minutely reachability check
+    assert not reconnect_lookup(UdpPacket("192.168.1.22", "192.168.1.1", 40000, 53, api), "192.168.1.22")

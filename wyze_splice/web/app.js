@@ -24,11 +24,12 @@ async function scan() {
 function displayName(c) { return c.name || c.model || "Wyze camera"; }
 
 function camCard(c) {
-  const card = el("div", "cam");
+  const card = el("div", "cam" + (c.online === false ? " off" : ""));
   const thumb = el("div", "thumb", (c.thumb ? `<img src="${esc(c.thumb)}" alt="">` : `<span class="ph">📷</span>`) + `<div class="go">Watch</div>`);
   const body = el("div", "body");
   const name = el("div", "name", `<span>${esc(displayName(c))}</span><button class="edit" title="Rename">✎</button>`);
-  const bits = [c.name ? c.model : null, c.ip, c.ready ? "ready" : c.key_known ? "key saved" : null, c.tested ? null : "untested model"].filter(Boolean);
+  const status = c.online === false ? "off or offline" : c.ready ? "ready" : c.key_known ? "key saved" : null;
+  const bits = [c.name ? c.model : null, c.ip, status, c.tested ? null : "untested model"].filter(Boolean);
   const meta = el("div", "meta", esc(bits.join(" · ")));
   name.querySelector(".edit").onclick = (ev) => { ev.stopPropagation(); rename(c, name); };
   card.onclick = () => start(c);

@@ -28,14 +28,18 @@ import time
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
-# When to cut the camera's internet while waiting for its ENR, and for how
-# long: (seconds after the wait starts, seconds cut off). The camera notices
-# a dead link after about 50 s and posts its metrics report, ENR included,
-# about 20 s after the link is back (fw 4.36.17.21). One cut in two worked
-# in testing: the camera can decide it is back online while still cut off
-# (I think because some of its traffic bypasses this host) and then not
-# report in until the next outage, so the cuts repeat.
-NUDGES = ((30, 90), (150, 120), (300, 150), (480, 150))
+# Nudging the camera into sending its ENR (Armed.wait_enr): cutting its
+# internet. About a minute into a cut the camera notices and looks up its
+# MQTT broker to reconnect. The cut ends a couple of seconds after that
+# lookup, so the camera's next attempt gets through; it then usually posts
+# its metrics report, ENR included, within about 20 s (fw 4.36.16 and
+# 4.36.17), but not always. With cuts of fixed length, several were
+# followed by no report within 30 to 80 s.
+NUDGE_FIRST = 30          # s without the ENR before the first cut
+NUDGE_CUTS = 3
+NUDGE_MIN_CUT = 20        # s: lookups before this are not about the cut
+NUDGE_MAX_CUT = 150       # s: end the cut even if no lookup was seen
+NUDGE_SETTLE = 150        # s to wait for the report before the next cut
 # firmware to quote to Wyze when the camera's own report didn't say
 DEFAULT_FW = "4.36.17.21"
 
@@ -74,20 +78,30 @@ def _install_signals():
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
-def _inhibit_sleep():
-    """A suspended host black-holes the camera while it is the camera's
-    gateway; hold a sleep inhibitor for the run."""
+def _inhibit_sleep(why):
+    """Keep the host awake until _release_inhibitor(returned value): a
+    suspended host black-holes the camera while it is the camera's gateway,
+    and ends a live view. Returns None without systemd-inhibit."""
     exe = shutil.which("systemd-inhibit")
     if not exe:
-        return
-    # the lock is held by `tail --pid`, which ends with this process even
-    # when it is killed outright
+        return None
+    # `tail --pid` also ends the lock when this process is killed outright
     p = subprocess.Popen([exe, "--what=sleep:idle:handle-lid-switch",
-                          "--who=wyze-splice", "--why=camera gateway",
+                          "--who=wyze-splice", f"--why={why}",
                           "tail", f"--pid={os.getpid()}", "-f", "/dev/null"],
                          start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    atexit.register(p.terminate)
+    atexit.register(_release_inhibitor, p)
+    return p
+
+
+def _release_inhibitor(p):
+    if p is not None and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(2)
+        except subprocess.TimeoutExpired:
+            p.kill()
 
 
 # -- camera key cache (keyed by camera MAC) -------------------------------
@@ -235,6 +249,7 @@ class Armed:
         self.onpath = self.tap = self.splicer = None
         self.cam_mac = None
         self.changes = None
+        self._sleep_lock = None
         self._down = threading.Lock()
         # front-end hooks
         self.stop = None                 # threading.Event: abandon waits
@@ -290,7 +305,7 @@ class Armed:
         self.gateway = self.onpath.gateway
         if self.dry:
             return
-        _inhibit_sleep()
+        self._sleep_lock = _inhibit_sleep("camera gateway")
         events.emit("onpath", state="arming")
         self.onpath.start()
         if self.tap:
@@ -313,14 +328,21 @@ class Armed:
 
     def wait_enr(self, timeout, nudge=True):
         """Wait for the camera to send its ENR. With nudge, cut its internet
-        for a while if it hasn't (see NUDGES): when it comes back online it
-        reports in to Wyze, ENR included."""
-        cut = []
+        if it hasn't (see NUDGE_*): when it comes back online it reports in
+        to Wyze, ENR included."""
+        cut = {"tokens": [], "lookups": None}
         try:
             return self._wait_enr(timeout, nudge, cut)
         finally:
-            if cut:
-                self.changes.undo(cut)
+            self._end_cut(cut)
+
+    def _end_cut(self, cut):
+        if cut["tokens"]:
+            self.changes.undo(cut["tokens"])
+            cut["tokens"] = []
+        if cut["lookups"]:
+            cut["lookups"][1].set()
+            cut["lookups"] = None
 
     def _wait_enr(self, timeout, nudge, cut):
         from . import events
@@ -328,36 +350,41 @@ class Armed:
         print("[*] waiting for the camera's ENR. It sends it at boot, on "
               "motion alarms, and every few hours"
               + ("; if it doesn't soon, this cuts the camera's internet for "
-                 "a minute to make it report in" if nudge else ""))
+                 "about a minute to make it report in" if nudge else ""))
         events.emit("enr", state="waiting", stats=dict(tap.stats))
         start = time.monotonic()
         last, printed, warned = None, None, False
-        plan = list(NUDGES) if nudge else []
-        cut_until = None
-        while not tap.enr_found.wait(2):
+        cuts_left = NUDGE_CUTS if nudge else 0
+        next_cut, cut_at = start + NUDGE_FIRST, None
+        while not tap.enr_found.wait(1):
             if self.stop and self.stop.is_set():
                 return None
             now = time.monotonic()
-            if cut_until is None and plan and now - start >= plan[0][0]:
-                seconds = plan.pop(0)[1]
+            if cut_at is None and cuts_left and now >= next_cut:
+                cuts_left -= 1
                 tok = self._cut_internet()
-                if tok is not None:
-                    cut.append(tok)
-                    cut_until = now + seconds
-                    print(f"[*] no ENR yet: cutting the camera off the "
-                          f"internet for {seconds} s; it reports in when it "
-                          f"is back online")
-                    events.emit("enr", state="nudging", seconds=seconds)
-            if cut_until is not None and now >= cut_until:
-                self.changes.undo(cut)
-                cut.clear()
-                cut_until = None
-                print("[*] the camera's internet is back; waiting for it to "
-                      "report in")
-                events.emit("enr", state="waiting", stats=dict(tap.stats))
+                if tok is None:
+                    cuts_left = 0
+                else:
+                    cut["tokens"].append(tok)
+                    cut["lookups"] = self._watch_lookups()
+                    cut_at = now
+                    print("[*] no ENR yet: cutting the camera off the internet "
+                          "until it notices (about a minute); it reports in "
+                          "when it is back online")
+                    events.emit("enr", state="nudging")
+            if cut_at is not None:
+                seen = [t for t in cut["lookups"][0] if t - cut_at >= NUDGE_MIN_CUT]
+                if (seen and now - seen[0] >= 2) or now - cut_at >= NUDGE_MAX_CUT:
+                    self._end_cut(cut)
+                    print(f"[*] {'the camera noticed' if seen else 'no sign the camera noticed'} "
+                          f"after {(seen[0] if seen else now) - cut_at:.0f} s; "
+                          f"its internet is back, waiting for it to report in")
+                    events.emit("enr", state="waiting", stats=dict(tap.stats))
+                    cut_at, next_cut = None, now + NUDGE_SETTLE
             st = dict(tap.stats)
             if st != last:
-                events.emit("enr", state="nudging" if cut_until else "waiting",
+                events.emit("enr", state="nudging" if cut_at else "waiting",
                             stats=st)
                 last = st
             if st != printed and time.monotonic() - start > 30:
@@ -380,6 +407,25 @@ class Armed:
         _cache_enr(self.cam_mac, tap.enr, **tap.device)
         events.emit("enr", state="harvested")
         return tap.enr
+
+    def _watch_lookups(self):
+        """Note when the camera looks up a wyzecam.com name, which it does
+        when it reconnects. Returns ([monotonic times], stop Event)."""
+        from .rawnet import parse_udp, sniff, udp_filter
+        seen, stop = [], threading.Event()
+        cam = self.a.target
+
+        def on(p):
+            if reconnect_lookup(p, cam):
+                seen.append(time.monotonic())
+
+        def run():
+            try:
+                sniff(self.iface, udp_filter([cam]), parse_udp, on, stop.is_set)
+            except OSError:
+                pass                     # then the cut ends at NUDGE_MAX_CUT
+        threading.Thread(target=run, daemon=True).start()
+        return seen, stop
 
     def _cut_internet(self):
         """Drop everything the camera sends through us (journaled); returns
@@ -419,6 +465,8 @@ class Armed:
                 print(f"[!] teardown step failed: {e!r}")
         self.changes.undo_all()
         self.changes.release()
+        _release_inhibitor(self._sleep_lock)
+        self._sleep_lock = None
         if self.tap and self.tap.enr_found.is_set() and self.cam_mac:
             _cache_enr(self.cam_mac, self.tap.enr, **self.tap.device)
         self.changes = None
@@ -508,6 +556,14 @@ def cmd_events(a):
         _give_to_user(root, started)
         print(f"[+] {len(events)} event file(s) in {out}/")
     return 0
+
+
+def reconnect_lookup(p, cam):
+    """A DNS query from the camera (rawnet.UdpPacket) for its MQTT broker,
+    aws-iot.wyzecam.com, which it looks up to reconnect. (It looks up
+    api.wyzecam.com about once a minute anyway, for a reachability check.)"""
+    return (p.src == cam and p.dport == 53
+            and b"\x07aws-iot\x07wyzecam\x03com" in p.payload)
 
 
 def obtain_key(armed, a, nudge=True):
@@ -615,6 +671,7 @@ def cmd_watch(a):
     d = Direct(target, uid, enr, mac, local_ip=local_ip_for(target),
                av_log=str(out / "av.bin"))
     ok = False
+    sleep_lock = _inhibit_sleep("recording a live view")
     try:
         open_firewall(changes, target, d.port)
         t0 = time.monotonic()
@@ -627,13 +684,16 @@ def cmd_watch(a):
             d.pump(0.5)
     except KeyboardInterrupt:
         print()
-    except CameraGone as e:
+    except (CameraGone, ValueError) as e:
         print(f"[!] {e}")
     finally:
+        if os.environ.get("WYZE_SPLICE_DEBUG"):
+            print(f"[d] session: {d.stats}")
         d.close()
         with signals_held():
             changes.undo_all()
         changes.release()
+        _release_inhibitor(sleep_lock)
     if ok and not a.no_video:
         _export(out / "av.bin", out)
     _give_to_user(root, started)

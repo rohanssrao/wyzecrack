@@ -75,9 +75,9 @@ video goes to `session-N/`.
   key, or changed this call. `wyze-splice run` still works: it catches a
   live view that the Wyze app opens.
 - **The first time takes long:** the camera only sends its ENR at certain
-  moments. The tool cuts its internet up to four times to make it report
-  in; a motion alarm also does it. Each cut takes the camera offline for
-  1.5 to 2.5 minutes.
+  moments. The tool cuts its internet up to three times, 2.5 minutes
+  apart, to make it report in; a motion alarm also does it. Each cut takes
+  the camera offline for about a minute.
 - **The live view plays in the app but nothing shows up here:** the phone
   is probably on the camera's Wi-Fi. There the app reaches the camera
   directly over the LAN, which doesn't pass through this computer; use a

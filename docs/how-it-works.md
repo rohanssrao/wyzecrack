@@ -35,12 +35,14 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
      TLS the tool terminates.
 
    The camera sends its ENR at boot, with every motion alarm, and in the
-   metrics report it posts about 20 s after its internet connection comes
-   back. So when the ENR hasn't shown up 30 s in, the tool drops all of
-   the camera's traffic for 90 s (an iptables raw-table rule, journaled
-   like every other change); the camera notices after about 50 s and
-   reports in once the rule is gone. In testing, one cut in two worked;
-   the tool repeats the cut up to four times. `--no-nudge` turns this off.
+   metrics report it posts when its internet connection comes back. So
+   when the ENR hasn't shown up 30 s in, the tool drops all of the
+   camera's traffic (an iptables raw-table rule, journaled like every
+   other change). About a minute later the camera notices and looks up
+   its MQTT broker (aws-iot.wyzecam.com) to reconnect; the tool sees the
+   DNS query and lifts the cut, the camera's next attempt gets through,
+   and the report usually follows within about 20 s. If none comes within
+   150 s, the cut repeats, up to three times. `--no-nudge` turns this off.
 
 3. **Ask Wyze for the UID** (`cloud.fetch_uid`). Wyze's device API
    authenticates a camera only by the `mac` and `enr` in the JSON body.

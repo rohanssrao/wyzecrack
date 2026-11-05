@@ -522,6 +522,10 @@ class CloudTap:
                     pass
 
     def _on_request(self, method, path, headers, body):
+        if DEBUG:
+            print(f"[d] camera {method} {headers.get(b'host', b'?').decode('latin-1')}"
+                  f"{path.decode('latin-1')[:60]} ({len(body)} B, ENR "
+                  f"{'in it' if ENR_RE.search(body) else 'not in it'})")
         if not self.enr_found.is_set():
             info = device_info(body)
             if info:
