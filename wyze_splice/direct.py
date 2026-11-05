@@ -5,9 +5,11 @@ This needs three per-camera values: its MAC, its ENR (read off the
 camera's own HTTPS, see cloud.py) and its TUTK UID (which the Wyze cloud
 returns for MAC + ENR, see cloud.fetch_uid).
 
-The protocol is ThroughTek's SDK 4.3 framing as these cameras speak it
-(go2rtc's pkg/tutk/dtls and pkg/wyze interoperate with it too):
+The packets come in one of two framings, after go2rtc's pkg/tutk/dtls
+and pkg/wyze, which interoperate with both. Discovery tries both, and the
+camera's answer picks one.
 
+SDK 4.3 (0xCC51; Wyze Cam v3 on 4.36.16 and 4.36.17):
   discovery  cmd 0x1002 to udp/32761. The camera answers from its P2P
              port with a ticket; four packets, seq 0..3.
   data       cmd 0x1502: a 28-byte header, DTLS records, a 20-byte trailer.
@@ -15,6 +17,13 @@ The protocol is ThroughTek's SDK 4.3 framing as these cameras speak it
   trailer    HMAC-SHA1 keyed by UID + AuthKey over the first 28 bytes
              (32 for discovery). AuthKey comes from ENR + MAC. The camera
              ignores packets whose trailer is wrong.
+
+The older IOTC framing (SDK 3.x/4.2; the Wyze Cam v2), obfuscated with
+TransCode (tutk.py):
+  discovery  cmd 0x0601 (UID and AuthKey in the body) to udp/32761, the
+             camera answers 0x0602; then a session request 0x0402 -> 0x0404.
+  data       cmd 0x0407 out, 0x0408 in: a 28-byte header, DTLS records.
+  keepalive  the camera's 0x0428 is answered with a 0x0427 echo.
 
 Inside the DTLS session (PSK from the ENR, see dtls.py): an AV login
 whose password is the ENR, the K10000/K10002 challenge (XXTEA with the
@@ -35,9 +44,16 @@ import time
 from .dtls import (HS_SH, HS_SHD, HS_SKE, RT_ALERT, RT_APPDATA, RT_CCS,
                    RT_HANDSHAKE, BadRecord, DTLSLeg, ReplayWindow, Templates,
                    derive_psk, parse_hs, parse_records)
+from .tutk import trans_code_blob, untrans_code_blob
 
 DISCO_PORT = 32761
 CMD_DISCO, CMD_KEEPALIVE, CMD_DTLS = 0x1002, 0x1202, 0x1502
+# the older IOTC framing
+IOTC_DISCO_REQ, IOTC_DISCO_RES = 0x0601, 0x0602
+IOTC_SESSION_REQ, IOTC_SESSION_RES = 0x0402, 0x0404
+IOTC_DATA_TX, IOTC_DATA_RX = 0x0407, 0x0408
+IOTC_KEEPALIVE_REQ, IOTC_KEEPALIVE_RES = 0x0427, 0x0428
+IOTC_SDK_VERSION = b"\x01\x01\x02\x04"     # 4.2.1.1, as go2rtc sends
 SDK_VERSION = b"\x00\x08\x03\x04"           # 4.3.8.0, as the app sends
 PROTO = 0x000C
 MAGIC_LOGIN_RESP, MAGIC_IOCTRL, MAGIC_ACK = 0x2100, 0x7000, 0x0009
@@ -66,18 +82,25 @@ def disco_packet(key, sid, seq=0, ticket=0):
 
 
 def answers(ip, uid, enr, mac, iface, timeout=1.5):
-    """True if the camera answers LAN discovery, i.e. it is switched on and
-    its P2P stack runs. The answer is read off an AF_PACKET socket, so no
-    firewall rule is needed (the host firewall may then drop it)."""
+    """True if the camera answers LAN discovery (in either framing), i.e.
+    it is switched on and its P2P stack runs. The answer is read off an
+    AF_PACKET socket, so no firewall rule is needed (the host firewall may
+    then drop it)."""
     from .rawnet import parse_udp, sniff, udp_filter
-    key = uid.encode() + auth_key(enr, mac)
+    probe = Direct.__new__(Direct)        # just for the discovery packets
+    probe.uid, probe.authkey = uid.encode(), auth_key(enr, mac)
+    probe.sid = os.urandom(8)
     got = threading.Event()
 
     def on(p):
         d = p.payload
-        if (p.src == ip and len(d) >= 52 and d[:2] == b"\x51\xcc"
-                and struct.unpack_from("<HH", d, 4)[0] == CMD_DISCO
-                and struct.unpack_from("<H", d, 12)[0] == 1):
+        if p.src != ip or len(d) < 16:
+            return
+        if d[:2] == b"\x51\xcc":
+            if (len(d) >= 52 and struct.unpack_from("<H", d, 4)[0] == CMD_DISCO
+                    and struct.unpack_from("<H", d, 12)[0] == 1):
+                got.set()
+        elif struct.unpack_from("<H", untrans_code_blob(d), 8)[0] == IOTC_DISCO_RES:
             got.set()
 
     t = threading.Thread(target=sniff, daemon=True,
@@ -86,9 +109,11 @@ def answers(ip, uid, enr, mac, iface, timeout=1.5):
     t.start()
     time.sleep(0.1)                       # the sniffer is listening
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        pkt = disco_packet(key, os.urandom(8))
+        pkts = (disco_packet(probe.uid + probe.authkey, probe.sid),
+                trans_code_blob(probe._iotc_disco(1)))
         for _ in range(3):
-            s.sendto(pkt, (ip, DISCO_PORT))
+            for pkt in pkts:
+                s.sendto(pkt, (ip, DISCO_PORT))
             if got.wait(timeout / 3):
                 break
     return got.is_set()
@@ -176,8 +201,14 @@ class Direct:
                  av_log=None, log=print, stop=None):
         self.ip, self.enr, self.mac, self.log = ip, enr, mac, log
         self.stop = stop                      # threading.Event: give up
-        self.key = uid.encode() + auth_key(enr, mac)
+        self.uid, self.authkey = uid.encode(), auth_key(enr, mac)
+        self.key = self.uid + self.authkey
+        self.framing = None                   # "cc51" or "iotc", from discovery
+        self.tx_seq = 0                       # iotc data packets
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # a 1080p stream is ~200 datagrams/s; the default buffer holds
+        # under half a second of it
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         self.sock.bind((local_ip or "0.0.0.0", 0))
         self.peer = (ip, DISCO_PORT)          # becomes the camera's P2P port
         self.sid, self.ticket = os.urandom(8), 0
@@ -226,35 +257,91 @@ class Direct:
         b[20:28] = self.sid
         return bytes(b) + self._trailer(bytes(b))
 
+    def _iotc(self, cmd, flags, body, mode=0x02):
+        """An older-framing packet before TransCode: header, then body."""
+        h = bytearray(16)
+        h[0:4] = bytes((0x04, 0x02, 0x1A, mode))
+        struct.pack_into("<HHHH", h, 4, len(body), 0, cmd, flags)
+        return bytes(h) + bytes(body)
+
+    def _iotc_disco(self, stage):
+        b = bytearray(72)
+        b[0:20] = self.uid
+        b[36:40] = IOTC_SDK_VERSION
+        b[40:48] = self.sid
+        b[48] = stage
+        if stage == 1:
+            b[58:66] = self.authkey
+        return self._iotc(IOTC_DISCO_REQ, 0x0021, b)
+
+    def _iotc_session(self):
+        b = bytearray(36)
+        b[0:20] = self.uid
+        b[20:28] = self.sid
+        struct.pack_into("<I", b, 32, int(time.time()) & 0xFFFFFFFF)
+        return self._iotc(IOTC_SESSION_REQ, 0x0033, b)
+
+    def _iotc_data(self, payload, channel=0):
+        b = bytearray(28)
+        b[0:4] = b"\x04\x02\x1a\x0b"
+        struct.pack_into("<HHHH", b, 4, 12 + len(payload), self.tx_seq,
+                         IOTC_DATA_TX, 0x0021)
+        self.tx_seq = (self.tx_seq + 1) & 0xFFFF
+        b[12:14] = self.sid[:2]
+        b[14], b[15] = channel, 0x01
+        struct.pack_into("<I", b, 16, 0x0C)
+        b[20:28] = self.sid
+        return bytes(b) + payload
+
     def _send(self, pkt, to=None):
         self.sock.sendto(pkt, to or self.peer)
         self.stats["tx"] += 1
 
+    def _send_iotc(self, pkt, to=None):
+        self._send(trans_code_blob(pkt), to)
+
     def _send_dtls(self, records):
-        self._send(self._wrap(records))
+        if self.framing == "iotc":
+            self._send_iotc(self._iotc_data(records))
+        else:
+            self._send(self._wrap(records))
 
     def _send_app(self, plaintext):
         self._log_av(0, plaintext)
         self._send_dtls(self.leg.encrypt_record(RT_APPDATA, plaintext))
 
     def _recv(self, timeout):
-        """One authenticated CC51 packet from the camera, or None."""
+        """(framing, packet) from the camera, or None: a CC51 packet with a
+        valid trailer, or an older-framing one with TransCode undone."""
         self.sock.settimeout(max(timeout, 0.001))
         try:
             data, addr = self.sock.recvfrom(4096)
         except (socket.timeout, BlockingIOError):
             return None
-        if addr[0] != self.ip or len(data) < 48 or data[:2] != b"\x51\xcc":
+        if addr[0] != self.ip or len(data) < 16:
+            self.stats["ignored"] = self.stats.get("ignored", 0) + 1
             return None
-        cmd = struct.unpack_from("<H", data, 4)[0]
-        span = 32 if cmd == CMD_DISCO else 28
-        if not hmac.compare_digest(self._trailer(data[:span]), data[-20:]):
-            self.stats["bad_trailer"] += 1
+        if data[:2] == b"\x51\xcc" and self.framing != "iotc":
+            if len(data) < 48:
+                return None
+            cmd = struct.unpack_from("<H", data, 4)[0]
+            span = 32 if cmd == CMD_DISCO else 28
+            if not hmac.compare_digest(self._trailer(data[:span]), data[-20:]):
+                self.stats["bad_trailer"] += 1
+                return None
+            kind = "cc51"
+        elif self.framing != "cc51":
+            data = untrans_code_blob(data)
+            if data[:2] != b"\x04\x02":    # [2] is a version that varies
+                self.stats["ignored"] = self.stats.get("ignored", 0) + 1
+                return None
+            kind = "iotc"
+        else:
             return None
         self.peer = addr
         self.last_rx = time.monotonic()
         self.stats["rx"] += 1
-        return data
+        return kind, data
 
     # ------------------------------------------------------------- session
     def open(self, timeout=12, resolution=HD_1080P):
@@ -284,24 +371,43 @@ class Direct:
     def _discover(self, deadline):
         got = {}
 
-        def on(d):
-            cmd = struct.unpack_from("<H", d, 4)[0]
-            if cmd != CMD_DISCO:
+        def on(kind, d):
+            if kind == "iotc":
+                cmd = struct.unpack_from("<H", d, 8)[0]
+                if cmd == IOTC_DISCO_RES:
+                    got.setdefault("framing", "iotc")
+                elif cmd == IOTC_SESSION_RES:
+                    got["done"] = True
+                return
+            if struct.unpack_from("<H", d, 4)[0] != CMD_DISCO:
                 return
             seq = struct.unpack_from("<H", d, 12)[0]
-            if seq == 1 and "ticket" not in got:
-                got["ticket"] = struct.unpack_from("<H", d, 14)[0]
-                got["sid"] = d[16:24]
+            if seq == 1 and "framing" not in got:
+                got.update(framing="cc51",
+                           ticket=struct.unpack_from("<H", d, 14)[0],
+                           sid=d[16:24])
             elif seq == 3:
                 got["done"] = True
 
+        def hello():
+            # both framings: whichever the camera speaks, it answers
+            self._send(self._disco(0), (self.ip, DISCO_PORT))
+            self._send_iotc(self._iotc_disco(1), (self.ip, DISCO_PORT))
+
         self._on_disco = on
-        self._until(deadline, "discovery",
-                    lambda: self._send(self._disco(0), (self.ip, DISCO_PORT)),
-                    lambda: "ticket" in got)
-        self.ticket, self.sid = got["ticket"], got["sid"]
-        self._until(deadline, "discovery",
-                    lambda: self._send(self._disco(2)), lambda: "done" in got)
+        self._until(deadline, "discovery", hello, lambda: "framing" in got)
+        self.framing = got["framing"]
+        if self.framing == "cc51":
+            self.ticket, self.sid = got["ticket"], got["sid"]
+            self._until(deadline, "discovery",
+                        lambda: self._send(self._disco(2)),
+                        lambda: "done" in got)
+        else:
+            self._send_iotc(self._iotc_disco(2))
+            time.sleep(0.1)
+            self._until(deadline, "session",
+                        lambda: self._send_iotc(self._iotc_session()),
+                        lambda: "done" in got)
         self._on_disco = None
 
     def _handshake(self, deadline):
@@ -412,20 +518,36 @@ class Direct:
             if self.next_ack is not None and now >= self.next_ack:
                 self._ack()
                 self.next_ack = now + ACK_EVERY
-            d = self._recv(min(end - now, ACK_EVERY))
-            if d is not None:
-                self._dispatch(d)
+            got = self._recv(min(end - now, ACK_EVERY))
+            if got is not None:
+                self._dispatch(*got)
             if time.monotonic() >= end:
                 break
         if (self.leg.handshake_done
                 and time.monotonic() - self.last_rx > SILENT_AFTER):
+            if os.environ.get("WYZE_SPLICE_DEBUG"):
+                print(f"[d] quiet: last packet {time.monotonic() - self.last_rx:.1f} s "
+                      f"ago, socket {self.sock.getsockname()}, peer {self.peer}")
             raise CameraGone("the camera went quiet")
 
-    def _dispatch(self, d):
+    def _dispatch(self, kind, d):
+        if kind == "iotc":
+            cmd = struct.unpack_from("<H", d, 8)[0]
+            seen = self.stats.setdefault("iotc_cmds", {})
+            seen[hex(cmd)] = seen.get(hex(cmd), 0) + 1
+            if cmd in (IOTC_DISCO_RES, IOTC_SESSION_RES):
+                if getattr(self, "_on_disco", None):
+                    self._on_disco(kind, d)
+            elif cmd == IOTC_KEEPALIVE_RES and len(d) >= 24:
+                self._send_iotc(self._iotc(IOTC_KEEPALIVE_REQ, 0x0021,
+                                           d[16:24], mode=0x0A))
+            elif cmd == IOTC_DATA_RX and len(d) > 28 and d[14] == 0:
+                self._records(d[28:])
+            return
         cmd = struct.unpack_from("<H", d, 4)[0]
         if cmd == CMD_DISCO:
             if getattr(self, "_on_disco", None):
-                self._on_disco(d)
+                self._on_disco(kind, d)
         elif cmd == CMD_KEEPALIVE:
             self._send(self._keepalive())
         elif cmd == CMD_DTLS:

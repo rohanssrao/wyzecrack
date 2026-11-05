@@ -109,3 +109,54 @@ def test_parse_media_takes_the_plain_format():
     wrapped = b"\x0c" + mid[1:8] + bytes(8) + mid[8:]
     assert parse_media(wrapped) == parse_media(mid)
     assert parse_media(b"\x09\x00\x0c\x00" + bytes(40)) is None   # an ACK
+
+
+def test_transcode_matches_go2rtc():
+    """Vectors from go2rtc's pkg/tutk/crypto.go (TransCodeBlob,
+    ReverseTransCodeBlob, TransCodePartial), run with Go."""
+    from wyze_splice.tutk import (trans_code, trans_code_blob, untrans_code,
+                                  untrans_code_blob)
+    vectors = [
+        ("0402",
+         "6a47",
+         "6a47"),
+        ("0402190a0800000028041200",
+         "476a78786469652041773274",
+         "476a78786469652041773274"),
+        ("0402190a080000002804120000000000",
+         "4c6f8d0c40d040ca3d2da82dc0eecad8",
+         "4c6f8d0c40d040ca3d2da82dc0eecad8"),
+        ("04021a0248000000010621000000000041424344454647484a4b4c4d4e505152313131410000000000000000000000000000000001010204112233445566778801000000000000000000006f454a4e3954587000000000000000000000",
+         "6e4c9d8c40d140ca2d2d882dc0e6cadcba9ac93c0dc4a5ee796a0c2814a04fbc6e2e8d8c40d040ca3e6d3b1f40a4cbd84f0ddf8a04a7194d2d6f280c50e48ac86e3ecd862f34125e2d6d280c40e4cbd8173011726c6965206973207468",
+         "6e4c9d8c40d140ca2d2d882dc0e6cadcba9ac93c0dc4a5ee796a0c2814a04fbc6e2e8d8c40d040ca3e6d3b1f40a4cbd84f0ddf8a04a7194d2d6f280c50e48ac86e3ecd862f34125e2d6d280c40e4cbd8173011726c6965206973207468"),
+        ("04021a0b2c00000307042100aabb00010c000000aabbccddeeff001116fefd000000000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+         "6e6c3df740dbe0da2d2d883d80eefada70de8272500e21c58da1280cede416635e3e8d8942b000ba2d6d280c40e4cad85f3f8c9953b001bb2de3989c80ee3a0818191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+         "6e6c3df740dbe0da2d2d883d80eefada70de8272500e21c58da1280cede416635e3e8d8942b000ba2d6d280c40e4cad85f3f8c9953b001bb2de3989c80ee3a085c3caf8962b202b82cf3999d81ff3a090f40594b414b446b"),
+    ]
+    for src, blob, partial in vectors:
+        src, blob, partial = (bytes.fromhex(x) for x in (src, blob, partial))
+        assert trans_code_blob(src) == blob
+        assert untrans_code_blob(blob) == src
+        assert trans_code(src) == partial
+        assert untrans_code(partial) == src
+
+
+def test_older_framing_packets_match_go2rtc_layout():
+    d = _client()
+    try:
+        disco = d._iotc_disco(1)
+        assert disco[:4] == b"\x04\x02\x1a\x02" and len(disco) == 16 + 72
+        assert struct.unpack_from("<HHH", disco, 4) == (72, 0, 0x0601)
+        assert disco[16:36] == UID.encode() and disco[16 + 48] == 1
+        assert disco[16 + 58:16 + 66] == direct.auth_key(ENR, MAC)
+        assert d._iotc_disco(2)[16 + 58:16 + 66] == bytes(8)
+        sess = d._iotc_session()
+        assert len(sess) == 52 and struct.unpack_from("<H", sess, 8)[0] == 0x0402
+        assert sess[16 + 20:16 + 28] == d.sid
+        data = d._iotc_data(b"x" * 100, 0)
+        assert data[:4] == b"\x04\x02\x1a\x0b" and data[28:] == b"x" * 100
+        assert struct.unpack_from("<HHH", data, 4) == (112, 0, 0x0407)
+        assert data[14] == 0 and data[20:28] == d.sid
+        assert d._iotc_data(b"", 0)[6] == 1          # sequence advances
+    finally:
+        d.close()

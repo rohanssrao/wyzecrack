@@ -118,3 +118,28 @@ def test_segments_split_where_the_sps_changes():
               (4, 5, 5, hd, True), (5, 7, 6, p, True)]
     segs = av_extract.segments(frames)
     assert [[f[2] for f in s] for s in segs] == [[1, 2, 3, 4], [5, 6]]
+
+
+def test_g711_decodes_to_pcm():
+    import struct
+    from wyze_splice.media import CODEC_PCMA, CODEC_PCMU, g711_to_pcm
+    mu = struct.unpack("<4h", g711_to_pcm(bytes((0xFF, 0x7F, 0x00, 0x80)), CODEC_PCMU))
+    assert mu == (0, 0, -32124, 32124)
+    al = struct.unpack("<4h", g711_to_pcm(bytes((0xD5, 0x55, 0xAA, 0x2A)), CODEC_PCMA))
+    assert al == (8, -8, 32256, -32256)
+
+
+def test_parse_media_decodes_v2_audio():
+    """A v2 audio packet: plain format (version 0x0B), G.711 mu-law, with
+    the 40-byte FrameInfo (codec 0x89) after the samples."""
+    import struct
+    from wyze_splice.media import parse_media
+    samples = bytes((0xFF, 0x00)) * 4
+    info = bytes((0x89, 0x00, 0x02)) + bytes(37)
+    payload = samples + info
+    rec = (bytes((3, 0x01)) + struct.pack("<HHH", 0x000B, 7, 0x65)
+           + bytes((3, 1)) + struct.pack("<HHHHH", 9, 1, 0x28, len(payload), 0)
+           + struct.pack("<II", 4, 5) + payload)
+    ch, frame_no, cidx, pcm, end, count = parse_media(rec)
+    assert (ch, frame_no, end) == (3, 5, True)
+    assert struct.unpack("<8h", pcm) == (0, -32124) * 4

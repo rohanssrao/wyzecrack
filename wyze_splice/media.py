@@ -46,6 +46,32 @@ import struct
 
 VIDEO_CHANNELS = (5, 6, 7)
 MEDIA_CHANNELS = (3, 5, 6, 7)
+# audio codecs in the FrameInfo: the v3 sends 16-bit PCM (0x8C), the v2
+# G.711 mu-law (0x89); both 8 kHz mono. G.711 is decoded to 16-bit PCM
+# here, so everything downstream sees one format.
+CODEC_PCMU, CODEC_PCMA = 0x89, 0x8A
+
+
+def _g711_tables():
+    """256-entry little-endian s16 lookup tables (the classic g711.c)."""
+    mu, al = [], []
+    for b in range(256):
+        u = ~b & 0xFF
+        t = (((u & 0x0F) << 3) + 0x84) << ((u & 0x70) >> 4)
+        mu.append(0x84 - t if u & 0x80 else t - 0x84)
+        a = b ^ 0x55
+        t, seg = (a & 0x0F) << 4, (a & 0x70) >> 4
+        t = t + 8 if seg == 0 else (t + 0x108) << max(seg - 1, 0)
+        al.append(t if a & 0x80 else -t)
+    return ([struct.pack("<h", v) for v in mu], [struct.pack("<h", v) for v in al])
+
+
+_ULAW, _ALAW = _g711_tables()
+
+
+def g711_to_pcm(data, codec):
+    table = _ULAW if codec == CODEC_PCMU else _ALAW
+    return b"".join(table[x] for x in data)
 
 
 def parse_media(p):
@@ -76,7 +102,10 @@ def parse_media(p):
     end = bool(ft & 0x01)
     if end:
         if cidx == 0x0028 and len(payload) >= 40:
+            codec = payload[-40]
             payload = payload[:-40]
+            if ch == 3 and codec in (CODEC_PCMU, CODEC_PCMA):
+                payload = g711_to_pcm(payload, codec)
         cidx = 0xFFFF
     return ch, frame_no, cidx, payload, end, count
 

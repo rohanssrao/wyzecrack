@@ -125,7 +125,7 @@ MODELS = {
     "WYZEDB3": "Wyze Video Doorbell",
 }
 # models wyze-splice has been tested against
-TESTED = {"WYZE_CAKP2JFUS"}
+TESTED = {"WYZE_CAKP2JFUS", "WYZEC1-JZ"}
 
 
 def reverse_name(ip, server, timeout=1.5):

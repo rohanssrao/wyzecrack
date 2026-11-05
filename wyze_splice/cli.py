@@ -688,7 +688,7 @@ def cmd_watch(a):
         print(f"[!] {e}")
     finally:
         if os.environ.get("WYZE_SPLICE_DEBUG"):
-            print(f"[d] session: {d.stats}")
+            print(f"[d] session ({d.framing} framing): {d.stats}")
         d.close()
         with signals_held():
             changes.undo_all()
