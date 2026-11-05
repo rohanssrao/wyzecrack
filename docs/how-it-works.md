@@ -84,8 +84,13 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
 
    The camera answers from a different port than the one it was sent to,
    which a stateful host firewall drops, so the tool opens udp from the
-   camera to its socket for the session (journaled). On a v3 the live view
-   starts within a second.
+   camera to its socket for the session (journaled). The live view usually
+   starts within a second or two; a camera that is serving other viewers
+   can take 10 s or more to answer the AV login, so the tool keeps asking
+   for up to 30 s. When the tool hangs up, it first switches the camera's
+   video and audio off (K10010). Otherwise the camera keeps streaming to
+   the dead session for about 30 s, using Wi-Fi bandwidth and overlapping
+   the next session.
 
 5. **Catch the session** (`splice.py`, the fallback). Nothing is
    diverted while the tool waits. When the app opens a live view, the

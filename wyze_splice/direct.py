@@ -60,6 +60,11 @@ MAGIC_LOGIN_RESP, MAGIC_IOCTRL, MAGIC_ACK = 0x2100, 0x7000, 0x0009
 CAPS = 0x001F07FB
 K_AUTH, K_CHALLENGE, K_CHALLENGE_RESP, K_AUTH_RESULT = 10000, 10001, 10002, 10003
 K_RESOLUTION, K_RESOLUTION_RESP = 10056, 10057
+K_CHANNEL, K_CHANNEL_RESP = 10010, 10011    # [media, 1 on / 2 off]
+MEDIA_VIDEO, MEDIA_AUDIO, CHANNEL_OFF = 1, 2, 2
+# a camera that is serving other viewers can take 10 s or more to answer
+# the AV login (seen on two v3s: answers after 8 to 12 s, resent every s)
+OPEN_TIMEOUT = 30
 HD_1080P, BITRATE_MAX = 1, 0xF0             # K10056 frame size 0 (+1), kbps
 ACK_EVERY = 0.1
 SILENT_AFTER = 6.0                          # camera quiet this long: gone
@@ -219,6 +224,7 @@ class Direct:
         self.rx_init = False
         self.ctrl = []                        # control replies not yet read
         self.login_resp = None
+        self.streaming = False                # set once open() is done
         self.next_ack = None                  # acking starts after login
         self.last_rx = time.monotonic()
         self.on_av = on_av
@@ -344,7 +350,7 @@ class Direct:
         return kind, data
 
     # ------------------------------------------------------------- session
-    def open(self, timeout=12, resolution=HD_1080P):
+    def open(self, timeout=OPEN_TIMEOUT, resolution=HD_1080P):
         deadline = time.monotonic() + timeout
         self._discover(deadline)
         self._handshake(deadline)
@@ -352,6 +358,7 @@ class Direct:
         self._authenticate(deadline)
         self.command(K_RESOLUTION, bytes([resolution])
                      + struct.pack("<HH", BITRATE_MAX, 0), K_RESOLUTION_RESP)
+        self.streaming = True
         return self
 
     def _until(self, deadline, what, send, done, every=0.5):
@@ -626,7 +633,30 @@ class Direct:
             except Exception as e:  # noqa: BLE001
                 self.log(f"[!] live view callback failed: {e!r}")
 
+    def _stop_media(self, wait=1.0):
+        """Ask the camera to stop video and audio (K10010 off). Without it
+        the camera keeps streaming to this session for about 30 s after we
+        hang up (both models), which costs its Wi-Fi bandwidth and overlaps a
+        reconnect; with it the stream stops at once. Waits up to `wait` s
+        for both answers."""
+        for media in (MEDIA_VIDEO, MEDIA_AUDIO):
+            self._send_app(self._ioctrl(hl(K_CHANNEL, bytes((media, CHANNEL_OFF)))))
+        answered = set()
+        end = time.monotonic() + wait
+        while len(answered) < 2 and time.monotonic() < end:
+            self.pump(0.05)
+            while self.ctrl:
+                r = find_hl(self.ctrl.pop(0))
+                if r and r[0] == K_CHANNEL_RESP and r[1]:
+                    answered.add(r[1][0])
+
     def close(self):
+        try:
+            if self.streaming:
+                self.streaming = False
+                self._stop_media()
+        except (OSError, CameraGone, ValueError):
+            pass
         try:
             if self.leg.handshake_done:
                 # a DTLS close_notify; the camera also times out on its own

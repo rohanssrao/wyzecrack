@@ -69,6 +69,10 @@ video goes to `session-N/`.
 
 ## Troubleshooting
 
+- **"Connecting to the camera" takes a while, or "the camera did not
+  answer (AV login)":** the camera is slow to take a new viewer, for
+  example while others are watching it. The tool keeps asking for 30 s,
+  and the page then tries again.
 - **"the camera did not answer (discovery)":** the camera is off (switched
   off in the Wyze app, or on a schedule) or unplugged. A camera that is
   turned off stops all its P2P traffic, so it can't be watched.

@@ -160,3 +160,16 @@ def test_older_framing_packets_match_go2rtc_layout():
         assert d._iotc_data(b"", 0)[6] == 1          # sequence advances
     finally:
         d.close()
+
+
+def test_close_stops_the_media_first():
+    d = _client()
+    sent = []
+    d._send_app = lambda pt: sent.append(pt)
+    d.pump = lambda timeout=0.1: None          # no camera here
+    d.streaming = True
+    d.close()
+    cmds = [direct.find_hl(p) for p in sent]
+    assert (direct.K_CHANNEL, bytes((1, 2))) in cmds          # video off
+    assert (direct.K_CHANNEL, bytes((2, 2))) in cmds          # audio off
+    assert not d.streaming
