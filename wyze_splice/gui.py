@@ -175,6 +175,7 @@ class Controller:
                 prev = (self.state.get("steps") or {}).get("enr") or {}
                 detail = {"seen": st.get("intercepted", 0) if st else
                           (prev.get("detail") or {}).get("seen", 0),
+                          "resets": st.get("resets", 0),
                           "nudging": ev["state"] == "nudging"}
                 self._step("enr", "active", detail)
             elif ev["state"] == "refused":

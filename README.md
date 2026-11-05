@@ -39,10 +39,9 @@ browser:
    model.
 2. **The first time with a camera** takes about two minutes. The tool
    reroutes the camera's traffic through this computer and reads the
-   camera's key (its ENR) off the camera's own HTTPS. If the camera doesn't
-   send it within 30 seconds, the tool cuts the camera's internet until the
-   camera notices, about a minute; the camera reports in with its key when
-   it's back online. The tool then asks Wyze for the camera's ID, presenting that key
+   camera's key (its ENR) off the camera's own HTTPS. To make the camera
+   send it now, it resets the camera's connection to Wyze a few times; the
+   camera reconnects within seconds each time. The tool then asks Wyze for the camera's ID, presenting that key
    as the camera does. Both are saved, and the camera's network goes back
    to normal.
 3. **Watch.** The live view plays in the page in 1080p, with sound if you

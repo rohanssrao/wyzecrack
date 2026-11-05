@@ -84,8 +84,8 @@ function showPicker() {
 
 const STATUS = {
   starting: ["⌁", "spin", "Starting", "Checking the network and the camera."],
-  key: ["🔑", "pulse", "Getting the camera's key", "It's read from the camera's own connection to Wyze. This happens once per camera."],
-  key_nudge: ["🔑", "pulse", "Getting the camera's key", "The camera is offline for about a minute. When it reconnects, it reports in to Wyze with its key. This happens once per camera."],
+  key: ["🔑", "pulse", "Waiting for the camera's key", "It's read from the camera's own reports to Wyze, which it sends every 20 minutes or so, and right away when it sees motion. This happens once per camera."],
+  key_nudge: ["🔑", "pulse", "Getting the camera's key", "Its connection to Wyze is reset a few times, which makes it report in with its key. About a minute, once per camera."],
   uid: ["🪪", "spin", "Asking Wyze for the camera's ID", "With the camera's own key, the way the camera itself asks."],
   direct: ["⚡", "spin", "Connecting to the camera", "Straight over your network; nothing is rerouted."],
   onpath: ["⇄", "spin", "Getting on the camera's path", "Only this camera is rerouted through this computer; everything else on the network is untouched."],
@@ -156,6 +156,7 @@ function applyState(s) {
   if (s.phase === "connecting" && s.session?.state === "joined") key = "joined";
   let extra = "";
   if (key === "enr" || key === "key") { const n = steps.enr.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
+  if (key === "key_nudge") { const r = steps.enr.detail?.resets || 0; extra = r ? `Reset ${r} of up to 8` : ""; }
   if (s.phase === "connecting" && s.session?.state === "failed") extra = "This attempt could not be joined; waiting for the app's retry.";
   if (s.hint === "unplug" && (key === "waiting" || key === "learning")) extra = "One of the camera's connections goes around this computer, so some live views would be missed. Unplug the camera for 5 seconds now (and plug it back in); this page will tell you when it's fixed.";
   else if (key === "waiting" && s.hint === "bypass") extra = "The last live view went around this computer, probably over a connection the camera opened before you started. Unplug the camera for 5 seconds; its new connections will come through here.";

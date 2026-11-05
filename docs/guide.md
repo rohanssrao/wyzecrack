@@ -11,8 +11,8 @@
 - `--no-video` skips the MP4 export.
 - `--enr <ENR>` supplies the camera's ENR instead of harvesting it.
 - `--reharvest` ignores the saved ENR and ID and gets them again.
-- `--no-nudge` never cuts the camera's internet to make it send its ENR;
-  it waits for a motion alarm instead.
+- `--no-nudge` doesn't reset the camera's connection to Wyze to make it
+  send its ENR; it waits for the camera to report in on its own.
 - `--harvest-timeout <seconds>` stops waiting for the ENR after that many
   seconds.
 
@@ -30,7 +30,8 @@ and `--no-video`. The ENR and ID are saved in
 - `--reharvest` ignores the cached ENR.
 - `--harvest-timeout <seconds>` stops waiting for the ENR after that many
   seconds.
-- `--no-nudge` never cuts the camera's internet to make it send its ENR.
+- `--no-nudge` doesn't reset the camera's connection to Wyze to make it
+  send its ENR.
 - `--no-events` leaves motion-event uploads alone.
 - `--no-video` skips the MP4 export.
 - `--on-path` skips the ARP step. Use it on a host that already carries the
@@ -75,9 +76,9 @@ video goes to `session-N/`.
   key, or changed this call. `wyze-splice run` still works: it catches a
   live view that the Wyze app opens.
 - **The first time takes long:** the camera only sends its ENR at certain
-  moments. The tool cuts its internet up to three times, 2.5 minutes
-  apart, to make it report in; a motion alarm also does it. Each cut takes
-  the camera offline for about a minute.
+  moments. On a v3 the tool resets its connection to Wyze until it does,
+  usually within two minutes. A v2 isn't nudged; it reports in on its own,
+  usually within 20 minutes, or right away when it sees motion.
 - **The live view plays in the app but nothing shows up here:** the phone
   is probably on the camera's Wi-Fi. There the app reaches the camera
   directly over the LAN, which doesn't pass through this computer; use a

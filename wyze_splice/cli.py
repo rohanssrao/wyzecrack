@@ -28,18 +28,11 @@ import time
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
-# Nudging the camera into sending its ENR (Armed.wait_enr): cutting its
-# internet. About a minute into a cut the camera notices and looks up its
-# MQTT broker to reconnect. The cut ends a couple of seconds after that
-# lookup, so the camera's next attempt gets through; it then usually posts
-# its metrics report, ENR included, within about 20 s (fw 4.36.16 and
-# 4.36.17), but not always. With cuts of fixed length, several were
-# followed by no report within 30 to 80 s.
-NUDGE_FIRST = 30          # s without the ENR before the first cut
-NUDGE_CUTS = 3
-NUDGE_MIN_CUT = 20        # s: lookups before this are not about the cut
-NUDGE_MAX_CUT = 150       # s: end the cut even if no lookup was seen
-NUDGE_SETTLE = 150        # s to wait for the report before the next cut
+# Models on which the ENR nudge (nudge.py: resetting the camera's MQTT
+# connection until it sends its metrics report) has been tried live. On
+# the Wyze Cam v2 an outage left the camera offline in the Wyze app for
+# over half an hour, so it gets no nudge.
+NUDGE_MODELS = {"WYZE_CAKP2JFUS"}
 # firmware to quote to Wyze when the camera's own report didn't say
 DEFAULT_FW = "4.36.17.21"
 
@@ -327,66 +320,50 @@ class Armed:
         return _cached_enr(self.cam_mac)
 
     def wait_enr(self, timeout, nudge=True):
-        """Wait for the camera to send its ENR. With nudge, cut its internet
-        if it hasn't (see NUDGE_*): when it comes back online it reports in
-        to Wyze, ENR included."""
-        cut = {"tokens": [], "lookups": None}
+        """Wait for the camera to send its ENR. With nudge, on models in
+        NUDGE_MODELS, make it send one now (nudge.py)."""
+        from .nudge import MqttNudge
+        n = None
+        if nudge and self.model() in NUDGE_MODELS:
+            n = MqttNudge(self.changes, self.a.target, self.iface)
+            n.start()
         try:
-            return self._wait_enr(timeout, nudge, cut)
+            return self._wait_enr(timeout, n)
         finally:
-            self._end_cut(cut)
+            if n:
+                n.stop.set()
+                n.thread.join(3)
 
-    def _end_cut(self, cut):
-        if cut["tokens"]:
-            self.changes.undo(cut["tokens"])
-            cut["tokens"] = []
-        if cut["lookups"]:
-            cut["lookups"][1].set()
-            cut["lookups"] = None
+    def model(self):
+        from .discover import describe
+        return (_cached(self.cam_mac).get("model")
+                or describe(self.a.target, self.cam_mac, self.gateway).get("model_id"))
 
-    def _wait_enr(self, timeout, nudge, cut):
+    def _wait_enr(self, timeout, n):
         from . import events
         tap = self.tap
-        print("[*] waiting for the camera's ENR. It sends it at boot, on "
-              "motion alarms, and every few hours"
-              + ("; if it doesn't soon, this cuts the camera's internet for "
-                 "about a minute to make it report in" if nudge else ""))
-        events.emit("enr", state="waiting", stats=dict(tap.stats))
+        if n:
+            print("[*] getting the camera's ENR: its connection to Wyze is reset "
+                  "a few times, which makes it report in (about a minute)")
+        else:
+            print("[*] waiting for the camera's ENR. It sends it at boot, on "
+                  "motion alarms, and in a report every 20 minutes or so")
+        events.emit("enr", state="nudging" if n else "waiting",
+                    stats=dict(tap.stats))
         start = time.monotonic()
-        last, printed, warned = None, None, False
-        cuts_left = NUDGE_CUTS if nudge else 0
-        next_cut, cut_at = start + NUDGE_FIRST, None
+        last, printed, warned, told = None, None, False, False
         while not tap.enr_found.wait(1):
             if self.stop and self.stop.is_set():
                 return None
-            now = time.monotonic()
-            if cut_at is None and cuts_left and now >= next_cut:
-                cuts_left -= 1
-                tok = self._cut_internet()
-                if tok is None:
-                    cuts_left = 0
-                else:
-                    cut["tokens"].append(tok)
-                    cut["lookups"] = self._watch_lookups()
-                    cut_at = now
-                    print("[*] no ENR yet: cutting the camera off the internet "
-                          "until it notices (about a minute); it reports in "
-                          "when it is back online")
-                    events.emit("enr", state="nudging")
-            if cut_at is not None:
-                seen = [t for t in cut["lookups"][0] if t - cut_at >= NUDGE_MIN_CUT]
-                if (seen and now - seen[0] >= 2) or now - cut_at >= NUDGE_MAX_CUT:
-                    self._end_cut(cut)
-                    print(f"[*] {'the camera noticed' if seen else 'no sign the camera noticed'} "
-                          f"after {(seen[0] if seen else now) - cut_at:.0f} s; "
-                          f"its internet is back, waiting for it to report in")
-                    events.emit("enr", state="waiting", stats=dict(tap.stats))
-                    cut_at, next_cut = None, now + NUDGE_SETTLE
-            st = dict(tap.stats)
+            st = dict(tap.stats, resets=n.resets if n else 0)
             if st != last:
-                events.emit("enr", state="nudging" if cut_at else "waiting",
-                            stats=st)
+                events.emit("enr", state="nudging" if n and not n.failed
+                            else "waiting", stats=st)
                 last = st
+            if n and n.failed and not told:
+                print(f"[!] {n.failed}; waiting for the camera to report in "
+                      f"on its own")
+                told = True
             if st != printed and time.monotonic() - start > 30:
                 print(f"    camera HTTPS so far: {st['intercepted']} read, "
                       f"{st['passed']} passed through, {st['tls_failed']} "
@@ -403,43 +380,12 @@ class Armed:
         if tap.mac and _mac_key(tap.mac) != _mac_key(self.cam_mac):
             print(f"[!] the ENR came from MAC {tap.mac}, but {self.a.target} "
                   f"is {self.cam_mac}")
-        print("[+] ENR harvested from the camera's own HTTPS")
+        print(f"[+] ENR harvested from the camera's own HTTPS after "
+              f"{time.monotonic() - start:.0f} s"
+              + (f" and {n.resets} connection reset(s)" if n else ""))
         _cache_enr(self.cam_mac, tap.enr, **tap.device)
         events.emit("enr", state="harvested")
         return tap.enr
-
-    def _watch_lookups(self):
-        """Note when the camera looks up a wyzecam.com name, which it does
-        when it reconnects. Returns ([monotonic times], stop Event)."""
-        from .rawnet import parse_udp, sniff, udp_filter
-        seen, stop = [], threading.Event()
-        cam = self.a.target
-
-        def on(p):
-            if reconnect_lookup(p, cam):
-                seen.append(time.monotonic())
-
-        def run():
-            try:
-                sniff(self.iface, udp_filter([cam]), parse_udp, on, stop.is_set)
-            except OSError:
-                pass                     # then the cut ends at NUDGE_MAX_CUT
-        threading.Thread(target=run, daemon=True).start()
-        return seen, stop
-
-    def _cut_internet(self):
-        """Drop everything the camera sends through us (journaled); returns
-        the token, or None if iptables refused."""
-        from .netutil import ipt
-        spec = ["-s", self.a.target, "-j", "DROP"]
-        tok = self.changes.add("ipt", args=["-t", "raw", "-D", "PREROUTING",
-                                            *spec])
-        if ipt("-t", "raw", "-I", "PREROUTING", "1", *spec).returncode:
-            self.changes.forget([tok])
-            print("[!] could not cut the camera's internet (iptables raw "
-                  "table); waiting for it to report in on its own")
-            return None
-        return tok
 
     def __exit__(self, *exc):
         self._teardown()
@@ -556,14 +502,6 @@ def cmd_events(a):
         _give_to_user(root, started)
         print(f"[+] {len(events)} event file(s) in {out}/")
     return 0
-
-
-def reconnect_lookup(p, cam):
-    """A DNS query from the camera (rawnet.UdpPacket) for its MQTT broker,
-    aws-iot.wyzecam.com, which it looks up to reconnect. (It looks up
-    api.wyzecam.com about once a minute anyway, for a reachability check.)"""
-    return (p.src == cam and p.dport == 53
-            and b"\x07aws-iot\x07wyzecam\x03com" in p.payload)
 
 
 def obtain_key(armed, a, nudge=True):
@@ -804,8 +742,8 @@ def _key_args(p):
     p.add_argument("--reharvest", action="store_true",
                    help="ignore the saved ENR and UID and get them again")
     p.add_argument("--no-nudge", action="store_true",
-                   help="never cut the camera's internet to make it report "
-                        "its ENR; wait for a motion alarm instead")
+                   help="don't reset the camera's cloud connection to make it "
+                        "report its ENR; wait for it to report on its own")
     p.add_argument("--harvest-timeout", type=int, default=0, metavar="SECONDS",
                    help="give up waiting for the ENR (default: wait)")
     p.add_argument("--on-path", action="store_true", help=argparse.SUPPRESS)
@@ -876,8 +814,8 @@ def main(argv=None):
     r.add_argument("--harvest-timeout", type=int, default=0, metavar="SECONDS",
                    help="give up waiting for the ENR (default: wait)")
     r.add_argument("--no-nudge", action="store_true",
-                   help="never cut the camera's internet to make it report "
-                        "its ENR; wait for a motion alarm instead")
+                   help="don't reset the camera's cloud connection to make it "
+                        "report its ENR; wait for it to report on its own")
     r.add_argument("--keep-going", action="store_true",
                    help="splice every live view until Ctrl-C, not just the first")
     r.add_argument("--no-events", action="store_true",

@@ -34,15 +34,29 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
      through pre-signed URLs. The only encryption on these uploads is the
      TLS the tool terminates.
 
-   The camera sends its ENR at boot, with every motion alarm, and in the
-   metrics report it posts when its internet connection comes back. So
-   when the ENR hasn't shown up 30 s in, the tool drops all of the
-   camera's traffic (an iptables raw-table rule, journaled like every
-   other change). About a minute later the camera notices and looks up
-   its MQTT broker (aws-iot.wyzecam.com) to reconnect; the tool sees the
-   DNS query and lifts the cut, the camera's next attempt gets through,
-   and the report usually follows within about 20 s. If none comes within
-   150 s, the cut repeats, up to three times. `--no-nudge` turns this off.
+   The camera sends its ENR in every device-API request, but it makes
+   few: at boot, on motion alarms, and in its metrics report. In firmware
+   4.36.17.21 (libwyzeUtils.so, `ms_upload_handler`) the report goes out
+   at a random time 0 to 20 minutes after the previous one, or as soon as
+   the 5120-byte metrics buffer is full. Each time the camera's MQTT
+   connection to aws-iot.wyzecam.com drops, it logs about 1 KB of
+   metrics while it reconnects. So `nudge.py` resets that connection, and
+   only that one: a TCP RST spoofed from the broker plus an iptables
+   REJECT for the connection, both journaled. It repeats the reset each
+   time the camera has reconnected, until the report arrives, at most 8
+   times. On v3 A that took 4 to 6 resets and 90 to 115 s. The
+   camera stays online apart from a few seconds per reconnect, and live
+   views are unaffected. The nudge only runs on the v3 (`NUDGE_MODELS`);
+   `--no-nudge` turns it off.
+
+   An earlier version cut all of the camera's traffic until it noticed.
+   That produced the report only when the burst of connection events
+   happened to overflow the buffer, and on v3 C (4.36.16) and the v2
+   it left the camera offline in the Wyze app for half an hour or more.
+   And when the network stays unavailable past the firmware's retry limit
+   (`exceed_network_connection_retry_limit` in `netChange_callback`), the
+   camera plays a voice prompt (`notify/CN/user_need_check.wav`) and
+   resets its network.
 
 3. **Ask Wyze for the UID** (`cloud.fetch_uid`). Wyze's device API
    authenticates a camera only by the `mac` and `enr` in the JSON body.
