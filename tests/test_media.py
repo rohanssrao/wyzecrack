@@ -206,3 +206,18 @@ def test_watch_keeps_only_the_video_and_its_still(tmp_path):
     _write_av_bin(av_bin, [(1000.0, _h264_frames(n=20))])
     assert cli._export(av_bin, tmp_path)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["frame.jpg", "video.mp4"]
+
+
+def test_a_session_that_starts_mid_gop_drops_its_lead_in(tmp_path):
+    """After a reconnect, P-frames before the new session's first IDR
+    reference pictures the recording doesn't have."""
+    import av
+    from wyzecrack.media import export
+    from test_jpegfeed import _h264_frames
+    units = _h264_frames(n=20)
+    av_bin = tmp_path / "av.bin"
+    # the second session's first five frames are the tail of a GOP
+    _write_av_bin(av_bin, [(1000.0, units), (1004.0, units[15:] + units)])
+    r = export(str(av_bin), str(tmp_path / "out"))
+    with av.open(r["mp4"]) as c:
+        assert c.streams.video[0].frames == 40

@@ -355,13 +355,13 @@ def export(av_bin, outdir):
     Returns {"mp4", "size", "seconds", "error"}; "mp4" is None when
     nothing decodable was found or the remux failed ("error")."""
     res = {"mp4": None, "size": None, "seconds": 0.0, "error": None}
-    every, audio = [], []
-    # frame numbers restart with each session: assemble and dedupe per
+    tagged, audio = [], []
+    # frame numbers restart with each session, and a session's pictures
+    # only reference each other: assemble, dedupe and check them per
     # session, then lay them end to end
     for recs in sessions(av_bin):
-        every += [t for t in assemble(recs) if t[1] in VIDEO_CHANNELS]
+        tagged += decodable([t for t in assemble(recs) if t[1] in VIDEO_CHANNELS])
         audio += audio_frames(recs)
-    tagged = decodable(every)
     if not tagged:
         return res
     segs = segments(tagged)
