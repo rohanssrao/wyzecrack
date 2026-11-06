@@ -1,105 +1,77 @@
-#!/usr/bin/env python3
-"""Offline tests for dtls.py: PSK derivation, template fidelity, and a
-client/server handshake loopback."""
+"""dtls.py: PSK derivation, the ClientHello template, and a whole handshake
+against the fake camera's server side."""
+import os
+import sys
+
 import pytest
 
-from wyzecrack.dtls import (  # noqa: E402
-    BadRecord, DTLSLeg, HS_CH, HS_CKE, RT_APPDATA, RT_CCS, RT_HANDSHAKE,
-    Templates, derive_psk, parse_hs, parse_records,
-)
+sys.path.insert(0, os.path.dirname(__file__))
+from fakecam import ENR, ServerLeg  # noqa: E402
 
-ENR = "gekMdn0XjZoWF/mD"
-PSK_HEX = ("cad9cb845808bd1baa377ceda71a843e30269d5b2aaacae6c975913266500000")
+from wyzecrack.dtls import (CLIENT_HELLO, HS_CH, HS_CKE, RT_APPDATA,  # noqa: E402
+                            RT_CCS, RT_HANDSHAKE, BadRecord, DTLSClient,
+                            derive_psk, parse_hs, parse_records)
 
-
-def drive_server(leg, payload):
-    """Feed a flight payload to a server-role leg; return its next flight."""
-    out = b""
-    for rtype, ver, epoch, seq, body in parse_records(payload):
-        if rtype == RT_HANDSHAKE and epoch == 0:
-            for msg in parse_hs(body):
-                if msg[0] == HS_CH:
-                    out = leg.server_on_ch(msg)
-                elif msg[0] == HS_CKE:
-                    leg.server_on_cke(msg)
-        elif rtype == RT_CCS:
-            leg.server_on_ccs()
-        elif epoch == 1:
-            pt = leg.decrypt_record(rtype, ver, epoch, seq, body)
-            if rtype == RT_HANDSHAKE:
-                f = leg.server_on_fin(pt)
-                if f:
-                    out = f
-    return out
-
-
-def drive_client(leg, payload, started):
-    """Feed a flight payload to a client-role leg; return its next flight."""
-    out = b""
-    for rtype, ver, epoch, seq, body in parse_records(payload):
-        if rtype == RT_HANDSHAKE and epoch == 0:
-            msgs = parse_hs(body)
-            if msgs and not started[0]:
-                out = leg.client_hello()
-                started[0] = True
-            elif msgs:
-                f = leg.client_on_server_flight(msgs)
-                if f:
-                    out = f
-        elif rtype == RT_CCS:
-            leg.client_on_ccs()
-        elif epoch == 1:
-            pt = leg.decrypt_record(rtype, ver, epoch, seq, body)
-            if rtype == RT_HANDSHAKE:
-                leg.client_on_fin(pt)
-    return out
+# SHA256 of ENR has its first NUL at byte 30: cut there, then zero-padded
+PSK_HEX = "cad9cb845808bd1baa377ceda71a843e30269d5b2aaacae6c975913266500000"
 
 
 def test_psk():
-    psk = derive_psk(ENR)
-    assert psk.hex() == PSK_HEX, psk.hex()
-    assert len(psk) == 32
-    assert psk.hex().endswith("0000"), "must be zero-padded to 32B"
+    assert derive_psk(ENR).hex() == PSK_HEX
 
 
-def test_ch_template_fidelity():
-    tpl = Templates.embedded()
-    psk = derive_psk(ENR)
-    c = DTLSLeg("client", psk, tpl)
-    ch_payload = c.client_hello()
-    my_ch = parse_hs(parse_records(ch_payload)[0][4])[0][2][12:]
-    assert my_ch[:2] == tpl.ch[:2]
-    assert my_ch[34:] == tpl.ch[34:], "CH tail (suites/ext) must be template"
-    assert my_ch[2:34] == c.random
+def test_client_hello_follows_the_template():
+    c = DTLSClient(derive_psk(ENR))
+    ch = parse_hs(parse_records(c.client_hello())[0][4])[0][2][12:]
+    assert ch[:2] == CLIENT_HELLO[:2] and ch[34:] == CLIENT_HELLO[34:]
+    assert ch[2:34] == c.random
 
 
-def test_leg_loopback():
-    """My client leg and server leg complete a handshake with each other."""
-    tpl = Templates.embedded()
-    psk = derive_psk(ENR)
-    c = DTLSLeg("client", psk, tpl)
-    s = DTLSLeg("server", psk, tpl)
+def _to_server(s, flight):
+    """Feed a client flight to the server leg; its answer."""
+    out = b""
+    for rtype, ver, epoch, seq, body in parse_records(flight):
+        if rtype == RT_HANDSHAKE and epoch == 0:
+            for msg in parse_hs(body):
+                if msg[0] == HS_CH:
+                    out = s.on_client_hello(msg)
+                elif msg[0] == HS_CKE:
+                    s.on_cke(msg)
+        elif epoch == 1:
+            out = s.on_fin(s.decrypt_record(rtype, ver, epoch, seq, body)) or out
+    return out
 
-    ch = c.client_hello()
-    sh = s.server_on_ch(parse_hs(parse_records(ch)[0][4])[0])
-    cke = c.client_on_server_flight(
-        [m for r in parse_records(sh) for m in parse_hs(r[4])])
-    nst = drive_server(s, cke)
-    assert s.handshake_done and nst
-    # client consumes NST flight
-    started = [True]
-    out = drive_client(c, nst, started)
-    assert out == b""
-    assert c.handshake_done
 
-    # appdata both directions
-    a = c.encrypt_record(RT_APPDATA, b"hello-from-client")
-    r = parse_records(a)[0]
-    assert s.decrypt_record(*r) == b"hello-from-client"
-    b_ = s.encrypt_record(RT_APPDATA, b"hi-from-server")
-    r = parse_records(b_)[0]
-    assert c.decrypt_record(*r) == b"hi-from-server"
-    # a tampered record doesn't authenticate
-    rt, ver, ep, sq, body = parse_records(b_)[0]
-    with pytest.raises(BadRecord):
+def _to_client(c, flight):
+    for rtype, ver, epoch, seq, body in parse_records(flight):
+        if rtype == RT_HANDSHAKE and epoch == 0:
+            c.on_server_flight(parse_hs(body))
+        elif rtype == RT_CCS:
+            c.on_ccs()
+        elif epoch == 1:
+            c.on_fin(c.decrypt_record(rtype, ver, epoch, seq, body))
+
+
+def test_handshake_with_the_fake_camera():
+    c, s = DTLSClient(derive_psk(ENR)), ServerLeg(derive_psk(ENR))
+    server_flight = _to_server(s, c.client_hello())
+    cke = c.on_server_flight([m for r in parse_records(server_flight)
+                              for m in parse_hs(r[4])])
+    _to_client(c, _to_server(s, cke))
+    assert s.handshake_done and c.handshake_done
+
+    r = parse_records(c.encrypt_record(RT_APPDATA, b"from the client"))[0]
+    assert s.decrypt_record(*r) == b"from the client"
+    rt, ver, ep, sq, body = parse_records(s.encrypt_record(RT_APPDATA, b"hi"))[0]
+    assert c.decrypt_record(rt, ver, ep, sq, body) == b"hi"
+    with pytest.raises(BadRecord):                 # tampered
         c.decrypt_record(rt, ver, ep, sq, bytes(len(body)))
+
+
+def test_a_wrong_psk_fails_the_handshake():
+    c, s = DTLSClient(derive_psk(ENR)), ServerLeg(derive_psk("another key"))
+    server_flight = _to_server(s, c.client_hello())
+    cke = c.on_server_flight([m for r in parse_records(server_flight)
+                              for m in parse_hs(r[4])])
+    with pytest.raises(BadRecord):
+        _to_server(s, cke)

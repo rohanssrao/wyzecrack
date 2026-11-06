@@ -3,10 +3,9 @@
 
 It answers a LAN session the way the real cameras do, in either framing
 (0xCC51 like the v3, TransCode IOTC like the v2): discovery, DTLS-PSK as
-the server (dtls.DTLSLeg's server role), the AV login, the K10000/K10002
-challenge, K10056 and K10010, and then it streams the H.264 access units
-it was given, one plain-format record per frame, plus a keepalive every
-second. Knobs for the failure cases: login_delay (a slow camera),
+the server (ServerLeg), the AV login, the K10000/K10002 challenge, K10056
+and K10010, and then it streams the H.264 access units it was given, one
+plain-format record per frame, plus a keepalive every second. Knobs for the failure cases: login_delay (a slow camera),
 ignore_logins (sessions whose AV login is never answered), and
 quiet (stop sending everything, as when a camera drops off its Wi-Fi;
 quiet_after sets it that many seconds into the live view, quiet_for ends
@@ -22,13 +21,127 @@ import struct
 import threading
 import time
 
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 from wyzecrack import direct
-from wyzecrack.dtls import (HS_CH, HS_CKE, RT_APPDATA, RT_CCS, RT_HANDSHAKE,
-                              DTLSLeg, Templates, derive_psk, parse_hs,
-                              parse_records)
+from wyzecrack.dtls import (HS_CH, HS_CKE, HS_FIN, HS_NST, HS_SH, HS_SHD,
+                            HS_SKE, RT_APPDATA, RT_CCS, RT_HANDSHAKE,
+                            build_record, derive_psk, finished, hs_msg,
+                            parse_hs, parse_records, seal, session_keys,
+                            unseal)
 from wyzecrack.tutk import trans_code_blob, untrans_code_blob
 
 CC51, IOTC = "cc51", "iotc"
+# made up: a camera that exists nowhere
+UID, ENR, MAC = "ABCDEFGHJKLMNPQR111A", "gekMdn0XjZoWF/mD", "D03F27A1B2C3"
+
+# A camera's ServerHello, ServerKeyExchange and NewSessionTicket bodies;
+# the random (SH [2:34]), public key (SKE [6:38]) and ticket (NST [6:])
+# are replaced in every handshake
+SERVER_HELLO = bytes.fromhex(
+    "fefdd010af85e5c5d1eb865c2737dc437e6919b1237ea1718c72ebdf12c53583"
+    "40b900ccac00000dff010001000023000000170000")
+SERVER_KEY_EXCHANGE = bytes.fromhex(
+    "000003001d200f9ffdb778b04f8e9041be857c3c7c9e2740860a69907b512e9a"
+    "a2c89e1f4972")
+SESSION_TICKET = bytes.fromhex(
+    "00001c2000b0241735850abed933b6d433398597ee1c59bde947523fcadd9e72"
+    "554acc679a1f0711f2dfcc23496ed169325ac66d4d32fdb24fcf508487f03733"
+    "7d55dc235f11caf299c37399f2892976260f1680ab3a5e526ad9d80c16be436e"
+    "3fc36600dda5b77e19ce77332a5a7a9604196aeae929f77c767d2503f722c32f"
+    "38be24d6e362052f986423ecc6cc09dffd915624bc2ee71720786a2a733017c9"
+    "d00b839c9a1a16daa7eb7b6f8a12be7040a81a59dbc2")
+
+
+class ServerLeg:
+    """The camera's side of the DTLS handshake that dtls.DTLSClient
+    speaks. Each on_* method returns the flight to send (b"" for none);
+    last_flight is what to resend when the client repeats itself."""
+
+    def __init__(self, psk):
+        self.psk = psk
+        self.priv = X25519PrivateKey.generate()
+        self.random = os.urandom(32)
+        self.state = "start"
+        self.transcript = b""
+        self.client_random = self.master = self.keys = None
+        self.epoch = self.seq = 0
+        self.last_flight = b""
+        self.handshake_done = False
+        self._seen = set()
+
+    def on_client_hello(self, msg):
+        if (msg[0], msg[1]) in self._seen:
+            return self.last_flight
+        self._seen.add((msg[0], msg[1]))
+        m = msg[2]
+        self.transcript += m
+        self.client_random = m[14:46]
+        sh = bytearray(SERVER_HELLO)
+        sh[2:34] = self.random
+        ske = bytearray(SERVER_KEY_EXCHANGE)
+        ske[6:38] = self.priv.public_key().public_bytes(Encoding.Raw,
+                                                        PublicFormat.Raw)
+        flight = b""
+        for mtype, mseq, body in ((HS_SH, 0, bytes(sh)), (HS_SKE, 1, bytes(ske)),
+                                  (HS_SHD, 2, b"")):
+            hm = hs_msg(mtype, mseq, body)
+            self.transcript += hm
+            flight += build_record(RT_HANDSHAKE, 0, self.seq, hm)
+            self.seq += 1
+        self.state = "wait_cke"
+        self.last_flight = flight
+        return flight
+
+    def on_cke(self, msg):
+        if (msg[0], msg[1]) in self._seen or self.state != "wait_cke":
+            return b""
+        self._seen.add((msg[0], msg[1]))
+        m = msg[2]
+        self.transcript += m
+        body = m[12:]
+        idlen = struct.unpack(">H", body[:2])[0]
+        point = body[2 + idlen + 1:2 + idlen + 1 + 32]
+        shared = self.priv.exchange(X25519PublicKey.from_public_bytes(point))
+        self.master, *self.keys = session_keys(
+            self.psk, shared, self.transcript, self.client_random, self.random)
+        self.state = "wait_fin"
+        return b""
+
+    def on_fin(self, plaintext):
+        for mtype, _mseq, m in parse_hs(plaintext):
+            if mtype != HS_FIN or self.state != "wait_fin":
+                continue
+            if m[12:24] != finished(self.master, "client finished", self.transcript):
+                raise ValueError("client Finished mismatch")
+            nst = bytearray(SESSION_TICKET)
+            nst[6:] = os.urandom(len(nst) - 6)
+            nst_msg = hs_msg(HS_NST, 3, bytes(nst))
+            fin = hs_msg(HS_FIN, 4, finished(self.master, "server finished",
+                                             self.transcript + m + nst_msg))
+            skey, siv = self.keys[2], self.keys[3]
+            flight = (build_record(RT_HANDSHAKE, 0, 3, nst_msg)
+                      + build_record(RT_CCS, 0, 4, b"\x01")
+                      + seal(skey, siv, RT_HANDSHAKE, 1, 0, fin))
+            self.epoch, self.seq = 1, 1        # Fin took (1, 0)
+            self.state = "done"
+            self.handshake_done = True
+            self.last_flight = flight
+            return flight
+        return b""
+
+    def encrypt_record(self, rtype, plaintext):
+        rec = seal(self.keys[2], self.keys[3], rtype, self.epoch, self.seq,
+                   plaintext)
+        self.seq += 1
+        return rec
+
+    def decrypt_record(self, rtype, ver, epoch, seq, body):
+        return unseal(self.keys[0], self.keys[1], rtype, ver, epoch, seq, body)
 
 
 def xxtea_encrypt(data, key):
@@ -76,6 +189,7 @@ class FakeCamera:
         self.p2p.bind((host, 0))
         self.disco_port = self.disco.getsockname()[1]
         self.ticket, self.sid, self.client = 0x4D2, None, None
+        self.key_ok = False                  # the last IOTC discovery's AuthKey
         self.events = []                     # what the client did, in order
         self.sessions = 0
         self._new_session()
@@ -247,16 +361,19 @@ class FakeCamera:
         stage = p[16 + 48] if len(p) > 16 + 48 else 0
         if (cmd == direct.IOTC_DISCO_REQ and p[16:36].rstrip(b"\0") == self.uid
                 and stage == 1):
-            if p[16 + 58:16 + 66] != self.authkey:
+            # like the v2: discovery is answered whatever the AuthKey, a
+            # wrong one's session request is not
+            self.key_ok = p[16 + 58:16 + 66] == self.authkey
+            if not self.key_ok:
                 self.events.append("bad authkey")
-                return
             self.client = addr
             if self.sid is not None and p[16 + 40:16 + 48] != self.sid:
                 self._new_session()
             self.sid = p[16 + 40:16 + 48]
             self.events.append("discovery")
             self.p2p.sendto(self._iotc(direct.IOTC_DISCO_RES, bytes(72)), addr)
-        elif cmd == direct.IOTC_SESSION_REQ and self.client == addr:
+        elif (cmd == direct.IOTC_SESSION_REQ and self.client == addr
+              and self.key_ok):
             self.p2p.sendto(self._iotc(direct.IOTC_SESSION_RES, bytes(36)), addr)
         elif cmd == direct.IOTC_DATA_TX and len(p) > 28:
             self._records(p[28:])
@@ -280,18 +397,17 @@ class FakeCamera:
     # ------------------------------------------------------------- DTLS + AV
     def _records(self, payload):
         if self.leg is None:
-            self.leg = DTLSLeg("server", derive_psk(self.enr), Templates.embedded())
+            self.leg = ServerLeg(derive_psk(self.enr))
         leg, out = self.leg, b""
         for rtype, ver, epoch, seq, body in parse_records(payload):
             if rtype == RT_HANDSHAKE and epoch == 0:
                 for msg in parse_hs(body):
                     if msg[0] == HS_CH:
-                        f = leg.server_on_ch(msg)
-                        out = f if f is not None else leg.last_flight
+                        out = leg.on_client_hello(msg)
                     elif msg[0] == HS_CKE:
-                        leg.server_on_cke(msg)
+                        leg.on_cke(msg)
             elif rtype == RT_CCS:
-                leg.server_on_ccs()
+                continue
             elif epoch == 1:
                 try:
                     pt = leg.decrypt_record(rtype, ver, epoch, seq, body)
@@ -299,7 +415,7 @@ class FakeCamera:
                     self.events.append("undecryptable")
                     continue
                 if rtype == RT_HANDSHAKE:
-                    f = leg.server_on_fin(pt)
+                    f = leg.on_fin(pt)
                     if f:
                         self.events.append("handshake")
                         out = f
@@ -356,8 +472,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
     ap.add_argument("--mac", required=True)
-    ap.add_argument("--uid", default="ABCDEFGHJKLMNPQR111A")
-    ap.add_argument("--enr", default="gekMdn0XjZoWF/mD")
+    ap.add_argument("--uid", default=UID)
+    ap.add_argument("--enr", default=ENR)
     ap.add_argument("--framing", choices=(CC51, IOTC), default=CC51)
     ap.add_argument("--seconds", type=float, default=20)
     ap.add_argument("--login-delay", type=float, default=0)

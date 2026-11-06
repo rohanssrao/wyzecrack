@@ -45,13 +45,13 @@ def server(seconds):
             .public_key(key.public_key()).serial_number(1)
             .not_valid_before(now - dt.timedelta(hours=1))
             .not_valid_after(now + dt.timedelta(days=1)).sign(key, hashes.SHA256()))
-    d = tempfile.mkdtemp()
-    open(f"{d}/c.pem", "wb").write(cert.public_bytes(serialization.Encoding.PEM))
-    open(f"{d}/k.pem", "wb").write(key.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption()))
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(f"{d}/c.pem", f"{d}/k.pem")
+    with tempfile.TemporaryDirectory() as d:
+        open(f"{d}/c.pem", "wb").write(cert.public_bytes(serialization.Encoding.PEM))
+        open(f"{d}/k.pem", "wb").write(key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+        ctx.load_cert_chain(f"{d}/c.pem", f"{d}/k.pem")
 
     def note_sni(_sock, name, _ctx):
         with open(f"{OUT}/api-sni.txt", "a") as f:

@@ -35,14 +35,12 @@ def run_bpf(prog, pkt):
 
 
 class TestFilters(unittest.TestCase):
-    def test_udp_filter(self):
-        prog = rawnet.udp_filter(["192.168.1.20"], ["192.168.1.2"])
+    def test_ip_from(self):
+        prog = rawnet.ip_from("192.168.1.20", socket.IPPROTO_UDP)
         ok = rawnet.ACCEPT
         self.assertEqual(run_bpf(prog, _udp_frame("192.168.1.20", "1.2.3.4", 1, 2, b"x")), ok)
-        self.assertEqual(run_bpf(prog, _udp_frame("1.2.3.4", "192.168.1.20", 1, 2, b"x")), ok)
-        self.assertEqual(run_bpf(prog, _udp_frame("1.2.3.4", "192.168.1.2", 1, 2, b"x")), ok)
-        # our own outbound traffic is not the camera's
-        self.assertEqual(run_bpf(prog, _udp_frame("192.168.1.2", "1.2.3.4", 1, 2, b"x")), 0)
+        # traffic to the camera, or not UDP, is not what's asked for
+        self.assertEqual(run_bpf(prog, _udp_frame("1.2.3.4", "192.168.1.20", 1, 2, b"x")), 0)
         self.assertEqual(run_bpf(prog, _udp_frame("192.168.1.20", "1.2.3.4", 1, 2, b"x", proto=6)), 0)
         arp = b"\x11" * 12 + b"\x08\x06" + bytes(28)
         self.assertEqual(run_bpf(prog, arp), 0)
@@ -79,7 +77,7 @@ class TestLiveFilter(unittest.TestCase):
                 got.append(p)
         import threading
         t = threading.Thread(target=rawnet.sniff, args=(
-            "lo", rawnet.udp_filter(["127.0.0.1"]), rawnet.parse_udp, on,
+            "lo", rawnet.ip_from("127.0.0.1", socket.IPPROTO_UDP), rawnet.parse_udp, on,
             lambda: bool(got) or time.time() > deadline))
         t.start()
         time.sleep(0.3)

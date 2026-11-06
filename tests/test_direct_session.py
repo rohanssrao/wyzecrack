@@ -7,12 +7,10 @@ import time
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from fakecam import CC51, IOTC, FakeCamera  # noqa: E402
+from fakecam import CC51, ENR, IOTC, MAC, UID, FakeCamera  # noqa: E402
 
 from wyzecrack import direct  # noqa: E402
 from wyzecrack.live import LiveAssembler  # noqa: E402
-
-UID, ENR, MAC = "ABCDEFGHJKLMNPQR111A", "gekMdn0XjZoWF/mD", "D03F27A1B2C3"
 
 
 @pytest.fixture(scope="module")
@@ -21,9 +19,11 @@ def h264():
     return _h264_frames(n=20)
 
 
-def _session(cam, enr=ENR, **kw):
-    return direct.Direct("127.0.0.1", UID, enr, MAC, local_ip="127.0.0.1",
-                         disco_port=cam.disco_port, **kw)
+def _session(cam, enr=ENR, on_av=None, **kw):
+    d = direct.Direct("127.0.0.1", UID, enr, MAC, local_ip="127.0.0.1",
+                      disco_port=cam.disco_port, **kw)
+    d.record(on_av=on_av)
+    return d
 
 
 @pytest.mark.parametrize("framing", [CC51, IOTC])
@@ -87,7 +87,7 @@ def test_wrong_key_is_ignored_by_the_camera(framing):
     try:
         with pytest.raises(direct.CameraGone, match="discovery"):
             d.open(timeout=1.5)
-        assert "discovery" not in cam.events
+        assert d.framing is None and "handshake" not in cam.events
     finally:
         d.close()
         cam.close()
@@ -159,9 +159,13 @@ def test_a_slow_session_is_hedged_with_a_second_one(h264, monkeypatch):
         cam.close()
 
 
-def test_no_hedging_for_a_camera_that_does_not_answer(h264, monkeypatch):
+@pytest.mark.parametrize("framing", [CC51, IOTC])
+def test_no_hedging_for_a_camera_that_does_not_answer(framing, h264, monkeypatch):
+    """A wrong key: the v3 doesn't answer discovery, the v2 doesn't set up
+    the session. One session, and an answer that says so."""
     monkeypatch.setattr(direct, "HEDGE_AFTER", 0.3)
-    cam = FakeCamera(UID, ENR, MAC, frames=h264)
+    monkeypatch.setattr(direct, "DISCO_GIVE_UP", 1.5)
+    cam = FakeCamera(UID, ENR, MAC, framing=framing, frames=h264)
     made = []
 
     def make(stop):
@@ -169,9 +173,10 @@ def test_no_hedging_for_a_camera_that_does_not_answer(h264, monkeypatch):
         return made[-1]
 
     try:
+        t0 = time.monotonic()
         with pytest.raises(direct.CameraGone, match="discovery"):
-            direct.open_first(make, timeout=2)
-        assert len(made) == 1
+            direct.open_first(make, timeout=10)
+        assert len(made) == 1 and time.monotonic() - t0 < 3
     finally:
         cam.close()
 

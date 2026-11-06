@@ -2,28 +2,27 @@
 import json
 import socket
 import ssl
-import tempfile
 import threading
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 
-from wyzecrack import cloud as enr
+from wyzecrack import cloud
 
 
 def test_device_info_unescapes_and_finds_mac():
     body = (b'POST /device/system/set_device_info HTTP/1.1\r\n\r\n'
             b'{"mac":"d03f27a1b2c3","enr":"gekMdn0XjZoWF\\/mD","x":1}')
-    info = enr.device_info(body)
+    info = cloud.device_info(body)
     assert (info["enr"], info["mac"]) == ("gekMdn0XjZoWF/mD", "D03F27A1B2C3")
-    assert enr.device_info(b'{"mac":"D03F27A1B2C3"}') is None
+    assert cloud.device_info(b'{"mac":"D03F27A1B2C3"}') is None
 
 
-def test_leaf_validates_against_the_emudhra_intermediate():
+def test_leaf_validates_against_the_emudhra_intermediate(tmp_path):
     """A client that trusts the compromised intermediate accepts the leaf
     for the requested name, with the chain we serve."""
-    certfile, keyfile = enr.mint_leaf("api.wyzecam.com", tempfile.mkdtemp())
-    _key, icert, _cross = enr.emudhra_chain()
+    certfile, keyfile = cloud.mint_leaf("api.wyzecam.com", tmp_path)
+    _key, icert, _cross = cloud.emudhra_chain()
     srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     srv_ctx.load_cert_chain(certfile, keyfile)
     cli_ctx = ssl.create_default_context(
@@ -50,7 +49,7 @@ def test_leaf_validates_against_the_emudhra_intermediate():
 
 def test_request_tap_splits_pipelined_requests_and_names_events():
     got = []
-    tap = enr.RequestTap(lambda m, p, h, b: got.append((m, p, b)))
+    tap = cloud.RequestTap(lambda m, p, h, b: got.append((m, p, b)))
     put = (b"/D03F27A1B2C3/2026-01-01/D03F27A1B2C3011767225600_1767225600894_1_2_0/"
            b"0123456789abcdef0123456789abcdef_1.mp4?Policy=x&Signature=y")
     clip = b"\x00\x00\x00\x18ftypmp42" + bytes(100)
@@ -61,9 +60,9 @@ def test_request_tap_splits_pipelined_requests_and_names_events():
         tap.feed(stream[i:i + 7])
     assert [g[0] for g in got] == ["POST", "PUT"]
     assert got[1][2] == clip
-    folder, fname = enr.event_name(got[1][1])
+    folder, fname = cloud.event_name(got[1][1])
     assert folder.endswith("_1767225600") and fname == "clip.mp4"
-    assert enr.event_name(b"/device/alarm/upload_alarm") is None
+    assert cloud.event_name(b"/device/alarm/upload_alarm") is None
 
 
 def _client_hello(sni):
@@ -80,24 +79,24 @@ def _client_hello(sni):
 
 def test_client_hello_sni():
     hello = _client_hello("cpl-t-sightsafe.wyzecam.com")
-    assert enr.client_hello_sni(hello) == "cpl-t-sightsafe.wyzecam.com"
-    assert enr.client_hello_sni(hello[:40]) is None            # partial
-    assert enr.client_hello_sni(b"GET / HTTP/1.1\r\n") is None  # not TLS
-    assert enr.intercepts("api.wyzecam.com")
-    assert not enr.intercepts("sinker-t-usw2.s3.us-west-2.amazonaws.com")
-    assert enr.intercepts("c-t-usw2.s3.us-west-2.amazonaws.com")    # v2 alarms
-    assert not enr.intercepts("wyze-iot.s3.us-west-2.amazonaws.com")
-    assert not enr.intercepts("")
+    assert cloud.client_hello_sni(hello) == "cpl-t-sightsafe.wyzecam.com"
+    assert cloud.client_hello_sni(hello[:40]) is None            # partial
+    assert cloud.client_hello_sni(b"GET / HTTP/1.1\r\n") is None  # not TLS
+    assert cloud.intercepts("api.wyzecam.com")
+    assert not cloud.intercepts("sinker-t-usw2.s3.us-west-2.amazonaws.com")
+    assert cloud.intercepts("c-t-usw2.s3.us-west-2.amazonaws.com")    # v2 alarms
+    assert not cloud.intercepts("wyze-iot.s3.us-west-2.amazonaws.com")
+    assert not cloud.intercepts("")
 
 
-def test_long_sni_still_gets_a_leaf():
+def test_long_sni_still_gets_a_leaf(tmp_path):
     name = "a" * 70 + ".wyzecam.com"
-    certfile, _ = enr.mint_leaf(name, tempfile.mkdtemp())
+    certfile, _ = cloud.mint_leaf(name, tmp_path)
     assert open(certfile).read().startswith("-----BEGIN CERTIFICATE-----")
 
 
 def test_bad_enr_escape_is_ignored():
-    assert enr.device_info(b'{"enr":"ab\\xcd"}') is None
+    assert cloud.device_info(b'{"enr":"ab\\xcd"}') is None
 
 
 def test_device_info_reads_both_request_shapes():
@@ -109,8 +108,8 @@ def test_device_info_reads_both_request_shapes():
                b'"firmware_version":"4.36.17.21","hardware_version":"0.0.0.0"}')
     want = {"enr": "gekMdn0XjZoWF/mD", "mac": "D03F27A1B2C3",
             "model": "WYZE_CAKP2JFUS", "fw": "4.36.17.21", "hw": "0.0.0.0"}
-    assert enr.device_info(alarm) == want
-    assert enr.device_info(metrics) == want
+    assert cloud.device_info(alarm) == want
+    assert cloud.device_info(metrics) == want
 
 
 class _Reply:
@@ -138,14 +137,14 @@ def test_fetch_uid_asks_as_the_camera(monkeypatch):
                       b'"ABCDEFGHJKLMNPQR111A","p2p_id_type":3}}')
 
     monkeypatch.setattr(urllib.request, "urlopen", fake)
-    uid = enr.fetch_uid("d0:3f:27:a1:b2:c3", "gekMdn0XjZoWF/mD",
+    uid = cloud.fetch_uid("d0:3f:27:a1:b2:c3", "gekMdn0XjZoWF/mD",
                         "WYZE_CAKP2JFUS", "4.36.17.21")
     assert uid == "ABCDEFGHJKLMNPQR111A"
     assert sent["url"].endswith("/device/system/get_p2pid")
     b = sent["body"]
     assert (b["mac"], b["enr"], b["p2p_id_type"]) == (
         "D03F27A1B2C3", "gekMdn0XjZoWF/mD", 3)
-    assert b["sv"] == enr.SV_GET_P2PID and b["sc"] == enr.SC
+    assert b["sv"] == cloud.SV_GET_P2PID and b["sc"] == cloud.SC
 
 
 def test_fetch_uid_refusal_is_a_cloud_error(monkeypatch):
@@ -153,19 +152,19 @@ def test_fetch_uid_refusal_is_a_cloud_error(monkeypatch):
     import pytest
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Reply(
         b'{"code":"1000","msg":"service is error","data":null}'))
-    with pytest.raises(enr.CloudError):
-        enr.fetch_uid("D03F27A1B2C3", "x", "WYZE_CAKP2JFUS", "4.36.17.21")
+    with pytest.raises(cloud.CloudError):
+        cloud.fetch_uid("D03F27A1B2C3", "x", "WYZE_CAKP2JFUS", "4.36.17.21")
 
 
 def test_event_name_for_a_v2_upload():
-    # a Wyze Cam v2 (4.9.9.3006) PUT to its S3 bucket, 2026-11-05
+    # how a Wyze Cam v2 (4.9.9.3006) names its uploads to its S3 bucket
     path = (b"/2CAA8ED4E5F6/2026-01-01/2CAA8ED4E5F6021767225800_1767225800810_2_2_0/"
             b"fedcba9876543210fedcba9876543210_-1.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256")
-    folder, fname = enr.event_name(path)
+    folder, fname = cloud.event_name(path)
     assert fname == "clip.mp4" and folder.endswith("_1767225800")
 
 
-def test_a_clip_without_snapshot_gets_a_still_and_its_length(tmp_path):
+def test_a_v2_upload_gives_its_key_and_a_clip_with_a_still(tmp_path):
     av = pytest.importorskip("av")
     from fractions import Fraction
     mp4 = tmp_path / "src.mp4"
@@ -182,10 +181,16 @@ def test_a_clip_without_snapshot_gets_a_still_and_its_length(tmp_path):
                 out.mux(pkt)
         for pkt in s.encode(None):
             out.mux(pkt)
-    tap = enr.CloudTap(None, "192.168.1.23", events_dir=tmp_path / "events")
+    tap = cloud.CloudTap(None, "192.168.1.23", events_dir=tmp_path / "events")
     path = (b"/2CAA8ED4E5F6/2026-01-01/2CAA8ED4E5F6021767225800_1767225800810_2_2_0/"
             b"fedcba9876543210fedcba9876543210_-1.mp4?X-Amz-Algorithm=x")
+    keys = []
+    tap.on_key = keys.append
+    tap._on_request("POST", b"/device/alarm/upload_alarm", {},
+                    b'{"mac":"2CAA8ED4E5F6","enr":"gekMdn0XjZoWF\\/mD",'
+                    b'"product_model":"WYZEC1-JZ"}')
     tap._on_request("PUT", path, {}, mp4.read_bytes())
+    assert tap.enr_found.is_set() and keys[0]["model"] == "WYZEC1-JZ"
     d = next((tmp_path / "events").iterdir())
     assert (d / "clip.mp4").exists() and (d / "snapshot.jpg").stat().st_size > 0
     assert json.loads((d / "meta.json").read_text())["seconds"] == pytest.approx(3.0, abs=0.2)

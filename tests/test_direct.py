@@ -2,32 +2,15 @@
 media format a direct session gets."""
 import hashlib
 import hmac
+import os
 import struct
+import sys
 
-from wyzecrack import direct
-from wyzecrack.media import parse_media
+sys.path.insert(0, os.path.dirname(__file__))
+from fakecam import ENR, MAC, UID, xxtea_encrypt  # noqa: E402
 
-ENR, MAC = "gekMdn0XjZoWF/mD", "D03F27A1B2C3"
-UID = "ABCDEFGHJKLMNPQR111A"            # made up
-
-
-def xxtea_encrypt(data, key):
-    """Reference XXTEA encryption (the inverse of direct.xxtea_decrypt)."""
-    n = len(data) // 4
-    v = list(struct.unpack(f"<{n}I", data))
-    k = struct.unpack("<4I", key)
-    delta, mask = 0x9E3779B9, 0xFFFFFFFF
-    total, z = 0, v[n - 1]
-    for _ in range(6 + 52 // n):
-        total = (total + delta) & mask
-        e = (total >> 2) & 3
-        for p in range(n):
-            y = v[(p + 1) % n]
-            mx = ((((z >> 5) ^ (y << 2)) + ((y >> 3) ^ (z << 4))) & mask) ^ \
-                 (((total ^ y) + (k[(p & 3) ^ e] ^ z)) & mask)
-            v[p] = (v[p] + mx) & mask
-            z = v[p]
-    return struct.pack(f"<{n}I", *v)
+from wyzecrack import direct  # noqa: E402
+from wyzecrack.media import parse_media  # noqa: E402
 
 
 def test_xxtea_matches_go2rtc_vector():
@@ -44,10 +27,11 @@ def test_challenge_response_undoes_the_cameras_encryption():
 
 
 def test_auth_key():
+    import base64
     h = hashlib.sha256((ENR + MAC).encode()).digest()[:6]
-    assert direct.auth_key(ENR, "d0:3f:27:a1:b2:c3") == direct.auth_key(ENR, MAC)
-    assert len(direct.auth_key(ENR, MAC)) == 8
-    assert b"+" not in direct.auth_key(ENR, MAC) and h
+    want = base64.b64encode(h).replace(b"+", b"Z").replace(b"/", b"9")
+    assert direct.auth_key(ENR, MAC) == want
+    assert direct.auth_key(ENR, "d0:3f:27:a1:b2:c3") == want
 
 
 def _client():

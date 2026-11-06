@@ -35,7 +35,7 @@
   <section id="session" class="view hidden">
     <div class="stage" id="stage">
       <canvas id="video"></canvas>
-      <div class="status" id="status">
+      <div class="status">
         <div class="status-icon" id="status-icon"></div>
         <h2 id="status-title"></h2>
         <p id="status-text"></p>
@@ -60,10 +60,10 @@
     </div>
     <div class="motion-row">
       <label class="switch"><input type="checkbox" id="motion-toggle"><span class="knob"></span>Save this camera's motion clips</label>
-      <span class="motion-note" id="motion-note">While wyzecrack is open, this camera's internet traffic goes through this computer so its clips can be copied. If this computer sleeps or shuts down meanwhile, the camera is offline for up to about a minute.</span>
+      <span class="motion-note" id="motion-note"></span>
     </div>
     <h3 class="saved-h">Saved <span class="count" id="saved-count"></span></h3>
-    <div class="tiles" id="saved"><p class="muted">Live views you watch are saved here, and motion clips if you turn that on.</p></div>
+    <div class="tiles" id="saved"></div>
   </section>
 </main>
 

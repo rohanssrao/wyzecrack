@@ -25,16 +25,21 @@ async function scan() {
 
 function displayName(c) { return c.name || c.model || "Wyze camera"; }
 
+function showName(c, node) {
+  node.innerHTML = `<span>${esc(displayName(c))}</span><button class="edit" title="Rename">✎</button>`;
+  node.querySelector(".edit").onclick = (ev) => { ev.stopPropagation(); rename(c, node); };
+}
+
 function camCard(c) {
   const card = el("div", "cam" + (c.online === false ? " off" : ""));
   const thumb = el("div", "thumb", (c.thumb ? `<img src="${esc(c.thumb)}" alt="">` : `<span class="ph">📷</span>`) + `<div class="go">Watch</div>`);
   const body = el("div", "body");
-  const name = el("div", "name", `<span>${esc(displayName(c))}</span><button class="edit" title="Rename">✎</button>`);
+  const name = el("div", "name");
+  showName(c, name);
   const status = c.online === false ? "not answering" : c.ready ? "ready" : c.key_known ? "key saved" : null;
   const saving = c.capturing === "on" ? "saving motion clips" : c.capturing === "error" ? "motion clips: not saving" : null;
   const bits = [c.name ? c.model : null, c.ip, status, saving, c.tested ? null : "untested model"].filter(Boolean);
   const meta = el("div", "meta", esc(bits.join(" · ")));
-  name.querySelector(".edit").onclick = (ev) => { ev.stopPropagation(); rename(c, name); };
   card.onclick = () => start(c);
   body.append(name, meta);
   card.append(thumb, body);
@@ -52,8 +57,7 @@ function rename(c, node) {
   const done = async () => {
     c.name = input.value.trim() || null;
     await api("/api/name", { mac: c.mac, ip: c.ip, name: input.value });
-    node.innerHTML = `<span>${esc(displayName(c))}</span><button class="edit" title="Rename">✎</button>`;
-    node.querySelector(".edit").onclick = (ev) => { ev.stopPropagation(); rename(c, node); };
+    showName(c, node);
   };
   input.onkeydown = (e) => { if (e.key === "Enter") input.blur(); if (e.key === "Escape") { input.value = c.name || ""; input.blur(); } };
   input.onblur = done;
@@ -63,7 +67,7 @@ async function start(c) {
   camera = c;
   hadPicture = ended = savedNew = false;
   $("#again").classList.add("hidden");
-  const r = await api("/api/start", { ...c, name: c.name });
+  const r = await api("/api/start", c);
   if (r.error) toast(r.error, "error");
   showSession(c);
 }
@@ -139,7 +143,7 @@ function applyState(s) {
   // first time with a camera: the key, then the ID; then connecting
   const keyRead = steps.enr?.status === "active" || steps.uid?.status === "active";
   let key = s.phase;
-  if (s.phase === "starting") key = steps.enr?.status !== "done" ? "key" : steps.uid?.status !== "done" ? "uid" : "direct";
+  if (s.phase === "starting") key = !steps.enr ? "starting" : steps.enr.status !== "done" ? "key" : steps.uid?.status !== "done" ? "uid" : "direct";
   if (steps.enr?.status === "active" && s.phase !== "error") key = steps.enr.detail?.nudging ? "key_nudge" : "key";
   if (steps.enr?.status === "problem") key = "enr_refused";
   if (steps.uid?.status === "active") key = "uid";
@@ -228,7 +232,7 @@ async function loadLibrary(fresh) {
   ].sort((a, b) => b.t - a.t);
   const box = $("#saved");
   $("#saved-count").textContent = items.length || "";
-  if (!items.length) { box.innerHTML = `<p class="muted">Live views you watch are saved here.</p>`; return; }
+  if (!items.length) { box.innerHTML = `<p class="muted">Live views you watch are saved here, and motion clips if you turn that on.</p>`; return; }
   box.innerHTML = "";
   for (const it of items) {
     const t = el("div", "tile" + (fresh && it.src === fresh ? " fresh" : ""));
@@ -270,10 +274,17 @@ function wantJpeg() {
   if (sock && sock.readyState === 1) sock.send(JSON.stringify({ kind: "want", video: "jpeg" }));
 }
 
+// the picture's size: the canvas follows it, and the pill shows it
+function fit(w, h) {
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  $("#res").textContent = `${h}p`;
+}
+
 function onJpeg(buf) {
   const blob = new Blob([new Uint8Array(buf, 9)], { type: "image/jpeg" });
   createImageBitmap(blob).then((bmp) => {
-    if (canvas.width !== bmp.width) { canvas.width = bmp.width; canvas.height = bmp.height; }
+    fit(bmp.width, bmp.height);
     ctx2d.drawImage(bmp, 0, 0);
     bmp.close();
     framesShown++;
@@ -288,7 +299,6 @@ function resetVideo(keepLastFrame) {
 }
 
 async function configure(cfg) {
-  if (cfg.width) $("#res").textContent = `${cfg.height}p`;
   if (videoMode === "jpeg") return;
   let ok = "VideoDecoder" in window;
   if (ok) {
@@ -298,7 +308,7 @@ async function configure(cfg) {
   if (decoder && decoder.state !== "closed") decoder.close();
   decoder = new VideoDecoder({
     output: (frame) => {
-      if (canvas.width !== frame.displayWidth) { canvas.width = frame.displayWidth; canvas.height = frame.displayHeight; }
+      fit(frame.displayWidth, frame.displayHeight);
       ctx2d.drawImage(frame, 0, 0);
       frame.close();
       framesShown++;

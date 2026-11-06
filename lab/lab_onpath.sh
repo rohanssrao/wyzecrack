@@ -15,7 +15,7 @@ TOOLENV="WYZECRACK_DEBUG=1 PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc WYZEC
 bash $LAB/lab_setup.sh up
 cd $REPO
 tool_pids() { for p in $(ip netns pids tfl-mid); do grep -qa wyzecrack /proc/$p/cmdline 2>/dev/null && echo $p; done; }
-ip netns exec tfl-relay env OUT=$OUT $PY $LAB/lab_api.py server 40 > $OUT/api-server.log 2>&1 &
+ip netns exec tfl-inet env OUT=$OUT $PY $LAB/lab_api.py server 40 > $OUT/api-server.log 2>&1 &
 API=$!
 ip netns exec tfl-mid env $TOOLENV $PY -m wyzecrack events --target 10.99.0.20 \
    --on-path --out $OUT/events --count 2 > $OUT/tool.out 2>&1 &

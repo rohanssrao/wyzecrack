@@ -12,6 +12,8 @@ from .changes import run
 WYZE_OUI24 = {"2c:aa:8e", "7c:78:b2", "80:48:2c", "d0:3f:27", "f0:c8:8b"}
 WYZE_OUI28 = {"a4:da:22:2"}
 MAX_SWEEP = 1024
+ROUNDS = 3          # ARP requests per address
+LINGER = 3.0        # s to wait for late answers
 
 
 def is_wyze(mac):
@@ -41,7 +43,7 @@ def neighbors(iface):
     return found
 
 
-def sweep(iface, seconds=3.0, rounds=3, extra=()):
+def sweep(iface, extra=()):
     """ARP every address on iface's subnet (up to MAX_SWEEP of them,
     nearest first) and return {ip: mac} of everything that answered or
     was already known."""
@@ -70,7 +72,7 @@ def sweep(iface, seconds=3.0, rounds=3, extra=()):
     # address a few times, known ones (extra) first
     order = list(dict.fromkeys([*extra, *hosts]))
     with rawnet.open_raw(iface) as s:
-        for _ in range(rounds):
+        for _ in range(ROUNDS):
             for h in order:
                 if h in found and h not in extra:
                     continue
@@ -90,7 +92,7 @@ def sweep(iface, seconds=3.0, rounds=3, extra=()):
                 u.sendto(b"", (h, 9))          # discard port
             except OSError:
                 pass
-    time.sleep(seconds)
+    time.sleep(LINGER)
     found.update(neighbors(iface))
     stop.set()
     listener.join(1)
@@ -124,8 +126,10 @@ MODELS = {
     "HL_WCO2": "Wyze Cam Outdoor v2",
     "WYZEDB3": "Wyze Video Doorbell",
 }
-# models wyzecrack has been tested against
-TESTED = {"WYZE_CAKP2JFUS", "WYZEC1-JZ"}
+# Models wyzecrack has been tried on, its key read included. Only on these
+# does the key read reset the camera's MQTT connection (nudge.py): a camera
+# whose recovery from it hasn't been seen just waits until it reports in.
+TESTED_MODELS = {"WYZE_CAKP2JFUS", "WYZEC1-JZ"}
 
 
 def reverse_name(ip, server, timeout=1.5):
@@ -159,7 +163,7 @@ def reverse_name(ip, server, timeout=1.5):
 
 
 def describe(ip, mac, gateway):
-    """{"model", "model_id", "hostname", "tested"} for a Wyze device."""
+    """{"model", "model_id", "tested"} for a Wyze device."""
     host = reverse_name(ip, gateway) if gateway else None
     model_id = None
     if host:
@@ -168,6 +172,6 @@ def describe(ip, mac, gateway):
         if base.upper().endswith("-" + tail):
             base = base[: -len(tail) - 1]
         model_id = base
-    return {"hostname": host, "model_id": model_id,
+    return {"model_id": model_id,
             "model": MODELS.get(model_id or "", model_id or "Wyze device"),
-            "tested": model_id in TESTED}
+            "tested": model_id in TESTED_MODELS}

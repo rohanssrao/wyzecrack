@@ -1,7 +1,6 @@
-"""The GUI server: token login, the library, and the live assembler feed."""
+"""The page's server: token login, the library and motion captures."""
 import asyncio
 import json
-import os
 
 import pytest
 
@@ -70,13 +69,13 @@ def test_token_login_api_and_files(tmp_path):
 def test_library_thumb_prefers_recordings(tmp_path):
     lib = _library(tmp_path)
     assert lib.thumb("D0:3F:27:A1:B2:C3").endswith("frame.jpg")
-    assert lib.thumb("aa:bb:cc:dd:ee:ff") is None
+    assert lib.thumb("02:00:00:00:00:01") is None
 
 
 class _FakeCapture:
     made = []
 
-    def __init__(self, journal, ip, mac, events_dir, on_event):
+    def __init__(self, journal, ip, mac, events_dir=None, on_motion=None):
         self.ip, self.mac, self.running, self.error = ip, mac, False, None
         self.starts = self.stops = 0
         _FakeCapture.made.append(self)
@@ -91,10 +90,10 @@ class _FakeCapture:
 
 
 def test_motion_capture_on_off_follow_and_pause(tmp_path, monkeypatch):
-    from wyzecrack import motion
+    from wyzecrack import onpath
     from wyzecrack.changes import Changes
     monkeypatch.setattr(gui, "STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(motion, "MotionCapture", _FakeCapture)
+    monkeypatch.setattr(onpath, "Reroute", _FakeCapture)
     _FakeCapture.made = []
     ctl = gui.Controller(gui.Hub(), gui.Library(tmp_path / "captures"),
                          Changes(tmp_path / "run"))

@@ -1,8 +1,6 @@
 """The host-change journal: ordering, crash replay, single instance."""
 import json
-import tempfile
 import unittest.mock
-from pathlib import Path
 
 import pytest
 
@@ -15,7 +13,7 @@ def test_undo_is_newest_first_and_journal_tracks_state(tmp_path):
     p1.write_text("0\n")
     p2.write_text("x\n")
     c.sysctl(p1, 1)
-    c.remember_sysctl(p2)
+    c.sysctl(p2)
     p2.write_text("changed\n")              # e.g. a kernel side effect
     c.add("ipt", args=["-t", "nat", "-D", "POSTROUTING", "-j", "X"])
     assert len(json.loads((tmp_path / "changes.json").read_text())) == 3
@@ -100,10 +98,10 @@ def test_a_sysctl_two_scopes_set_is_restored_by_the_last_one(tmp_path):
     fwd.write_text("0\n")
     side.write_text("0\n")
     a, b = c.scope(), c.scope()
-    a.remember_sysctl(side)
+    a.sysctl(side)
     a.sysctl(fwd, 1)
     side.write_text("1\n")                 # the kernel's side effect
-    b.remember_sysctl(side)                # b must not save the 1
+    b.sysctl(side)                # b must not save the 1
     b.sysctl(fwd, 1)
     a.undo_all()                           # b still needs forwarding on
     assert fwd.read_text() == "1\n" and side.read_text() == "1\n"

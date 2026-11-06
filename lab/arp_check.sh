@@ -16,10 +16,11 @@ ip netns exec tfl-mid env PYTHONPATH=$REPO $PY - <<'PY' &
 import tempfile, time
 from wyzecrack.changes import Changes
 from wyzecrack.onpath import OnPath
-c = Changes(tempfile.mkdtemp())
-o = OnPath(c, "10.99.0.20", "eth0", poison=True, gateway="10.99.0.1")
-o.start(); time.sleep(4); o.close()
-assert not c.items, c.items
+with tempfile.TemporaryDirectory() as run:
+    c = Changes(run)
+    o = OnPath(c, "10.99.0.20", "eth0", poison=True, gateway="10.99.0.1")
+    o.start(); time.sleep(4); o.close()
+    assert not c.items, c.items
 PY
 sleep 3; during=$(gwmac)
 # keep the camera talking so its entry stays live

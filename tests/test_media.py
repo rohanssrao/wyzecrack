@@ -2,7 +2,7 @@ import os
 import struct
 import tempfile
 
-from wyzecrack import media as av_extract
+from wyzecrack import media
 
 
 def _rec(direction, payload, ts=0.0):
@@ -25,8 +25,8 @@ def _media(ft, ch, frame_no, cidx, paysize, payload, last=0):
 
 
 def _video_frames(path):
-    s = av_extract.sessions(path)
-    return ([t for t in av_extract.assemble(s[0]) if t[1] in av_extract.VIDEO_CHANNELS]
+    s = media.sessions(path)
+    return ([t for t in media.assemble(s[0]) if t[1] in media.VIDEO_CHANNELS]
             if s else [])
 
 
@@ -79,12 +79,12 @@ def test_missing_middle_chunk_is_incomplete():
 
 def test_sessions_split_at_session_marks():
     one = lambda fno, ts: _rec(1, _media(0x01, 7, fno, 0x0028, 8, b"\x41" * 8, last=1), ts)
-    mark = _rec(av_extract.SESSION_MARK, b"")
+    mark = _rec(media.SESSION_MARK, b"")
     path = _write(b"".join([mark] + [one(n, n * 0.05) for n in range(1, 120)]
                            + [mark] + [one(n, 10 + n * 0.05) for n in range(1, 5)]
                            + [mark, mark]))                # an empty session
     try:
-        assert [len(s) for s in av_extract.sessions(path)] == [119, 4]
+        assert [len(s) for s in media.sessions(path)] == [119, 4]
     finally:
         os.unlink(path)
 
@@ -94,7 +94,7 @@ def test_single_packet_extended_frame():
     pslice = b"\x00\x00\x00\x01\x21\xfe" + b"\xDD" * 10
     frameinfo = b"\x4e\x00\x00\x00" + b"\x00" * 36
     body = pslice + frameinfo
-    m = av_extract.parse_media(_media(0x09, 7, 20, 0x0028, len(body), body,
+    m = media.parse_media(_media(0x09, 7, 20, 0x0028, len(body), body,
                                       last=1))
     assert m == (7, 20, 0xFFFF, pslice, True, 1)
 
@@ -107,12 +107,12 @@ def test_decodable_drops_gop_after_incomplete_idr():
               (2, 5, 3, idr, False),          # IDR missing its last chunk
               (3, 7, 4, p, True), (4, 7, 5, p, True),
               (5, 5, 6, idr, True), (6, 7, 7, p, True)]
-    kept = [f[2] for f in av_extract.decodable(frames)]
+    kept = [f[2] for f in media.decodable(frames)]
     assert kept == [1, 2, 6, 7]
     # an incomplete P-frame breaks the rest of its GOP too
     frames[4] = (3, 7, 4, p, False)
     frames[3] = (2, 5, 3, idr, True)
-    assert [f[2] for f in av_extract.decodable(frames)] == [1, 2, 3, 6, 7]
+    assert [f[2] for f in media.decodable(frames)] == [1, 2, 3, 6, 7]
 
 
 def test_segments_split_where_the_sps_changes():
@@ -122,7 +122,7 @@ def test_segments_split_where_the_sps_changes():
     frames = [(0, 5, 1, sd, True), (1, 7, 2, p, True),
               (2, 5, 3, sd, True), (3, 7, 4, p, True),     # same SPS: same segment
               (4, 5, 5, hd, True), (5, 7, 6, p, True)]
-    segs = av_extract.segments(frames)
+    segs = media.segments(frames)
     assert [[f[2] for f in s] for s in segs] == [[1, 2, 3, 4], [5, 6]]
 
 
@@ -194,7 +194,7 @@ def test_only_the_main_resolution_is_kept(tmp_path):
     av_bin = tmp_path / "av.bin"
     _write_av_bin(av_bin, [(1000.0, sd + hd)])
     r = export(str(av_bin), str(tmp_path / "out"))
-    assert r["size"] == (640, 480) and r["frames"] == 60
+    assert r["size"] == (640, 480)
     with av.open(r["mp4"]) as c:
         assert (c.streams.video[0].width, c.streams.video[0].frames) == (640, 60)
 

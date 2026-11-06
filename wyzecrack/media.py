@@ -31,8 +31,10 @@ marks a frame's last packet.
 import os
 import struct
 
+AUDIO_CHANNEL = 3
 VIDEO_CHANNELS = (5, 6, 7)
-MEDIA_CHANNELS = (3, 5, 6, 7)
+MEDIA_CHANNELS = (AUDIO_CHANNEL, *VIDEO_CHANNELS)
+AUDIO_RATE = 8000           # the camera's live audio: 8 kHz mono
 HEADER = 8                  # bytes before the [8] fields above
 # audio codecs in the FrameInfo: the v3 sends 16-bit PCM (0x8C), the v2
 # G.711 mu-law (0x89); both 8 kHz mono. G.711 is decoded to 16-bit PCM
@@ -85,7 +87,7 @@ def parse_media(p):
         if cidx == 0x0028 and len(payload) >= 40:
             codec = payload[-40]
             payload = payload[:-40]
-            if ch == 3 and codec in (CODEC_PCMU, CODEC_PCMA):
+            if ch == AUDIO_CHANNEL and codec in (CODEC_PCMU, CODEC_PCMA):
                 payload = g711_to_pcm(payload, codec)
         cidx = 0xFFFF
     return ch, frame_no, cidx, payload, end, count
@@ -150,28 +152,40 @@ def assemble(records):
     return out
 
 
-def _has_idr(blob):
-    i = blob.find(b"\x00\x00\x01")
+def nal_units(blob):
+    """[(type, NAL unit)] of an Annex-B access unit, start codes left out."""
+    out, i = [], blob.find(b"\x00\x00\x01")
     while i != -1 and i + 3 < len(blob):
-        if blob[i + 3] & 0x1F == 5:
-            return True
-        i = blob.find(b"\x00\x00\x01", i + 3)
-    return False
+        j = blob.find(b"\x00\x00\x01", i + 3)
+        nal = blob[i + 3:j if j != -1 else len(blob)]
+        out.append((nal[0] & 0x1F, nal))
+        i = j
+    return out
+
+
+def is_idr(blob):
+    return any(t == 5 for t, _ in nal_units(blob))
+
+
+def sps(blob):
+    """The access unit's SPS NAL unit, or None."""
+    for t, nal in nal_units(blob):
+        if t == 7:
+            # a 4-byte start code after it leaves a zero byte at its end
+            return nal.rstrip(b"\x00")
+    return None
 
 
 def decodable(tagged):
     """Frames a decoder can show cleanly: complete frames, minus every
     frame that follows an incomplete IDR until the next complete one,
     and every frame after an incomplete P-frame until the next IDR (a
-    P-frame references the one before it).
-    Once the viewer leaves, the camera keeps streaming to the dead
-    session but stops completing I-frames (run14: the last chunk of every
-    IDR from ~8 s after the phone left), and the P-frames after a broken
-    IDR decode as smears in whatever moves."""
+    P-frame references the one before it, and the frames after a broken
+    one decode as smears in whatever moves)."""
     out, gop_ok = [], False      # nothing decodes before the first IDR
     for t in tagged:
         blob, complete = t[3], t[4]
-        if _has_idr(blob):
+        if is_idr(blob):
             gop_ok = complete
         elif not complete:
             gop_ok = False
@@ -180,17 +194,11 @@ def decodable(tagged):
     return out
 
 
-AUDIO_CHANNEL = 3
-AUDIO_RATE = 8000          # the camera's live audio: s16le PCM, 8 kHz mono
-
-
-def audio_frames(records, t_from, t_to):
-    """[(t, pcm)] of a session's audio (codec 0x8C, PCM) between two times,
-    each frame once."""
+def audio_frames(records):
+    """[(t, s16le PCM)] of a session's audio, each frame once."""
     seen, out = set(), []
     for ts, (ch, frame_no, cidx, payload, end, count) in records:
-        if (ch == AUDIO_CHANNEL and end and frame_no not in seen
-                and t_from - 0.5 <= ts <= t_to + 0.5):
+        if ch == AUDIO_CHANNEL and end and frame_no not in seen:
             seen.add(frame_no)
             out.append((ts, payload))
     return out
@@ -247,8 +255,7 @@ def make_mp4(h264_path, mp4_path, frames, audio=None):
 
     frames: the [(t, ch, frame_no, blob, ended)] list that produced
     h264_path, in order. Each demuxed packet is mapped back to its frame
-    by byte offset. audio: [(t, pcm)] to add as an AAC track. Returns the
-    number of frames written."""
+    by byte offset. audio: [(t, pcm)] to add as an AAC track."""
     import av
     from bisect import bisect_right
     from fractions import Fraction
@@ -257,7 +264,7 @@ def make_mp4(h264_path, mp4_path, frames, audio=None):
         starts.append(off)
         off += len(f[3])
     tb = 90000
-    n, last = 0, -1
+    last = -1
     with av.open(h264_path, format="h264") as inp, \
             av.open(mp4_path, "w", format="mp4") as out:
         vin = inp.streams.video[0]
@@ -281,13 +288,11 @@ def make_mp4(h264_path, mp4_path, frames, audio=None):
             pkt.time_base = vout.time_base
             pkt.stream = vout
             out.mux(pkt)
-            n += 1
         if aout is not None:
             try:
                 _mux_audio(out, aout, audio, t0)
             except Exception:  # noqa: BLE001  (video without sound beats none)
                 pass
-    return n
 
 
 def clip_facts(mp4_path, jpg_path=None, at=1.0):
@@ -310,51 +315,33 @@ def clip_facts(mp4_path, jpg_path=None, at=1.0):
 
 
 def last_frame_jpeg(h264_path, jpg_path):
-    """Decode the stream and save its last picture (needs Pillow)."""
+    """Decode the stream and save its last picture; returns its (width,
+    height), or None without one."""
     import av
     img = None
     with av.open(h264_path, format="h264") as inp:
         for frame in inp.decode(video=0):
             img = frame.to_image()
     if img is None:
-        return False
+        return None
     img.save(jpg_path, quality=92)
-    return True
-
-
-def _sps(blob):
-    """The SPS NAL (bytes) of an access unit, or None."""
-    i = blob.find(b"\x00\x00\x01")
-    while i != -1 and i + 3 < len(blob):
-        if blob[i + 3] & 0x1F == 7:
-            j = blob.find(b"\x00\x00\x01", i + 3)
-            return blob[i + 3: j if j != -1 else len(blob)].rstrip(b"\x00")
-        i = blob.find(b"\x00\x00\x01", i + 3)
-    return None
+    return img.size
 
 
 def segments(tagged):
-    """Split frames where the SPS changes. The app starts the live view
-    in SD and switches the camera to HD a few seconds in (640x360 ->
-    1920x1080 at an IDR), and an MP4 track holds one resolution."""
+    """Split frames where the SPS changes. The camera starts each live
+    view in SD and switches to HD a few seconds in (640x360 -> 1920x1080
+    at an IDR), and an MP4 track holds one resolution."""
     segs, cur = [], None
     for t in tagged:
-        sps = _sps(t[3])
-        if sps is not None and sps != cur:
+        s = sps(t[3])
+        if s is not None and s != cur:
             segs.append([])
-            cur = sps
+            cur = s
         if not segs:
             segs.append([])
         segs[-1].append(t)
     return segs
-
-
-def _size(h264_path):
-    import av
-    with av.open(h264_path, format="h264") as inp:
-        for frame in inp.decode(video=0):
-            return frame.width, frame.height
-    return None
 
 
 def export(av_bin, outdir):
@@ -365,28 +352,25 @@ def export(av_bin, outdir):
     resolution is kept: the camera starts each session in SD for a few
     seconds before it switches to HD.
 
-    Returns {"mp4", "size", "seconds", "frames", "dropped", "frame",
-    "error"}; "mp4" is None when nothing decodable was found or the remux
-    failed ("error")."""
-    res = {"mp4": None, "size": None, "seconds": 0.0, "frames": 0,
-           "dropped": 0, "frame": None, "error": None}
+    Returns {"mp4", "size", "seconds", "error"}; "mp4" is None when
+    nothing decodable was found or the remux failed ("error")."""
+    res = {"mp4": None, "size": None, "seconds": 0.0, "error": None}
     every, audio = [], []
     # frame numbers restart with each session: assemble and dedupe per
     # session, then lay them end to end
     for recs in sessions(av_bin):
         every += [t for t in assemble(recs) if t[1] in VIDEO_CHANNELS]
-        audio += audio_frames(recs, float("-inf"), float("inf"))
+        audio += audio_frames(recs)
     tagged = decodable(every)
-    res["dropped"] = len(every) - len(tagged)
     if not tagged:
         return res
     segs = segments(tagged)
     span = {}
     for seg in segs:
-        sps = _sps(seg[0][3])
-        span[sps] = span.get(sps, 0) + seg[-1][0] - seg[0][0] + 0.05
+        s = sps(seg[0][3])
+        span[s] = span.get(s, 0) + seg[-1][0] - seg[0][0] + 0.05
     main = max(span, key=span.get)
-    frames = [t for seg in segs if _sps(seg[0][3]) == main for t in seg]
+    frames = [t for seg in segs if sps(seg[0][3]) == main for t in seg]
     os.makedirs(outdir, exist_ok=True)
     part = os.path.join(outdir, ".video.h264")
     mp4 = os.path.join(outdir, "video.mp4")
@@ -396,11 +380,8 @@ def export(av_bin, outdir):
         t0, t1 = frames[0][0], frames[-1][0]
         make_mp4(part, mp4, frames,
                  [a for a in audio if t0 - 0.5 <= a[0] <= t1 + 0.5])
-        res.update(mp4=mp4, size=_size(part), seconds=t1 - t0,
-                   frames=len(frames))
-        jpg = os.path.join(outdir, "frame.jpg")
-        if last_frame_jpeg(part, jpg):
-            res["frame"] = jpg
+        res.update(mp4=mp4, seconds=t1 - t0,
+                   size=last_frame_jpeg(part, os.path.join(outdir, "frame.jpg")))
     except Exception as e:  # noqa: BLE001
         res["error"] = repr(e)
     finally:

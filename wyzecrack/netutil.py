@@ -1,4 +1,6 @@
 """Small Linux networking helpers: iptables, route lookups."""
+import ipaddress
+
 from .changes import run
 
 
@@ -46,5 +48,33 @@ def default_gateway(iface):
 
 
 def is_local_address(ip):
-    out = run(["ip", "-4", "route", "get", ip]).stdout
-    return out.startswith("local ")
+    return route_get(ip).startswith("local ")
+
+
+def internet_iface():
+    """The interface of this host's internet route."""
+    try:
+        return iface_for("8.8.8.8")
+    except OSError:
+        raise SystemExit("this host has no internet route; is its network up?")
+
+
+def camera_iface(target, on_path=False):
+    """The interface the camera at `target` is on, after checking that it
+    is another host's IPv4 address on this host's LAN (unless this host
+    already carries its traffic: on_path) and on the interface of this
+    host's internet route. Raises SystemExit with the reason."""
+    try:
+        ipaddress.IPv4Address(target)
+    except ValueError:
+        raise SystemExit(f"--target must be an IPv4 address, not {target!r}")
+    if is_local_address(target):
+        raise SystemExit(f"{target} is this host's own address")
+    if not on_path and not on_link(target):
+        raise SystemExit(f"{target} is not on a LAN this host is attached to")
+    iface, inet = iface_for(target), internet_iface()
+    if iface != inet:
+        raise SystemExit(f"the camera is on {iface} but this host's internet "
+                         f"route is on {inet} (a VPN?); the camera's traffic "
+                         f"must leave through the interface it arrives on")
+    return iface

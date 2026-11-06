@@ -17,10 +17,12 @@ scope() of the one journal, and undo only what they did. A sysctl that two
 parts set is shared: the first part's saved value is kept, and it is put
 back when the last part that needs it is done.
 """
+import atexit
 import contextlib
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -223,28 +225,19 @@ class Changes:
                 return alias
         return None
 
-    def sysctl(self, path, value):
-        """Set a sysctl, recording its old value (or sharing the entry of a
-        part of this run that set it first)."""
-        p = Path(path)
-        with self._lock:
-            tok = self._share(p)
-            if tok is None:
-                old = p.read_text().strip()
-                tok = self.add("sysctl", path=str(p), value=old)
-                self._holders[tok] = {tok}
-            p.write_text(f"{value}\n")
-            return tok
-
-    def remember_sysctl(self, path):
-        """Record a sysctl's current value so it is restored, without
-        changing it (for values the kernel changes as a side effect)."""
+    def sysctl(self, path, value=None):
+        """Set a sysctl, recording its old value so it is put back (or
+        sharing the entry of a part of this run that recorded it first).
+        Without a value it is only recorded: for values the kernel changes
+        as a side effect."""
         p = Path(path)
         with self._lock:
             tok = self._share(p)
             if tok is None:
                 tok = self.add("sysctl", path=str(p), value=p.read_text().strip())
                 self._holders[tok] = {tok}
+            if value is not None:
+                p.write_text(f"{value}\n")
             return tok
 
 
@@ -266,11 +259,8 @@ class Scope:
     def add(self, kind, **item):
         return self._keep(self.parent.add(kind, **item))
 
-    def sysctl(self, path, value):
+    def sysctl(self, path, value=None):
         return self._keep(self.parent.sysctl(path, value))
-
-    def remember_sysctl(self, path):
-        return self._keep(self.parent.remember_sysctl(path))
 
     def _drop(self, tokens):
         tokens = set(tokens)
@@ -317,3 +307,28 @@ def replay(items):
                 print(f"[!] could not undo {DESCRIBE.get(item.get('kind'), str)(item)}: {e}")
                 failed.insert(0, item)
     return failed
+
+
+def keep_awake(why):
+    """Hold a sleep lock (systemd-inhibit) until the returned function is
+    called: a suspended host black-holes a camera it routes, and ends a
+    live view. Without systemd-inhibit it does nothing."""
+    exe = shutil.which("systemd-inhibit")
+    if not exe:
+        return lambda: None
+    # `tail --pid` also ends the lock when this process is killed outright
+    p = subprocess.Popen([exe, "--what=sleep:idle:handle-lid-switch",
+                          "--who=wyzecrack", f"--why={why}",
+                          "tail", f"--pid={os.getpid()}", "-f", "/dev/null"],
+                         start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def release():
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    atexit.register(release)
+    return release

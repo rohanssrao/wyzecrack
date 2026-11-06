@@ -41,7 +41,7 @@ import threading
 import time
 
 from .dtls import (HS_SH, HS_SHD, HS_SKE, RT_ALERT, RT_APPDATA, RT_CCS,
-                   RT_HANDSHAKE, BadRecord, DTLSLeg, ReplayWindow, Templates,
+                   RT_HANDSHAKE, BadRecord, DTLSClient, ReplayWindow,
                    derive_psk, parse_hs, parse_records)
 from .tutk import trans_code_blob, untrans_code_blob
 
@@ -70,7 +70,7 @@ OPEN_TIMEOUT = 30
 # A camera answers some sessions' AV login (or DTLS handshake) at once and
 # others only after 5-25 s, or never before it drops them at 30 s. Sessions
 # are slow independently of each other: of two opened together, one logged
-# in after 0.2 s and the other after 21 s (both v3s, 2026-11-05). So
+# in after 0.2 s and the other after 21 s (both v3s). So
 # open_first() starts a second session beside a slow one and keeps
 # whichever logs in first.
 HEDGE_AFTER = 2.0         # a second session if the first hasn't logged in
@@ -80,9 +80,6 @@ LOGIN_EVERY = 0.5         # the answer follows the first resend it takes
 # a camera that is on answers discovery within 0.1 s; one that is switched
 # off, offline, or set up again (a new key) never does
 DISCO_GIVE_UP = 10.0
-# a live view reconnects when the camera hangs up, and gives up after this
-# many sessions in a row without a picture (the page and `watch` both)
-RETRIES = 3
 HD_1080P, BITRATE_MAX = 1, 0xF0             # K10056 frame size 0 (+1), kbps
 ACK_EVERY = 0.1
 SILENT_AFTER = 6.0                          # camera quiet this long: gone
@@ -104,15 +101,34 @@ def disco_packet(key, sid, seq=0, ticket=0):
     return bytes(b) + hmac.new(key, bytes(b), hashlib.sha1).digest()
 
 
+def iotc(cmd, flags, body, mode=0x02):
+    """An older-framing packet before TransCode: header, then body."""
+    h = bytearray(16)
+    h[0:4] = bytes((0x04, 0x02, 0x1A, mode))
+    struct.pack_into("<HHHH", h, 4, len(body), 0, cmd, flags)
+    return bytes(h) + bytes(body)
+
+
+def iotc_disco(uid, authkey, sid, stage):
+    """An older-framing discovery packet (0x0601); stage 1 carries the
+    AuthKey."""
+    b = bytearray(72)
+    b[0:20] = uid
+    b[36:40] = IOTC_SDK_VERSION
+    b[40:48] = sid
+    b[48] = stage
+    if stage == 1:
+        b[58:66] = authkey
+    return iotc(IOTC_DISCO_REQ, 0x0021, b)
+
+
 def answers(ip, uid, enr, mac, iface, timeout=1.5):
     """True if the camera answers LAN discovery (in either framing), i.e.
     it is switched on and its P2P stack runs. The answer is read off an
     AF_PACKET socket, so no firewall rule is needed (the host firewall may
     then drop it)."""
-    from .rawnet import parse_udp, sniff, udp_filter
-    probe = Direct.__new__(Direct)        # just for the discovery packets
-    probe.uid, probe.authkey = uid.encode(), auth_key(enr, mac)
-    probe.sid = os.urandom(8)
+    from .rawnet import ip_from, parse_udp, sniff
+    uid, authkey, sid = uid.encode(), auth_key(enr, mac), os.urandom(8)
     got = threading.Event()
 
     def on(p):
@@ -127,13 +143,13 @@ def answers(ip, uid, enr, mac, iface, timeout=1.5):
             got.set()
 
     t = threading.Thread(target=sniff, daemon=True,
-                         args=(iface, udp_filter([ip]), parse_udp, on,
-                               got.is_set, timeout + 0.5))
+                         args=(iface, ip_from(ip, socket.IPPROTO_UDP),
+                               parse_udp, on, got.is_set, timeout + 0.5))
     t.start()
     time.sleep(0.1)                       # the sniffer is listening
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        pkts = (disco_packet(probe.uid + probe.authkey, probe.sid),
-                trans_code_blob(probe._iotc_disco(1)))
+        pkts = (disco_packet(uid + authkey, sid),
+                trans_code_blob(iotc_disco(uid, authkey, sid, 1)))
         for _ in range(3):
             for pkt in pkts:
                 s.sendto(pkt, (ip, DISCO_PORT))
@@ -216,8 +232,10 @@ def find_hl(data):
     return cmd, data[i + 16:i + 16 + n]
 
 
-def open_first(make, timeout=OPEN_TIMEOUT, stop=None, av_log=None, on_av=None,
-               resolution=HD_1080P):
+_STAGES = ["discovery", "DTLS handshake", "AV login", "logged in"]
+
+
+def open_first(make, timeout=OPEN_TIMEOUT, stop=None, av_log=None, on_av=None):
     """A session opened like Direct.open(), hedged: make(stop_event) returns
     a new Direct that gives up when stop_event is set. When the first
     hasn't logged in after HEDGE_AFTER s, a second runs beside it, and every
@@ -244,7 +262,7 @@ def open_first(make, timeout=OPEN_TIMEOUT, stop=None, av_log=None, on_av=None,
         except Exception as e:  # noqa: BLE001 - a bad packet ends this try only
             box["error"] = e
         if os.environ.get("WYZECRACK_DEBUG"):
-            d.log(f"[d] session {n} ended at the {d.stage()} after "
+            print(f"[d] session {n} gave up at the {d.stage()} after "
                   f"{time.monotonic() - t0:.1f} s"
                   + (f": {box['error']!r}" if "error" in box else ""))
         d.close()                     # lost or gave up: free its camera slot
@@ -289,23 +307,20 @@ def open_first(make, timeout=OPEN_TIMEOUT, stop=None, av_log=None, on_av=None,
     d.stop, d.tries = stop, len(tries)
     d.record(av_log, on_av)
     try:
-        d.finish(deadline, resolution)
+        d.finish(deadline)
     except BaseException:
         d.close()
         raise
     return d
 
 
-_STAGES = ["discovery", "DTLS handshake", "AV login", "logged in"]
-
 class Direct:
     """One live session with one camera. open() connects and authenticates;
     pump() then runs the session (call it in a loop); close() hangs up."""
 
-    def __init__(self, ip, uid, enr, mac, local_ip=None, on_av=None,
-                 av_log=None, log=print, stop=None, framing=None,
-                 disco_port=DISCO_PORT):
-        self.ip, self.enr, self.mac, self.log = ip, enr, mac, log
+    def __init__(self, ip, uid, enr, mac, local_ip=None, stop=None,
+                 framing=None, disco_port=DISCO_PORT):
+        self.ip, self.enr, self.mac = ip, enr, mac
         self.disco_port = disco_port          # another one only in tests
         self.known_framing = framing          # from a previous session
         self.stop = stop                      # threading.Event: give up
@@ -320,7 +335,7 @@ class Direct:
         self.sock.bind((local_ip or "0.0.0.0", 0))
         self.peer = (ip, disco_port)          # becomes the camera's P2P port
         self.sid, self.ticket = os.urandom(8), 0
-        self.leg = DTLSLeg("client", derive_psk(enr), Templates.embedded())
+        self.leg = DTLSClient(derive_psk(enr))
         self.av_seq = self.cmd_seq = self.ka_seq = self.ack_flags = 0
         self.rx_start = self.rx_end = 0xFFFF
         self.rx_init = False
@@ -329,12 +344,12 @@ class Direct:
         self.streaming = False                # set once open() is done
         self.next_ack = None                  # acking starts after login
         self.last_rx = time.monotonic()
-        self.on_av, self.av_f = None, None
-        self.record(av_log, on_av)
+        self.on_av = self.av_f = None         # see record()
+        self._on_disco = None                 # discovery answers, while waiting
         self.info = {}                        # the camera's K10003 JSON
         self.seen = ReplayWindow()            # the camera sends media twice
-        self.stats = {"rx": 0, "tx": 0, "bad_trailer": 0, "bad_record": 0,
-                      "duplicate": 0}
+        self.stats = {"rx": 0, "tx": 0, "ignored": 0, "bad_trailer": 0,
+                      "bad_record": 0, "duplicate": 0}
 
     @property
     def port(self):
@@ -365,29 +380,15 @@ class Direct:
         b[20:28] = self.sid
         return bytes(b) + self._trailer(bytes(b))
 
-    def _iotc(self, cmd, flags, body, mode=0x02):
-        """An older-framing packet before TransCode: header, then body."""
-        h = bytearray(16)
-        h[0:4] = bytes((0x04, 0x02, 0x1A, mode))
-        struct.pack_into("<HHHH", h, 4, len(body), 0, cmd, flags)
-        return bytes(h) + bytes(body)
-
     def _iotc_disco(self, stage):
-        b = bytearray(72)
-        b[0:20] = self.uid
-        b[36:40] = IOTC_SDK_VERSION
-        b[40:48] = self.sid
-        b[48] = stage
-        if stage == 1:
-            b[58:66] = self.authkey
-        return self._iotc(IOTC_DISCO_REQ, 0x0021, b)
+        return iotc_disco(self.uid, self.authkey, self.sid, stage)
 
     def _iotc_session(self):
         b = bytearray(36)
         b[0:20] = self.uid
         b[20:28] = self.sid
         struct.pack_into("<I", b, 32, int(time.time()) & 0xFFFFFFFF)
-        return self._iotc(IOTC_SESSION_REQ, 0x0033, b)
+        return iotc(IOTC_SESSION_REQ, 0x0033, b)
 
     def _iotc_data(self, payload, channel=0):
         b = bytearray(28)
@@ -426,7 +427,7 @@ class Direct:
         except (socket.timeout, BlockingIOError):
             return None
         if addr[0] != self.ip or len(data) < 16:
-            self.stats["ignored"] = self.stats.get("ignored", 0) + 1
+            self.stats["ignored"] += 1
             return None
         if data[:2] == b"\x51\xcc" and self.framing != "iotc":
             if len(data) < 48:
@@ -440,7 +441,7 @@ class Direct:
         elif self.framing != "cc51":
             data = untrans_code_blob(data)
             if data[:2] != b"\x04\x02":    # [2] is a version that varies
-                self.stats["ignored"] = self.stats.get("ignored", 0) + 1
+                self.stats["ignored"] += 1
                 return None
             kind = "iotc"
         else:
@@ -461,10 +462,10 @@ class Direct:
             # media.SESSION_MARK: frame numbers start over from here
             self.av_f.write(struct.pack("<BdI", 255, time.time(), 0))
 
-    def open(self, timeout=OPEN_TIMEOUT, resolution=HD_1080P):
+    def open(self, timeout=OPEN_TIMEOUT):
         deadline = time.monotonic() + timeout
         self.login(deadline)
-        self.finish(deadline, resolution)
+        self.finish(deadline)
         return self
 
     def login(self, deadline):
@@ -474,10 +475,10 @@ class Direct:
         self._handshake(deadline)
         self._av_login(deadline)
 
-    def finish(self, deadline, resolution=HD_1080P):
-        """Authenticate and pick the resolution; media flows from here."""
+    def finish(self, deadline):
+        """Authenticate and ask for 1080p; media flows from here."""
         self._authenticate(deadline)
-        self.command(K_RESOLUTION, bytes([resolution])
+        self.command(K_RESOLUTION, bytes([HD_1080P])
                      + struct.pack("<HH", BITRATE_MAX, 0), K_RESOLUTION_RESP)
         self.streaming = True
 
@@ -534,24 +535,28 @@ class Direct:
 
         self._on_disco = on
         self._until(deadline, "discovery", hello, lambda: "framing" in got)
-        self.framing = got["framing"]
-        if self.framing == "cc51":
+        if got["framing"] == "cc51":
+            self.framing = "cc51"
             self.ticket, self.sid = got["ticket"], got["sid"]
             self._until(deadline, "discovery",
                         lambda: self._send(self._disco(2)),
                         lambda: "done" in got)
         else:
+            # the v2 answers discovery whatever the key, but ignores a
+            # wrong key's session request: it has only answered once the
+            # session is set up (open_first gives up on it sooner then)
             self._send_iotc(self._iotc_disco(2))
             time.sleep(0.1)
-            self._until(deadline, "session",
+            self._until(deadline, "discovery",
                         lambda: self._send_iotc(self._iotc_session()),
                         lambda: "done" in got)
+            self.framing = "iotc"
         self._on_disco = None
 
     def _handshake(self, deadline):
-        self._flight = self.leg.client_hello()
+        self.leg.client_hello()
         self._until(deadline, "DTLS handshake",
-                    lambda: self._send_dtls(self._flight),
+                    lambda: self._send_dtls(self.leg.last_flight),
                     lambda: self.leg.handshake_done, every=1.0)
 
     def _av_login(self, deadline):
@@ -662,28 +667,23 @@ class Direct:
                 break
         if (self.leg.handshake_done
                 and time.monotonic() - self.last_rx > SILENT_AFTER):
-            if os.environ.get("WYZECRACK_DEBUG"):
-                print(f"[d] quiet: last packet {time.monotonic() - self.last_rx:.1f} s "
-                      f"ago, socket {self.sock.getsockname()}, peer {self.peer}")
             raise CameraGone("the camera went quiet")
 
     def _dispatch(self, kind, d):
         if kind == "iotc":
             cmd = struct.unpack_from("<H", d, 8)[0]
-            seen = self.stats.setdefault("iotc_cmds", {})
-            seen[hex(cmd)] = seen.get(hex(cmd), 0) + 1
             if cmd in (IOTC_DISCO_RES, IOTC_SESSION_RES):
-                if getattr(self, "_on_disco", None):
+                if self._on_disco:
                     self._on_disco(kind, d)
             elif cmd == IOTC_KEEPALIVE_RES and len(d) >= 24:
-                self._send_iotc(self._iotc(IOTC_KEEPALIVE_REQ, 0x0021,
-                                           d[16:24], mode=0x0A))
+                self._send_iotc(iotc(IOTC_KEEPALIVE_REQ, 0x0021, d[16:24],
+                                     mode=0x0A))
             elif cmd == IOTC_DATA_RX and len(d) > 28 and d[14] == 0:
                 self._records(d[28:])
             return
         cmd = struct.unpack_from("<H", d, 4)[0]
         if cmd == CMD_DISCO:
-            if getattr(self, "_on_disco", None):
+            if self._on_disco:
                 self._on_disco(kind, d)
         elif cmd == CMD_KEEPALIVE:
             self._send(self._keepalive())
@@ -700,7 +700,7 @@ class Direct:
                 if rtype == RT_HANDSHAKE:
                     self._server_flight(parse_hs(body))
                 elif rtype == RT_CCS:
-                    self.leg.client_on_ccs()
+                    self.leg.on_ccs()
                 continue
             if not self.seen.check(epoch, seq):
                 self.stats["duplicate"] += 1
@@ -713,21 +713,20 @@ class Direct:
                 self.stats["bad_record"] += 1     # drop it, keep the session
                 continue
             if rtype == RT_HANDSHAKE:
-                self.leg.client_on_fin(pt)
+                self.leg.on_fin(pt)
             elif rtype == RT_APPDATA:
                 self._app(pt)
 
     def _server_flight(self, msgs):
         if not msgs:
             return
-        flight = self.leg.client_on_server_flight(msgs)
+        flight = self.leg.on_server_flight(msgs)
         if flight:
-            self._flight = flight
             self._send_dtls(flight)
         elif (self.leg.state == "wait_cam_fin"
               and all(m[0] in (HS_SH, HS_SKE, HS_SHD) for m in msgs)):
             # the camera repeated its flight: ours was lost
-            self._send_dtls(self._flight)
+            self._send_dtls(self.leg.last_flight)
 
     def _app(self, pt):
         self._log_av(pt)
@@ -755,7 +754,7 @@ class Direct:
             try:
                 self.on_av(now, plaintext)
             except Exception as e:  # noqa: BLE001
-                self.log(f"[!] live view callback failed: {e!r}")
+                print(f"[!] live view callback failed: {e!r}")
 
     def _stop_media(self, wait=1.0):
         """Ask the camera to stop video and audio (K10010 off). Without it

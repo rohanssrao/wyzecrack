@@ -1,20 +1,108 @@
-"""Getting on the camera's path (router mode)."""
+"""Routing the camera through this host: for reading its key, and for
+copying its motion clips."""
+import atexit
 import shutil
 import subprocess
 import threading
 from pathlib import Path
 
-from . import rawnet
-from .changes import run
-from .netutil import default_gateway, ipt
+from . import keys, rawnet
+from .changes import keep_awake, run, signals_held
+from .netutil import camera_iface, default_gateway, ipt
+
+
+class Reroute:
+    """The camera routed through this host (OnPath) with its HTTPS read
+    (cloud.CloudTap): the key it sends is saved (keys.save), and with
+    events_dir set, so are its motion clips (on_motion hears each file).
+
+    start() sets it up and stop() undoes it, as does a `with` block. Every
+    change goes into `journal` (a Changes, or one of its scopes, whose
+    owner holds the single-instance lock). Both raise SystemExit with the
+    reason when the camera can't be routed."""
+
+    def __init__(self, journal, ip, mac=None, on_path=False, events_dir=None,
+                 on_motion=None):
+        self.journal, self.ip, self.mac = journal, ip, mac
+        self.on_path, self.events_dir = on_path, events_dir
+        self.on_motion = on_motion or (lambda p: print(f"[+] motion event: {p}"))
+        self.iface = self.gateway = None
+        self.tap = self.onpath = None
+        self.running = False
+        self.error = None          # why a capture in the page didn't start
+        self._awake = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        from .cloud import CloudTap
+        with self._lock:
+            if self.running:
+                return
+            atexit.register(self.stop)     # in case teardown is cut short
+            try:
+                self.iface = camera_iface(self.ip, self.on_path)
+                self.mac = self.mac or neighbor_mac(self.ip)
+                if not self.mac:
+                    raise SystemExit(f"{self.ip} does not answer on "
+                                     f"{self.iface}; is the camera on?")
+                # bind and check everything before touching the camera's route
+                self.tap = CloudTap(self.journal, self.ip,
+                                    events_dir=self.events_dir,
+                                    on_event=self.on_motion, on_key=self._key)
+                self.tap.listen()
+                self.onpath = OnPath(self.journal, self.ip, self.iface,
+                                     poison=not self.on_path)
+                self.gateway = self.onpath.gateway
+                self._awake = keep_awake("routing a camera")
+                self.onpath.start()
+                self.tap.start()
+                self.running = True
+            except BaseException:
+                self._teardown()
+                raise
+
+    def _key(self, info):
+        if info.get("mac") and keys.mac_key(info["mac"]) != keys.mac_key(self.mac):
+            print(f"[!] the ENR came from MAC {info['mac']}, but {self.ip} "
+                  f"is {self.mac}")
+        keys.save(self.mac, enr=info["enr"], model=info.get("model"),
+                  fw=info.get("fw"), hw=info.get("hw"))
+
+    def stop(self):
+        with self._lock:
+            self._teardown()
+
+    def _teardown(self):
+        with signals_held():
+            for part in (self.tap, self.onpath):
+                if part is None:
+                    continue
+                try:
+                    part.stop() if part is self.tap else part.close()
+                except Exception as e:  # noqa: BLE001
+                    print(f"[!] teardown step failed: {e!r}")
+            self.journal.undo_all()
+        if self._awake:
+            self._awake()
+        self.tap = self.onpath = self._awake = None
+        self.running = False
+        atexit.unregister(self.stop)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
 
 
 class OnPath:
     """Make this host the camera's router: ARP-poison only the camera (we
     become its gateway) and MASQUERADE its traffic out under our address.
 
-    Two-way poisoning (camera AND router) made the router route spoofed
-    camera packets that it had also bridged from WiFi to our port with
+    Two-way poisoning (camera AND router) made a home router route spoofed
+    camera packets that it had also bridged from Wi-Fi to our port with
     the identical 5-tuple; its fast path then sent them back to us with
     the camera's MAC (TTL -1 per bounce, a 25 us ping-pong) and kept doing
     so after the MITM stopped, black-holing that camera flow until the
@@ -42,7 +130,6 @@ class OnPath:
         self.stop = threading.Event()
         self.threads = []
         self.tokens = []
-        self.cam_mac = None
 
     def _rule(self, table, chain, *spec, insert=False):
         """Add an iptables rule unless an identical one exists, journaling
@@ -65,7 +152,7 @@ class OnPath:
         # back after ip_forward is
         for p in [*sorted(Path("/proc/sys/net/ipv4/conf").glob("*/forwarding")),
                   Path("/proc/sys/net/ipv4/conf/all/accept_redirects")]:
-            self.tokens.append(c.remember_sysctl(p))
+            self.tokens.append(c.sysctl(p))
         self.tokens.append(c.sysctl("/proc/sys/net/ipv4/ip_forward", 1))
         for dev in ("all", self.iface):
             # forwarding out the interface the packet came in on would
@@ -87,8 +174,7 @@ class OnPath:
 
     def _arp_start(self):
         me = rawnet.mac_bytes(rawnet.iface_mac(self.iface))
-        self.cam_mac = self._mac(self.cam_ip)
-        cam_mac = rawnet.mac_bytes(self.cam_mac)
+        cam_mac = rawnet.mac_bytes(self._mac(self.cam_ip))
         gw_mac = rawnet.mac_bytes(self._mac(self.gateway))
         # unicast to the camera only: "the gateway is at our MAC"
         lie = rawnet.arp_reply(me, cam_mac, self.gateway, me,

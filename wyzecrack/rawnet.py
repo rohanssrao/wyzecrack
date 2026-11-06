@@ -27,29 +27,13 @@ def _ip(addr):
     return struct.unpack("!I", socket.inet_aton(addr))[0]
 
 
-def udp_filter(hosts, dsts=()):
-    """BPF for IPv4 UDP frames whose source or destination is in `hosts`,
-    or whose destination is in `dsts`."""
+def ip_from(host, proto):
+    """BPF: IPv4 frames of this IP protocol (socket.IPPROTO_*) from host."""
     # (code, jt, jf, k); jumps are relative to the next instruction
-    tests = [(26, h) for h in hosts] + [(30, h) for h in (*hosts, *dsts)]
-    assert len(tests) < 100, "jump offsets are 8-bit"
-    prog = [(LD_H_ABS, 0, 0, 12),
-            (JEQ_K, 0, 0, ETH_P_IP),        # jf patched to DROP below
-            (LD_B_ABS, 0, 0, 23),
-            (JEQ_K, 0, 0, socket.IPPROTO_UDP)]
-    for off, addr in tests:
-        prog += [(LD_W_ABS, 0, 0, off), (JEQ_K, 0, 0, _ip(addr))]
-    prog += [(RET_K, 0, 0, DROP), (RET_K, 0, 0, ACCEPT)]
-    drop, accept = len(prog) - 2, len(prog) - 1
-    out = []
-    for i, (code, jt, jf, k) in enumerate(prog):
-        if code == JEQ_K:
-            if i in (1, 3):                     # wrong type/proto: drop
-                jt, jf = 0, drop - i - 1
-            else:                               # address match: accept
-                jt, jf = accept - i - 1, 0
-        out.append((code, jt, jf, k))
-    return out
+    return [(LD_H_ABS, 0, 0, 12), (JEQ_K, 0, 5, ETH_P_IP),
+            (LD_B_ABS, 0, 0, 23), (JEQ_K, 0, 3, proto),
+            (LD_W_ABS, 0, 0, 26), (JEQ_K, 0, 1, _ip(host)),
+            (RET_K, 0, 0, ACCEPT), (RET_K, 0, 0, DROP)]
 
 
 def arp_filter():

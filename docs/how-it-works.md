@@ -46,21 +46,19 @@ is rerouted. Step 5 turns what it records into video files.
    only that one: a TCP RST spoofed from the broker plus an iptables
    REJECT for the connection, both journaled. It repeats the reset each
    time the camera has reconnected, until the report arrives, at most 8
-   times. On v3 A that took 4 to 6 resets and 90 to 115 s; on the
-   v2 (4.9.9.3006) one reset, after which the camera
-   posted `set_device_info` with its ENR. The camera stays online apart
-   from a few seconds per reconnect, and live views are unaffected. The
-   nudge runs on the models it was tried on (`NUDGE_MODELS`: the v3 and
-   the v2).
+   times. On a v3 (4.36.17.21) that took 4 to 6 resets and 90 to 115 s;
+   on the v2 (4.9.9.3006) one or two, after which the camera posted
+   `set_device_info` with its ENR. The camera stays online apart from a
+   few seconds per reconnect, and live views are unaffected. The nudge
+   runs only on the models it was tried on (`TESTED_MODELS` in
+   `discover.py`: the v3 and the v2); others are waited for.
 
-   An earlier version cut all of the camera's traffic until it noticed.
-   That produced the report only when the burst of connection events
-   happened to overflow the buffer, and it left v3 C (4.36.16)
-   offline in the Wyze app for about half an hour and the v2 for over an
-   hour. The firmware also has a path for a network that stays
-   unavailable past a retry limit (`exceed_network_connection_retry_limit`
-   in `netChange_callback`): it plays a voice prompt
-   (`notify/CN/user_need_check.wav`) and resets the network.
+   Cutting all of the camera's traffic instead produced the report only
+   when the burst of connection events happened to overflow the buffer,
+   and left cameras offline in the Wyze app for half an hour or more. The
+   firmware also has a path for a network that stays unavailable past a
+   retry limit (`exceed_network_connection_retry_limit` in
+   `netChange_callback`): it plays a voice prompt and resets the network.
 
 3. **Ask Wyze for the UID** (`cloud.fetch_uid`). Wyze's device API
    authenticates a camera only by the `mac` and `enr` in the JSON body.
@@ -86,7 +84,9 @@ is rerouted. Step 5 turns what it records into video files.
      from the ENR alone (`dtls.py`);
    - the v2 frames the same session in ThroughTek's older IOTC format
      (0x0601/0x0402 to set it up, 0x0407/0x0408 for data), obfuscated with
-     TransCode (`tutk.py`);
+     TransCode (`tutk.py`). It answers discovery whatever the key, but
+     ignores a wrong key's session request, so the tool counts that
+     request as part of discovery;
    - inside: an AV login whose password is the ENR, the K10000/K10002
      challenge (XXTEA with the ENR), and K10056 for 1080p. The camera then
      streams H.264 and 8 kHz PCM, acknowledged every 100 ms.
@@ -111,7 +111,7 @@ is rerouted. Step 5 turns what it records into video files.
    doesn't answer discovery within 10 s is switched off, offline, or has a
    new key, and gets no second session. Before this, a quarter of single
    sessions to the v3s got no answer within 30 s and the median was about
-   8 s; with it, six views of v3 A started after 0.5 to 15 s
+   8 s; with it, six views of one v3 started after 0.5 to 15 s
    (median 4 s), none failing. The v2 wasn't affected (0.5 to 2.2 s).
 
    When the tool hangs up, it first switches the camera's video and audio
@@ -137,7 +137,7 @@ click to Stop is one recording: when the camera hangs up, the page opens a
 new session and records into the same capture, and the export joins the
 stretches (the picture holds still across the gap).
 
-**Motion clips** (`motion.py`), when turned on for a camera, are copied
+**Motion clips**, when turned on for a camera, are copied
 in the background for as long as the page is open: the camera is routed
 through this host (step 1) and its uploads are read (step 2), as with the
 `events` command. Several cameras can be captured at once, each with its

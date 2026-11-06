@@ -6,14 +6,13 @@ lists the Wyze cameras on the LAN; picking one plays its live view in the
 page (video decoded by the browser with WebCodecs, audio with WebAudio)
 and records it.
 
-The first time with a camera, the tool gets on its path to read its ENR
-off its HTTPS (resetting its MQTT connection until it reports in, see
-nudge.py), then asks Wyze for its UID with that ENR; both are cached.
-Every live view is a direct LAN session (direct.py): nothing on the
-network is changed.
+The first time with a camera, the tool reads its key (keys.camera_key);
+every live view is then a direct LAN session (view.py) that changes
+nothing on the network. Motion clips, when turned on for a camera, are
+copied for as long as the page is open (onpath.Reroute).
 
-The server runs in the main thread (asyncio); the session runs in a
-worker thread and reports through `events`.
+The server runs in the main thread (asyncio); a live view runs in a
+worker thread.
 """
 import asyncio
 import contextlib
@@ -21,20 +20,25 @@ import json
 import os
 import secrets
 import shutil
+import signal
+import socket
 import struct
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
-from . import events
-from .live import LiveAssembler, codec_string
+from aiohttp import web
+
+from . import keys
+from .keys import STATE_DIR, mac_key
 
 WEB = Path(__file__).parent / "web"
-STATE_DIR = Path(os.environ.get("WYZECRACK_STATE", "/var/lib/wyzecrack"))
+QUIT = web.AppKey("quit", asyncio.Event)
 MSG_VIDEO, MSG_AUDIO, MSG_JPEG = 1, 2, 3
+NO_ANSWER = ("Is it switched on in the Wyze app? A camera that is turned off "
+             "can't be watched. If it is on and was set up again in the Wyze "
+             "app, its key has changed.")
 
 
 # -- camera directory -----------------------------------------------------
@@ -49,21 +53,11 @@ def _save_camera(mac, **fields):
     """Remember the page's settings for a camera (its name, whether its
     motion clips are saved), keyed by MAC."""
     d = _names()
-    entry = d.get(_key(mac), {})
-    entry.update(fields)
-    d[_key(mac)] = entry
+    d.setdefault(mac_key(mac), {}).update(fields)
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = STATE_DIR / "cameras.json.tmp"
     tmp.write_text(json.dumps(d, indent=1) + "\n")
     os.replace(tmp, STATE_DIR / "cameras.json")
-
-
-def _save_name(mac, name, ip=None):
-    _save_camera(mac, name=name.strip()[:60], ip=ip)
-
-
-def _key(mac):
-    return mac.replace(":", "").upper()
 
 
 def _slug(text):
@@ -80,8 +74,9 @@ class Library:
         # anywhere above the captures root would otherwise refuse every file
         self.root = Path(root).resolve()
 
-    def camera_dir(self, mac, name):
-        return self.root / f"{_slug(name)}-{_key(mac)[-6:]}"
+    def camera_dir(self, cam):
+        name = cam.get("name") or cam.get("model") or "camera"
+        return self.root / f"{_slug(name)}-{mac_key(cam['mac'])[-6:]}"
 
     def recordings(self, mac=None):
         out = []
@@ -90,7 +85,7 @@ class Library:
                 m = json.loads(meta.read_text())
             except (OSError, ValueError):
                 continue
-            if mac and _key(m.get("mac", "")) != _key(mac):
+            if mac and mac_key(m.get("mac", "")) != mac_key(mac):
                 continue
             d = meta.parent
             if not (d / "video.mp4").exists():
@@ -104,7 +99,7 @@ class Library:
         out = []
         for d in self.root.glob("*/events/*/"):
             cam = d.parent.parent.name
-            if mac and not cam.endswith(_key(mac)[-6:]):
+            if mac and not cam.endswith(mac_key(mac)[-6:]):
                 continue
             clip, snap = d / "clip.mp4", d / "snapshot.jpg"
             if not clip.exists() and not snap.exists():
@@ -113,7 +108,7 @@ class Library:
                 seconds = json.loads((d / "meta.json").read_text()).get("seconds")
             except (OSError, ValueError):
                 seconds = None
-            out.append({"id": d.name, "t": d.stat().st_mtime,
+            out.append({"t": d.stat().st_mtime,
                         "clip": self.url(clip) if clip.exists() else None,
                         "snapshot": self.url(snap) if snap.exists() else None,
                         "seconds": seconds})
@@ -136,25 +131,22 @@ class Library:
         return p if p.is_relative_to(self.root) and p.is_file() else None
 
 
-# -- the armed session, in a worker thread --------------------------------
+# -- the live view, in a worker thread ------------------------------------
 class Controller:
     def __init__(self, hub, library, journal):
         self.hub, self.lib = hub, library
         self.journal = journal       # the page's Changes; parts take scopes
-        self.captures = {}           # MAC -> motion.MotionCapture
+        self.captures = {}           # MAC -> onpath.Reroute saving clips
         self._cap_lock = threading.RLock()
         self._paused = None          # MAC whose capture stepped aside
-        self._view_since = None
         self.thread = None
         self.stop = threading.Event()
         self.state = {"phase": "idle"}
         self.camera = None
-        self.live = None
-        self.jpeg = None            # jpegfeed.JpegFeed while a page wants it
-        self.live_stats = {}
-        self.saving = []            # export threads still running
-        self.uid = int(os.environ.get("SUDO_UID", os.getuid()))
-        self.gid = int(os.environ.get("SUDO_GID", os.getgid()))
+        self.jpeg = None             # jpegfeed.JpegFeed while a page wants it
+        self.codec = None            # of the stream the page decodes
+        self.since = None            # when this view's first picture came
+        self.saving = []             # export threads still running
 
     # state shown to the page
     def set(self, **kw):
@@ -186,189 +178,78 @@ class Controller:
         steps[name] = {"status": status, "detail": detail}
         self.set(steps=steps)
 
-    def _on_event(self, ev):
-        k = ev["kind"]
-        if k == "enr":
-            st = ev.get("stats") or {}
-            if ev["state"] in ("waiting", "nudging"):
-                prev = (self.state.get("steps") or {}).get("enr") or {}
-                detail = {"seen": st.get("intercepted", 0) if st else
-                          (prev.get("detail") or {}).get("seen", 0),
-                          "resets": st.get("resets", 0),
-                          "nudging": ev["state"] == "nudging"}
-                self._step("enr", "active", detail)
-            elif ev["state"] == "refused":
-                self._step("enr", "problem", {"refused": st.get("tls_failed")})
-            else:
-                self._step("enr", "done", {"how": "cached" if ev.get("cached")
-                                           else "harvested"})
-        elif k == "uid":
-            status = {"active": "active", "done": "done"}.get(ev["state"],
-                                                              "problem")
-            self._step("uid", status, {"detail": ev.get("detail")})
-
     def _run(self):
-        from .cli import _give_to_user
-        unsub = events.subscribe(self._on_event)
+        from .cli import give_to_user
         cam = self.camera
-        cam_dir = self.lib.camera_dir(cam["mac"], cam.get("name") or cam["model"])
+        cam_dir = self.lib.camera_dir(cam)
         started = time.time()
         try:
-            enr, uid = self._key(cam, cam_dir)
-            if self.stop.is_set() or not enr:
-                return
-            if uid:
-                self._watch(cam, cam_dir, enr, uid)
-            else:
-                detail = ((self.state.get("steps") or {}).get("uid") or {}).get(
-                    "detail") or {}
-                self.set(phase="error", error="Wyze didn't hand out this "
-                         "camera's ID, which watching it needs"
-                         + (f" ({detail.get('detail')})" if detail.get("detail")
-                            else "") + ". Try again later.")
+            # reading a key routes the camera through this host on its
+            # own: a motion capture of the same camera steps aside
+            paused = (self._capture_paused(cam["mac"])
+                      if not keys.cached(cam["mac"]).get("enr")
+                      else contextlib.nullcontext())
+            with paused:
+                got = keys.camera_key(self.journal, cam["ip"], cam["mac"],
+                                      stop=self.stop, on_step=self._step,
+                                      events_dir=cam_dir / "events",
+                                      on_motion=self._motion)
+            if got and not self.stop.is_set():
+                self._watch(cam, cam_dir, *got)
         except SystemExit as e:
             self.set(phase="error", error=str(e.code or e))
         except Exception as e:  # noqa: BLE001
             self.set(phase="error", error=f"{type(e).__name__}: {e}")
         finally:
-            unsub()
             if cam_dir.exists():
-                _give_to_user(cam_dir.parent, started)
+                give_to_user(cam_dir.parent, started)
             if self.state.get("phase") != "error":
                 self.set(phase="idle", since=None)
             self.hub.send_json({"kind": "library"})
 
-    def _key(self, cam, cam_dir):
-        """(enr, uid) for the camera: cached, or read once while on its
-        path (motion clips it uploads meanwhile are saved too)."""
-        from .cli import (Armed, _cached_enr, _cached_uid, obtain_key,
-                          uid_from_wyze)
-        from .cloud import CloudError
-        mac = cam["mac"]
-        enr, uid = _cached_enr(mac), _cached_uid(mac)
-        if enr:
-            self._step("enr", "done", {"how": "cached"})
-        if enr and uid:
-            self._step("uid", "done")
-            return enr, uid
-        if enr:
-            self._step("uid", "active")
-            try:
-                uid = uid_from_wyze(cam["ip"], mac, enr)
-                self._step("uid", "done")
-                return enr, uid
-            except CloudError as e:
-                self._step("uid", "problem", {"detail": str(e)})
-                return enr, None
-        args = SimpleNamespace(target=cam["ip"], on_path=False, enr=None,
-                               reharvest=False, events_dir=cam_dir / "events")
-        armed = Armed(args, cam_dir, harvest=True, changes=self.journal.scope())
-        armed.stop = self.stop
-        armed.on_motion = self._motion
-        self._step("enr", "active", {"seen": 0})
-        with self._capture_paused(mac), armed:
-            return obtain_key(armed, args)
-
     def _watch(self, cam, cam_dir, enr, uid):
-        """The live view straight from the camera until Stop. When the
-        camera hangs up it reconnects; everything from the click to Stop
-        is one recording."""
-        from .changes import signals_held
-        from .cli import (_cached, _inhibit_sleep, _release_inhibitor,
-                          _remember_framing)
-        from .direct import RETRIES, CameraGone, Direct, open_firewall, open_first
-        from .netutil import local_ip_for
-        failures = 0                 # attempts in a row without a picture
-        any_video = False
+        """The live view until Stop: everything from the click to Stop is
+        one recording, reconnects included."""
+        from .view import watch
         out = cam_dir / time.strftime("%Y%m%d-%H%M%S")
         out.mkdir(parents=True, exist_ok=True)
-        self._new_live(view_start=True)
-        sleep_lock = _inhibit_sleep("showing a live view")
-        try:
-            while not self.stop.is_set():
+        self.since = None
+
+        def status(kind, **info):
+            if kind == "connecting":
+                self._new_stream()
                 self.set(phase="connecting")
-                scope = self.journal.scope()
-                d, why = None, ""
-                framing = _cached(cam["mac"]).get("framing")
-
-                def make(stop, scope=scope, framing=framing):
-                    s = Direct(cam["ip"], uid, enr, cam["mac"],
-                               local_ip=local_ip_for(cam["ip"]), stop=stop,
-                               framing=framing)
-                    open_firewall(scope, cam["ip"], s.port)
-                    return s
-
-                try:
-                    t0 = time.monotonic()
-                    d = open_first(make, stop=self.stop, on_av=self._on_av,
-                                   av_log=str(out / "av.bin"))
-                    _remember_framing(cam["mac"], d)
-                    print(f"[+] live from {cam['ip']} after "
-                          f"{time.monotonic() - t0:.1f} s"
-                          + (f" ({d.tries} sessions tried)" if d.tries > 1 else ""))
-                    while not self.stop.is_set():
-                        d.pump(0.3)
-                except (CameraGone, ValueError, OSError) as e:
-                    # ValueError: a DTLS handshake that went wrong; OSError:
-                    # no route (the host's network is still coming up)
-                    print(f"[*] {e}")
-                    why = str(e)
-                finally:
-                    if d:
-                        d.close()
-                    with signals_held():
-                        scope.undo_all()
-                had_video = self.live_stats.get("frames", 0) > 0
-                any_video = any_video or had_video
-                if self.stop.is_set():
-                    break
-                failures = 0 if had_video else failures + 1
-                # no answer at all to a first try: switched off, offline, or
-                # a new key; trying again won't change that
-                if failures >= RETRIES or ("(discovery)" in why and not any_video):
-                    self.set(phase="error", error_kind="no_answer",
-                             error="Is it switched on in the Wyze app? A "
-                                   "camera that is turned off can't be "
-                                   "watched. If it is on and was set up again "
-                                   "in the Wyze app, its key has changed.")
-                    break
+            elif kind == "retry":
                 self.hub.send_json({"kind": "toast", "text":
                                     "The camera hung up · reconnecting"
-                                    if had_video else "Trying again…"})
-                self._new_live()     # the next stream starts afresh
-                self.stop.wait(1.5)
+                                    if info["hung_up"] else "Trying again…"})
+            elif kind == "gave_up":
+                self.set(phase="error", error_kind="no_answer", error=NO_ANSWER)
+
+        try:
+            watch(self.journal, cam["ip"], cam["mac"], enr, uid,
+                  str(out / "av.bin"), self.stop, on_video=self._video,
+                  on_audio=self._audio, on_status=status)
         finally:
-            _release_inhibitor(sleep_lock)
-            self._session_end(out, any_video)
+            self._new_stream()
+            self._session_end(out)
 
     # live media -> the page
-    def _new_live(self, view_start=False):
-        if view_start:
-            self._view_since = None
+    def _new_stream(self):
+        """A new session: its stream starts at its own key frame."""
         if self.jpeg:
-            self.jpeg.close()       # the next stream starts at its own key frame
+            self.jpeg.close()
             self.jpeg = None
-        self.live = LiveAssembler(on_video=self._video, on_audio=self._audio)
-        self.live_stats = {"frames": 0, "size": None, "codec": None}
-
-    def _on_av(self, ts, plaintext):
-        if self.live:
-            self.live.feed(ts, plaintext)
+        self.codec = None
 
     def _video(self, f):
         if self.state.get("phase") != "live":
             # the page's recording timer runs from the view's first picture
-            self._view_since = self._view_since or time.time()
-            self.set(phase="live", since=self._view_since)
-        st = self.live_stats
-        codec = codec_string(f.sps)
-        size = self.live.size
-        if f.key and (codec != st["codec"] or size != st["size"]):
-            st["codec"], st["size"] = codec, size
-            self.hub.send_json({"kind": "video_config", "codec": codec,
-                                "width": size[0] if size else None,
-                                "height": size[1] if size else None})
-        st["frames"] += 1
+            self.since = self.since or time.time()
+            self.set(phase="live", since=self.since)
+        if f.key and f.codec != self.codec:
+            self.codec = f.codec
+            self.hub.send_json({"kind": "video_config", "codec": f.codec})
         self.hub.send_bytes(struct.pack(">BBd", MSG_VIDEO, f.key, f.t) + f.data,
                             audience="h264")
         if self.hub.jpeg:
@@ -381,9 +262,8 @@ class Controller:
     def _audio(self, ts, pcm):
         self.hub.send_bytes(struct.pack(">Bd", MSG_AUDIO, ts) + pcm)
 
-    def _session_end(self, out, had_video):
-        self._new_live()
-        if not had_video:
+    def _session_end(self, out):
+        if self.since is None:            # no picture: nothing to keep
             shutil.rmtree(out, ignore_errors=True)
             return
         t = threading.Thread(target=self._save, args=(out,), daemon=True)
@@ -391,7 +271,7 @@ class Controller:
         t.start()
 
     def _save(self, out):
-        from .cli import _give_to_user
+        from .cli import give_to_user
         from .media import export
         self.hub.send_json({"kind": "saving"})
         started = time.time()
@@ -409,15 +289,10 @@ class Controller:
             shutil.rmtree(out, ignore_errors=True)
             return
         (out / "av.bin").unlink()
-        cam = self.camera or {}
-        meta = {"mac": cam.get("mac"), "ip": cam.get("ip"),
-                "camera": cam.get("name") or cam.get("model"),
-                "started": out.stat().st_mtime,
-                "seconds": round(r["seconds"], 1),
-                "width": r["size"][0] if r["size"] else None,
-                "height": r["size"][1] if r["size"] else None}
+        meta = {"mac": (self.camera or {}).get("mac"),
+                "started": out.stat().st_mtime, "seconds": round(r["seconds"], 1)}
         (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
-        _give_to_user(out.parent, started - 600)
+        give_to_user(out.parent, started - 600)
         self.hub.send_json({"kind": "library", "new": self.lib.url(out / "video.mp4")})
 
     # -- motion clips, in the background -------------------------------
@@ -425,25 +300,20 @@ class Controller:
         """Turn saving a camera's motion clips on or off (remembered)."""
         _save_camera(cam["mac"], motion=bool(on), ip=cam.get("ip"))
         with self._cap_lock:
-            if on and not self._in_use(cam["mac"]):
+            if on and self._paused != mac_key(cam["mac"]):
                 self._start_capture(cam)
             elif not on:
                 self._stop_capture(cam["mac"])
         self._send_captures()
-
-    def _in_use(self, mac):
-        """The camera's key is being read right now (its capture
-        resumes by itself afterwards)."""
-        return self._paused == _key(mac)
 
     def ensure_captures(self, cams):
         """Start the captures turned on for cameras found on the LAN (and
         follow a camera to a new address)."""
         with self._cap_lock:
             for cam in cams:
-                if not cam.get("motion") or self._in_use(cam["mac"]):
+                if not cam.get("motion") or self._paused == mac_key(cam["mac"]):
                     continue
-                c = self.captures.get(_key(cam["mac"]))
+                c = self.captures.get(mac_key(cam["mac"]))
                 if c and c.running and c.ip == cam["ip"]:
                     continue
                 if c:
@@ -452,27 +322,24 @@ class Controller:
         self._send_captures()
 
     def _start_capture(self, cam):
-        from .motion import MotionCapture
-        key = _key(cam["mac"])
+        from .onpath import Reroute
+        key = mac_key(cam["mac"])
         if key in self.captures and self.captures[key].running:
             return
-        cam_dir = self.lib.camera_dir(cam["mac"], cam.get("name") or cam.get("model") or "camera")
-        c = MotionCapture(self.journal, cam["ip"], cam["mac"],
-                          cam_dir / "events", self._motion)
+        c = Reroute(self.journal.scope(), cam["ip"], cam["mac"],
+                    events_dir=self.lib.camera_dir(cam) / "events",
+                    on_motion=self._motion)
         self.captures[key] = c
         try:
             c.start()
-            c.error = None
             print(f"[+] saving {cam['ip']}'s motion clips")
-        except SystemExit as e:
-            c.error = str(e.code or e)
-            print(f"[!] can't save {cam['ip']}'s motion clips: {c.error}")
-        except Exception as e:  # noqa: BLE001
-            c.error = f"{type(e).__name__}: {e}"
+        except (SystemExit, Exception) as e:  # noqa: BLE001
+            c.error = str(e.code or e) if isinstance(e, SystemExit) \
+                else f"{type(e).__name__}: {e}"
             print(f"[!] can't save {cam['ip']}'s motion clips: {c.error}")
 
     def _stop_capture(self, mac):
-        c = self.captures.pop(_key(mac), None)
+        c = self.captures.pop(mac_key(mac), None)
         if c:
             c.stop()
 
@@ -487,10 +354,10 @@ class Controller:
         return c.running or self._paused == key
 
     def capture_status(self, mac):
-        c = self.captures.get(_key(mac))
+        c = self.captures.get(mac_key(mac))
         if not c:
             return None
-        return "on" if self._capturing(_key(mac), c) else "error"
+        return "on" if self._capturing(mac_key(mac), c) else "error"
 
     def _send_captures(self):
         self.hub.send_json({"kind": "captures", "captures": {
@@ -499,21 +366,21 @@ class Controller:
 
     @contextlib.contextmanager
     def _capture_paused(self, mac):
-        """Getting a camera's key routes it through this host on its own; a
-        motion capture of the same camera steps aside."""
+        """Stop the camera's motion capture for the duration (a key read
+        routes the camera itself), then start it again."""
         with self._cap_lock:
-            c = self.captures.get(_key(mac))
+            c = self.captures.get(mac_key(mac))
             paused = bool(c and c.running)
             if paused:
                 c.stop()
-                self._paused = _key(mac)
+                self._paused = mac_key(mac)
         try:
             yield
         finally:
             if paused:
                 with self._cap_lock:
                     self._paused = None
-                    if self.captures.get(_key(mac)) is c:
+                    if self.captures.get(mac_key(mac)) is c:
                         try:
                             c.start()
                         except (SystemExit, Exception) as e:  # noqa: BLE001
@@ -523,10 +390,10 @@ class Controller:
     def _motion(self, path):
         print(f"[+] motion event: {path}")
         if path.name == "clip.mp4":
-            self.hub.send_json({"kind": "motion",
-                                "clip": self.lib.url(path),
-                                "snapshot": self.lib.url(path.with_name("snapshot.jpg"))
-                                if path.with_name("snapshot.jpg").exists() else None})
+            snap = path.with_name("snapshot.jpg")
+            self.hub.send_json({"kind": "motion", "clip": self.lib.url(path),
+                                "snapshot": self.lib.url(snap)
+                                if snap.exists() else None})
 
 
 # -- the web server ---------------------------------------------------------
@@ -586,24 +453,19 @@ class Hub:
 
 
 def _cameras(lib):
-    from .cli import _cached_enr, _cached_uid
     from .discover import describe, find_cameras
-    from .netutil import default_gateway, iface_for
-    iface = iface_for("8.8.8.8")
+    from .netutil import default_gateway, internet_iface
+    iface = internet_iface()
     gw = default_gateway(iface)
     names = _names()
     out = []
-    known = [v.get("ip") for v in names.values()]
-    for ip, mac in find_cameras(iface, known):
-        d = describe(ip, mac, gw)
-        out.append({"ip": ip, "mac": mac, **d,
-                    "name": names.get(_key(mac), {}).get("name"),
-                    "key_known": bool(_cached_enr(mac)),
-                    "ready": bool(_cached_enr(mac) and _cached_uid(mac)),
-                    "motion": bool(names.get(_key(mac), {}).get("motion")),
-                    "online": None,
-                    "thumb": lib.thumb(mac),
-                    "recordings": len(lib.recordings(mac))})
+    for ip, mac in find_cameras(iface, [v.get("ip") for v in names.values()]):
+        known, saved = keys.cached(mac), names.get(mac_key(mac), {})
+        out.append({"ip": ip, "mac": mac, **describe(ip, mac, gw),
+                    "name": saved.get("name"), "motion": bool(saved.get("motion")),
+                    "key_known": bool(known.get("enr")),
+                    "ready": bool(known.get("enr") and known.get("uid")),
+                    "online": None, "thumb": lib.thumb(mac)})
     _check_online([c for c in out if c["ready"]], iface)
     return out
 
@@ -612,13 +474,13 @@ def _check_online(cams, iface):
     """Mark which ready cameras answer on the LAN (in parallel, ~1.5 s): a
     camera that is switched off in the Wyze app, or offline, can't be
     watched."""
-    from .cli import _cached_enr, _cached_uid
     from .direct import answers
 
     def one(c):
+        known = keys.cached(c["mac"])
         try:
-            c["online"] = answers(c["ip"], _cached_uid(c["mac"]),
-                                  _cached_enr(c["mac"]), c["mac"], iface)
+            c["online"] = answers(c["ip"], known["uid"], known["enr"], c["mac"],
+                                  iface)
         except OSError:
             c["online"] = None
     threads = [threading.Thread(target=one, args=(c,)) for c in cams]
@@ -629,8 +491,6 @@ def _check_online(cams, iface):
 
 
 def make_app(token, hub, ctl, lib):
-    from aiohttp import web
-
     @web.middleware
     async def auth(request, handler):
         # the link carries a one-time token; it becomes a cookie, so the
@@ -664,16 +524,14 @@ def make_app(token, hub, ctl, lib):
                                   "capturing": ctl.capture_status(body["mac"])})
 
     async def rekey(request):
-        from .cli import _forget_key
         body = await request.json()
         if ctl.busy():
             return web.json_response({"error": "busy"}, status=409)
-        _forget_key(body["mac"])
+        keys.forget_enr(body["mac"])
         return web.json_response({"ok": True})
 
     async def start(request):
-        cam = await request.json()
-        if not ctl.start(cam):
+        if not ctl.start(await request.json()):
             return web.json_response({"error": "already running"}, status=409)
         return web.json_response({"ok": True})
 
@@ -683,7 +541,8 @@ def make_app(token, hub, ctl, lib):
 
     async def name(request):
         body = await request.json()
-        _save_name(body["mac"], body["name"], body.get("ip"))
+        _save_camera(body["mac"], name=body["name"].strip()[:60],
+                     ip=body.get("ip"))
         return web.json_response({"ok": True})
 
     async def library(request):
@@ -699,7 +558,7 @@ def make_app(token, hub, ctl, lib):
 
     async def quit_(request):
         ctl.request_stop()
-        request.app["quit"].set()
+        request.app[QUIT].set()
         return web.json_response({"ok": True})
 
     async def ws(request):
@@ -724,7 +583,7 @@ def make_app(token, hub, ctl, lib):
         return sock
 
     app = web.Application(middlewares=[auth])
-    app["quit"] = asyncio.Event()
+    app[QUIT] = asyncio.Event()
     app.add_routes([
         web.get("/", index), web.get("/api/cameras", cameras),
         web.post("/api/start", start), web.post("/api/stop", stop),
@@ -735,37 +594,6 @@ def make_app(token, hub, ctl, lib):
         web.static("/assets", WEB),
     ])
     return app
-
-
-class _Tee:
-    def __init__(self, stream, f):
-        self.stream, self.f = stream, f
-
-    def write(self, data):
-        try:
-            self.f.write(time.strftime("%H:%M:%S ") + data if data.strip()
-                         else data)
-            self.f.flush()
-        except OSError:
-            pass
-        return self.stream.write(data)
-
-    def flush(self):
-        self.stream.flush()
-
-    def __getattr__(self, name):
-        return getattr(self.stream, name)
-
-
-def _tee(path):
-    """Keep what the terminal shows in a log next to the recordings, for
-    working out what happened later."""
-    try:
-        f = open(path, "a")
-    except OSError:
-        return
-    f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} wyzecrack started\n")
-    sys.stdout = _Tee(sys.stdout, f)
 
 
 def open_browser(url):
@@ -791,29 +619,25 @@ def open_browser(url):
 
 
 def serve(listen="127.0.0.1", port=0, out="captures", browser=True):
-    from aiohttp import web
-    import socket as _socket
+    from .changes import Changes, signals_held
     token = secrets.token_urlsafe(18)
     hub = Hub()
     lib = Library(out)
     lib.root.mkdir(parents=True, exist_ok=True)
-    _tee(lib.root / "wyzecrack.log")
-    from .changes import Changes, signals_held
     journal = Changes()
     journal.acquire()            # one wyzecrack at a time; replays a crash's
     ctl = Controller(hub, lib, journal)
     app = make_app(token, hub, ctl, lib)
-    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    sock.bind((listen, port or 0))
-    host = listen if listen != "0.0.0.0" else _socket.gethostname()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((listen, port))
+    host = listen if listen != "0.0.0.0" else socket.gethostname()
     url = f"http://{host}:{sock.getsockname()[1]}/?t={token}"
 
     async def main():
         hub.loop = asyncio.get_running_loop()
-        import signal as _signal
-        for sig in (_signal.SIGINT, _signal.SIGTERM, _signal.SIGHUP):
-            hub.loop.add_signal_handler(sig, app["quit"].set)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            hub.loop.add_signal_handler(sig, app[QUIT].set)
         runner = web.AppRunner(app, handle_signals=False)
         await runner.setup()
         site = web.SockSite(runner, sock)
@@ -824,7 +648,7 @@ def serve(listen="127.0.0.1", port=0, out="captures", browser=True):
         else:
             print("  Open that link in a browser. Ctrl-C here quits.\n")
         try:
-            await app["quit"].wait()
+            await app[QUIT].wait()
             print("[*] stopping, putting the camera's network back...")
             ctl.request_stop()
             for _ in range(300):          # let the session tear down

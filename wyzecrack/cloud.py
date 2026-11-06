@@ -11,8 +11,8 @@ the camera's requests:
 
 - the ENR, the per-camera secret the DTLS PSK is derived from, in the JSON
   body of its POSTs to api.wyzecam.com and device-api.wyzecam.com (at
-  boot, on motion alarms, in the metrics report it sends after its
-  internet connection comes back, and every few hours);
+  boot, on motion alarms, and in its metrics report, which nudge.py makes
+  it send);
 - motion events: for each alarm the camera PUTs a snapshot (jpg) and a
   12 s clip (mp4, H.264 + A-law audio) to cpl-t-sightsafe.wyzecam.com via
   pre-signed URLs, with no encryption beyond TLS.
@@ -119,7 +119,6 @@ uL5ChFWOQU+ErSDnUq7yr+pjBQ==
 
 
 SO_ORIGINAL_DST = 80
-INTERCEPT_PORT = 0           # any free port (several taps can run at once)
 DEBUG = bool(os.environ.get("WYZECRACK_DEBUG"))
 # PUT /<MAC>/<date>/<alarm id>_<alarm ms>_<n>_<file type>_<n>/<uuid>_<n>.<ext>,
 # <n> 1 from the v3 (cpl-t-sightsafe.wyzecam.com), -1 from the v2 (S3)
@@ -366,58 +365,50 @@ class CloudTap:
 
     Connections whose SNI is a *.wyzecam.com name are terminated with an
     eMudhra-chained leaf and relayed to the real server under the same
-    SNI; all others are relayed as raw TCP. `enr_found` is set when an
-    ENR is seen; with events_dir set, motion-event uploads are saved
-    there as <time>_<id>/clip.mp4 and snapshot.jpg.
+    SNI; all others are relayed as raw TCP. When an ENR is first seen,
+    on_key(device_info) hears it and `enr_found` is set; with events_dir
+    set, motion-event uploads are saved there as <time>_<id>/clip.mp4 and
+    snapshot.jpg, and on_event(path) hears each file.
 
     listen() binds (do it before going on-path), start() installs the
     redirect, stop() removes it."""
 
-    def __init__(self, changes, cam_ip, port=INTERCEPT_PORT, events_dir=None,
-                 on_event=None):
-        self.changes = changes
-        self.cam_ip, self.port = cam_ip, port
+    def __init__(self, changes, cam_ip, events_dir=None, on_event=None,
+                 on_key=None):
+        self.changes, self.cam_ip = changes, cam_ip
         self.events_dir = Path(events_dir) if events_dir else None
-        self.on_event = on_event
+        self.on_event, self.on_key = on_event, on_key
         self.enr_found = threading.Event()
-        self.enr = self.mac = None
-        self.device = {}           # model/fw/hw from the ENR's request
-        self.events = []
-        self.stats = {"connections": 0, "intercepted": 0, "passed": 0,
-                      "tls_failed": 0}
-        self.hosts = {}
+        self.enr = None
+        self.stats = {"intercepted": 0, "passed": 0, "tls_failed": 0}
         self.refused = set()       # non-Wyze hosts whose leaf the camera refused
-        self._work = tempfile.mkdtemp(prefix="wyzecrack-certs-")
+        self.port = None
+        self._contexts = {}        # host -> server context with its leaf
+        self._work = None          # where the leaves are written
         self._ctx_lock = threading.Lock()
         self._tokens = []
         self._srv = None
 
     def _ctx_for(self, host):
         with self._ctx_lock:
-            ctx = self.hosts.get(host)
+            ctx = self._contexts.get(host)
             if ctx is None:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(*mint_leaf(host, self._work))
-                self.hosts[host] = ctx
+                self._contexts[host] = ctx
             return ctx
 
     def listen(self):
+        self._work = tempfile.mkdtemp(prefix="wyzecrack-certs-")
+        # any free port, so that several cameras can be read at once
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind(("0.0.0.0", self.port))
-        except OSError as e:
-            srv.close()
-            raise SystemExit(f"TCP port {self.port} is busy ({e.strerror})")
+        srv.bind(("0.0.0.0", 0))
         srv.listen(32)
-        # port 0: any free one, so that several cameras can be read at once
         self.port = srv.getsockname()[1]
         self._srv = srv
         threading.Thread(target=self._accept, daemon=True).start()
 
     def start(self):
-        if self._srv is None:
-            self.listen()
         for table, chain, spec in (
                 ("nat", "PREROUTING", ["-s", self.cam_ip, "-p", "tcp",
                                        "--dport", "443", "-j", "REDIRECT",
@@ -444,7 +435,8 @@ class CloudTap:
                 pass
             self._srv.close()
             self._srv = None
-        shutil.rmtree(self._work, ignore_errors=True)
+        if self._work:
+            shutil.rmtree(self._work, ignore_errors=True)
 
     def _accept(self):
         while True:
@@ -481,7 +473,6 @@ class CloudTap:
 
     def _handle(self, c):
         up = None
-        self.stats["connections"] += 1
         try:
             dst = original_dst(c)
             if dst[1] == self.port or is_local(dst[0]):
@@ -514,11 +505,10 @@ class CloudTap:
             raw = socket.create_connection(dst, timeout=15)
             up = cctx.wrap_socket(raw, server_hostname=sni)
             _pump(tc, up, RequestTap(self._on_request))
-        except (OSError, ssl.SSLError, ValueError) as e:
+        except (OSError, ssl.SSLError, ValueError):
             if DEBUG:
                 import traceback
                 traceback.print_exc()
-            self.stats["errors"] = self.stats.get("errors", 0) + 1
         finally:
             for s in (c, up):
                 try:
@@ -534,8 +524,12 @@ class CloudTap:
         if not self.enr_found.is_set():
             info = device_info(body)
             if info:
-                self.enr, self.mac = info["enr"], info.get("mac")
-                self.device = {k: info[k] for k in DEVICE_FIELDS if k in info}
+                self.enr = info["enr"]
+                if self.on_key:
+                    try:
+                        self.on_key(info)
+                    except Exception as e:  # noqa: BLE001 (keep reading)
+                        print(f"[!] couldn't save the camera's key: {e!r}")
                 self.enr_found.set()
         if method == "PUT" and self.events_dir is not None and body:
             name = event_name(path)
@@ -545,7 +539,6 @@ class CloudTap:
                 (d / name[1]).write_bytes(body)
                 if name[1] == "clip.mp4":
                     _describe_clip(d)
-                self.events.append(d / name[1])
                 if self.on_event:
                     self.on_event(d / name[1])
 

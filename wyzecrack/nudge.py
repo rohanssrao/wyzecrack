@@ -17,9 +17,9 @@ traffic (live views included) is untouched. The internet cuts used
 before produced a report only when their burst of events happened to
 overflow the buffer.
 
-Live on v3 A (fw 4.36.17.21): the report came after 4 to 6
-resets. On a Wyze Cam v2 (4.9.9.3006, MQTT in its separate iotclient
-process) one reset was enough: within seconds the camera posted
+Live on a v3 (fw 4.36.17.21) the report came after 4 to 6 resets. On a
+Wyze Cam v2 (4.9.9.3006, MQTT in its separate iotclient process) one or
+two resets were enough: within seconds the camera posted
 set_device_info, with its ENR, to api.wyzecam.com.
 
 A reset is a TCP RST sent to the camera as if from the broker, with the
@@ -33,21 +33,12 @@ import struct
 import threading
 import time
 
-from .rawnet import (ACCEPT, DROP, JEQ_K, LD_B_ABS, LD_H_ABS, LD_W_ABS,
-                     PACKET_OUTGOING, RET_K, _ip, open_raw)
+from .rawnet import PACKET_OUTGOING, ip_from, open_raw
 
 DEBUG = bool(os.environ.get("WYZECRACK_DEBUG"))
 MQTT_PORT = 8883
 SETTLE = 5          # s after a reconnect: let it publish (that logs metrics)
 MAX_RESETS = 8      # each adds ~1 KB; the buffer holds 5 KB
-
-
-def tcp_from(host):
-    """BPF: IPv4 TCP frames from host."""
-    return [(LD_H_ABS, 0, 0, 12), (JEQ_K, 0, 5, 0x0800),
-            (LD_B_ABS, 0, 0, 23), (JEQ_K, 0, 3, socket.IPPROTO_TCP),
-            (LD_W_ABS, 0, 0, 26), (JEQ_K, 0, 1, _ip(host)),
-            (RET_K, 0, 0, ACCEPT), (RET_K, 0, 0, DROP)]
 
 
 def mqtt_segment(frame):
@@ -96,8 +87,8 @@ class MqttNudge:
 
     STALE = 30          # s: a connection this quiet is gone
 
-    def __init__(self, changes, cam_ip, iface, log=print):
-        self.changes, self.cam, self.iface, self.log = changes, cam_ip, iface, log
+    def __init__(self, changes, cam_ip, iface):
+        self.changes, self.cam, self.iface = changes, cam_ip, iface
         self.stop = threading.Event()
         self.resets = 0
         self.failed = None            # why it gave up, if it did
@@ -127,7 +118,7 @@ class MqttNudge:
 
     def _run(self):
         try:
-            sock = open_raw(self.iface, tcp_from(self.cam))
+            sock = open_raw(self.iface, ip_from(self.cam, socket.IPPROTO_TCP))
             raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         except OSError as e:
             self.failed = f"can't watch the camera's traffic ({e})"
@@ -150,8 +141,8 @@ class MqttNudge:
                     if c is None:
                         c = live[port] = [broker, None, now, now]
                         if DEBUG:
-                            self.log(f"[d] {time.strftime('%T')} MQTT connection "
-                                     f"from port {port}{' (new)' if syn else ''}")
+                            print(f"[d] {time.strftime('%T')} MQTT connection "
+                                  f"from port {port}{' (new)' if syn else ''}")
                     c[0], c[3] = broker, now
                     if ack is not None:
                         c[1] = ack
@@ -176,9 +167,9 @@ class MqttNudge:
                     live.clear()
                     last_round = now
                     self.resets += 1
-                    self.log(f"[*] resetting the camera's cloud connection "
-                             f"({self.resets}/{MAX_RESETS}) so it reports in"
-                             + (f" [{time.strftime('%T')}]" if DEBUG else ""))
+                    print(f"[*] resetting the camera's cloud connection "
+                          f"({self.resets}/{MAX_RESETS}) so it reports in"
+                          + (f" [{time.strftime('%T')}]" if DEBUG else ""))
         finally:
             self._release()
             sock.close()

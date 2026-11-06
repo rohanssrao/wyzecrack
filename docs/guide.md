@@ -27,7 +27,7 @@ the network has one Wyze device, and asks which one when it has several;
     `captures/watch-<time>`).
   - `--reharvest` reads the camera's key again, for a camera that was set
     up again in the Wyze app.
-  - `--enr <ENR>` uses this key instead of reading it.
+  - `--enr <ENR>` uses this key, and saves it, instead of reading it.
 - `wyzecrack events` saves motion clips until Ctrl-C; `--count <n>` stops
   after that many, `--out <dir>` sets where.
 - `wyzecrack cleanup` undoes the network changes of a wyzecrack that was
