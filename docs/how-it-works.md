@@ -171,6 +171,15 @@ for two cameras on the path) is put back when the last one is done.
 
 ## Safety
 
+The tool only acts on the camera you pick. Watching opens a session to
+that camera alone and reroutes nothing. A camera is routed through this
+host only for its first-time key read, for a splice, or while you have
+turned on saving its motion clips. It never pre-connects to the other
+cameras to save start time: a v3 that is slow to answer is waited for.
+To show which cameras are switched off, the picker sends each camera
+that has a saved key a few discovery packets, stopping once it answers;
+they change nothing on the camera.
+
 Every change to the host (iptables rules, the policy route, sysctls, the
 camera's ARP entry) is written to a journal in `/run/wyzecrack/` before
 it is made. However the tool exits, including Ctrl-C (once or repeatedly),
