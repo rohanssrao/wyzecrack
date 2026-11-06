@@ -2,7 +2,7 @@
 
 Watch and record Wyze cameras on a local network without authentication.
 
-wyzecrack exploits unpatched Wyze cam (v2 and v3) firmwares that still trust eMudhra intermediate CAs. It MITMs the camera and its cloud traffic to sniff its key and UID and connects directly to it to stream its feed.
+wyzecrack exploits unpatched Wyze cam (v2 and v3) firmwares that still trust eMudhra intermediate CAs. It MITMs the camera to sniff its master secret, asks the Wyze cloud for its UID, and connects directly to it to stream its feed.
 
 ## Get started
 
@@ -15,12 +15,10 @@ uv tool install git+https://github.com/rohanssrao/wyzecrack
 wyzecrack
 ```
 
-wyzecrack will open a page in your browser.
-Pick a camera to watch it live.
+wyzecrack will open in your browser. Pick a camera to watch it live.
 
-Picking a camera for the first time takes a minute or two, sometimes up
-to four, as wyzecrack routes that camera through your computer with ARP spoofing and reads the
-camera's key from what the camera sends to Wyze. The camera reconnects to
+Watching a camera for the first time takes a few minutes as wyzecrack routes that camera through your computer with ARP spoofing and reads the
+camera's key (ENR) from what it sends to Wyze. The camera reconnects to
 Wyze a few times meanwhile, and its network goes back to normal
 afterwards. From then on, live views start within seconds.
 
