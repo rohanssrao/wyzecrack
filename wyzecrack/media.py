@@ -1,10 +1,12 @@
-"""Reassemble decrypted TUTK/Wyze AV media from a splice av.bin capture.
+"""Reassemble the decrypted TUTK/Wyze AV media of a session's av.bin.
 
-av.bin entry format (written by dtls.SpliceEngine): "<BdI" = direction byte
-(0 = phone->camera, 1 = camera->phone), capture timestamp (double),
-payload length (u32 LE), then the decrypted DTLS application-data record.
+av.bin entry format (written by direct.Direct): "<BdI" = direction byte
+(0 = to the camera, 1 = from the camera, 255 = a new session starts),
+capture timestamp (double), payload length (u32 LE), then the decrypted
+DTLS application-data record. (Captures from older versions, which
+spliced the Wyze app's live views, have the same format.)
 
-Camera->phone media records (first byte 0x0c) carry a 36-byte header:
+Media records from the camera (first byte 0x0c) carry a 36-byte header:
 
   [0]     0x0c magic
   [1]     frame type: 0x08/0x09 start, 0x00/0x04 cont, 0x01/0x05 end
@@ -75,7 +77,7 @@ def g711_to_pcm(data, codec):
 
 
 def parse_media(p):
-    """Camera->phone media record -> (ch, frame_no, cidx, payload, end,
+    """Media record from the camera -> (ch, frame_no, cidx, payload, end,
     count), or None for anything else. `count` is the frame's packet
     count (chunks 0..count-2 plus the end packet). The end packet's chunk
     index comes back as 0xFFFF so it sorts last; a 0x0028 marker there
@@ -282,7 +284,7 @@ def _mux_audio(out, stream, audio, t0):
 def make_mp4(h264_path, mp4_path, frames, audio=None):
     """Remux the Annex-B stream into an MP4 without re-encoding, giving
     each frame its arrival time as its timestamp, so playback runs at
-    true speed (relay delivery is bursty, so a fixed frame rate would
+    true speed (delivery is bursty, so a fixed frame rate would
     stretch quiet gaps and compress bursts).
 
     frames: the [(t, ch, frame_no, blob, ended)] list that produced
@@ -312,7 +314,7 @@ def make_mp4(h264_path, mp4_path, frames, audio=None):
             idx = (bisect_right(starts, pkt.pos) - 1 if pkt.pos is not None
                    and pkt.pos >= 0 else i)
             ts = round((frames[min(max(idx, 0), len(frames) - 1)][0] - t0) * tb)
-            # relay bursts deliver frames microseconds apart; give each at
+            # bursts deliver frames microseconds apart; give each at
             # least 10 ms on screen (the burst catches up at the next gap)
             ts = max(ts, last + tb // 100)
             last = ts

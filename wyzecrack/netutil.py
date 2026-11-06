@@ -1,8 +1,4 @@
-"""Small Linux networking helpers: iptables/ip wrappers, route lookups,
-and conntrack over netlink (pyroute2)."""
-import errno
-import socket
-
+"""Small Linux networking helpers: iptables, route lookups."""
 from .changes import run
 
 
@@ -10,14 +6,6 @@ def ipt(*a):
     # -w: wait for the xtables lock instead of failing when Docker,
     # firewalld or fail2ban hold it
     return run(["iptables", "-w", *a])
-
-
-def ip_cmd(*a):
-    return run(["ip", *a])
-
-
-def ipt_restore(blob):
-    return run(["iptables-restore", "-w", "--noflush"], input=blob)
 
 
 def route_get(dst):
@@ -60,43 +48,3 @@ def default_gateway(iface):
 def is_local_address(ip):
     out = run(["ip", "-4", "route", "get", ip]).stdout
     return out.startswith("local ")
-
-
-_CT = [None]
-
-
-def ensure_conntrack():
-    """Open the netlink conntrack socket at startup: the latch-time NAT
-    handoff needs it, and failing then would be too late."""
-    from pyroute2 import Conntrack
-    try:
-        ct = Conntrack()
-        ct.count()
-    except Exception as e:  # noqa: BLE001
-        raise SystemExit(f"conntrack netlink unavailable ({e}); is the "
-                         f"nf_conntrack_netlink module loaded?")
-    _CT[0] = ct
-    return ct
-
-
-def conntrack_delete(src, sport, dst, dport, proto=socket.IPPROTO_UDP):
-    """Delete the conntrack entry whose original direction is
-    src:sport -> dst:dport. Best-effort: a missing entry is normal, and a
-    failure here must never skip the splice's rule cleanup."""
-    from pyroute2.netlink.exceptions import NetlinkError
-    from pyroute2.netlink.nfnetlink.nfctsocket import NFCTAttrTuple
-    ct = _CT[0]
-    if ct is None:
-        return False
-    try:
-        ct.entry("del", tuple_orig=NFCTAttrTuple(
-            saddr=src, daddr=dst, proto=proto, sport=int(sport),
-            dport=int(dport)))
-        return True
-    except NetlinkError as e:
-        if e.code != errno.ENOENT:
-            print(f"[!] conntrack delete failed: {e}")
-        return False
-    except Exception as e:  # noqa: BLE001
-        print(f"[!] conntrack delete failed: {e}")
-        return False

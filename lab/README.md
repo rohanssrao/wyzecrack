@@ -1,66 +1,34 @@
 # Lab
 
-The lab is a network-namespace replica of a home LAN as it looks once
-`wyzecrack run` has made itself the camera's router. It tests the splice
-end to end without a camera or phone:
+A network-namespace copy of a home LAN, for testing wyzecrack end to end
+without a camera:
 
-    cam 10.99.0.20 --(L2)-- mid 10.99.0.10 (wyzecrack --on-path) --(L2)-- gw 10.99.0.1 (NAT) -- relays 203.0.113.x
+    cam 10.99.0.20 --(L2)-- mid 10.99.0.10 (wyzecrack) --(L2)-- gw 10.99.0.1 (NAT) -- internet 203.0.113.x
 
-The camera's default route points at `mid`, and `mid` NATs its traffic. On
-a real LAN, the camera-only ARP poison plus MASQUERADE produce the same
-result.
+The camera's default route points at `mid`, as it does on a real LAN once
+the tool has made itself the camera's router, and `mid` NATs its traffic.
 
-- `lab_peers.py` plays the camera and the phone behind the relay, with real
-  DTLS and format-exact 0xCC51 wrappers modeled on live relay captures.
-- `lab_api.py` plays the Wyze cloud, plus the camera's ENR-bearing POST and
-  motion-clip upload.
+- `lab_watch.sh` runs `tests/fakecam.py` as the camera and `wyzecrack watch`
+  in `mid`, with the camera's key saved beforehand. It passes when the view
+  went live and was recorded, hanging up switched the camera's video and
+  audio off (K10010), and no firewall rule or journal is left in `mid`.
+- `lab_onpath.sh` runs `wyzecrack events` in `mid` while `lab_api.py` plays
+  the camera's HTTPS calls and the Wyze cloud (203.0.113.3). It passes when
+  the ENR and both motion clips (one uploaded the way a v3 does, one the
+  way a v2 does) were read, a name the tool must not read passed through
+  untouched, and nothing is left in `mid` however the tool exited.
+- `arp_check.sh` checks the ARP step: the camera's gateway entry points at
+  `mid` while armed and back at the real gateway afterwards.
 
 Run as root on Linux, from the repo, after `uv sync`:
 
-    sudo bash lab/lab_run.sh direct      # control: no splice, peers talk through the kernel
-    sudo bash lab/lab_run.sh splice      # the same session through wyzecrack
-    sudo MULTIPATH=1 bash lab/lab_run.sh splice
-                                         # phone's ClientHello arrives via the STUN relay as 0x1402
-    sudo FAIL_FIRST=1 CAM_IGNORE_FIRST_CH=1 DUR=30 bash lab/lab_run.sh splice
-                                         # first attempt fails at the camera; the app retries on a new relay port
-    sudo DIE_FIRST=1 DUR=30 bash lab/lab_run.sh splice
-                                         # camera closes the spliced channel early; the app retries elsewhere
-    sudo MEDIA_PPS=250 bash lab/lab_run.sh splice   # throughput
-    sudo HARVEST=1 bash lab/lab_run.sh splice       # no --enr: harvest it from the camera's HTTPS
-                                                    # first, and save its motion-clip upload
-    sudo KILL_AT=6 KILL_SIG=TERM bash lab/lab_run.sh splice
-                                         # signal the tool mid-session (TERM, HUP, INT2 =
-                                         # Ctrl-C twice, KILL = then `cleanup`)
-    sudo bash lab/lab_watch.sh           # direct mode: `watch` against a fake camera
-    sudo FRAMING=iotc bash lab/lab_watch.sh
-                                         # the v2's older framing
-    sudo LOGIN_DELAY=4 bash lab/lab_watch.sh
-                                         # a camera slow to take the AV login
-    sudo QUIET_AFTER=3 SECS=30 bash lab/lab_watch.sh
-                                         # the camera drops off mid-view
-    sudo KILL_AT=5 KILL_SIG=TERM bash lab/lab_watch.sh
-                                         # signal `watch` mid-view (TERM, INT, KILL = then `cleanup`)
-    sudo bash lab/arp_check.sh           # the ARP step: camera-only poison, then restore
-    sudo bash lab/labsuite.sh            # all of the above; one PASS/FAIL line each in
-                                         # /tmp/wslab-suite.txt
+    sudo bash lab/labsuite.sh            # everything; one PASS/FAIL line each in /tmp/wslab-suite.txt
+    sudo bash lab/lab_watch.sh           # one view; FRAMING=iotc for the v2's framing,
+                                         # LOGIN_DELAY=4 for a slow camera, QUIET_AFTER=3 SECS=30
+                                         # for a camera that drops off mid-view
+    sudo bash lab/lab_onpath.sh          # the key and clips; KILL_AT=2 KILL_SIG=TERM|HUP|INT2|KILL
+                                         # signals the tool instead (INT2 = Ctrl-C twice,
+                                         # KILL = then `wyzecrack cleanup`)
     sudo bash lab/debian-check.sh        # unit tests + suite on stock Debian 12 (podman/docker)
 
-After every splice run, the lab checks that the tool left nothing behind in
-the `mid` namespace: no TPROXY/REDIRECT/FORWARD rules, policy route,
-`accept_local` or journal.
-
-A run passes when:
-
-- both peers report `handshake_done`;
-- the phone's `media_ok` equals `expected_media`, with `media_bad` 0;
-- each side sees only the other's real address in `srcs`.
-
-A run that was signalled mid-session only has to leave nothing behind.
-Captures and logs land in `/tmp/wslab-out`. `lab_run.sh` captures the
-`mid` box with `tcpdump` (override with `TCPDUMP=`).
-
-`lab_watch.sh` runs `tests/fakecam.py` as the camera in the `cam`
-namespace and `wyzecrack watch` in `mid`, with the camera's key saved
-beforehand. It passes when the view went live and was recorded, hanging up
-switched the camera's video and audio off (K10010), and no firewall rule
-or journal is left in `mid`.
+Logs land in `/tmp/wslab-out`.

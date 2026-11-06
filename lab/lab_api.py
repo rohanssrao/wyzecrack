@@ -1,12 +1,14 @@
-"""Fake Wyze cloud for the harvest/event scenario.
+"""Fake Wyze cloud for the on-path scenarios (lab_onpath.sh).
 
   server: TLS on 203.0.113.3:443 with a self-signed cert; answers every
           request with a small JSON body and records each request's SNI
           to $OUT/api-sni.txt
   client: the camera's calls, trusting the eMudhra intermediate the way
           the real camera's stale store does: POSTs {"mac", "enr"} to
-          api.wyzecam.com, then PUTs a motion clip to
-          cpl-t-sightsafe.wyzecam.com (saved to $OUT/sent-clip.mp4)
+          api.wyzecam.com, PUTs a motion clip to cpl-t-sightsafe.wyzecam.com
+          the way a v3 does and another to the S3 alarm bucket the way a v2
+          does (saved to $OUT/sent-clip.mp4), then checks that a name the
+          tool must not read passes through untouched
 """
 import datetime as dt
 import hashlib
@@ -26,6 +28,9 @@ ENR = "gekMdn0XjZoWF/mD"
 OUT = os.environ.get("OUT", "/tmp/wslab-out")
 CLIP_PATH = ("/D03F27A1B2C3/2026-01-01/D03F27A1B2C3011767225700_1767225700381_1_2_0/"
              "00112233445566778899aabbccddeeff_1.mp4?Policy=x&Signature=y")
+# a v2 (4.9.9.3006) names its uploads with _-1 and sends them to S3
+V2_CLIP_PATH = ("/2CAA8ED4E5F6/2026-01-01/2CAA8ED4E5F6021767225800_1767225800810_2_2_0/"
+                "fedcba9876543210fedcba9876543210_-1.mp4?X-Amz-Algorithm=x")
 
 
 def server(seconds):
@@ -94,14 +99,18 @@ def client():
             b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
     clip = b"\x00\x00\x00\x18ftypmp42" + os.urandom(300_000)
     open(f"{OUT}/sent-clip.mp4", "wb").write(clip)
-    put = (b"PUT %s HTTP/1.1\r\nHost: cpl-t-sightsafe.wyzecam.com\r\n"
-           b"Content-Type:application/octet-stream\r\nContent-Length: %d\r\n\r\n"
-           % (CLIP_PATH.encode(), len(clip))) + clip
+    def put(host, path):
+        return (b"PUT %s HTTP/1.1\r\nHost: %s\r\n"
+                b"Content-Type:application/octet-stream\r\nContent-Length: %d\r\n\r\n"
+                % (path.encode(), host.encode(), len(clip))) + clip
+    v2_bucket = "c-t-usw2.s3.us-west-2.amazonaws.com"
     replies = []
     step = "post"
     try:
         for host, req in (("api.wyzecam.com", post),
-                          ("cpl-t-sightsafe.wyzecam.com", put)):
+                          ("cpl-t-sightsafe.wyzecam.com",
+                           put("cpl-t-sightsafe.wyzecam.com", CLIP_PATH)),
+                          (v2_bucket, put(v2_bucket, V2_CLIP_PATH))):
             step = host
             with ctx.wrap_socket(socket.create_connection(ADDR, timeout=10),
                                  server_hostname=host) as t:

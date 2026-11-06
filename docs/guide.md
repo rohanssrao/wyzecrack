@@ -1,115 +1,92 @@
 # wyzecrack guide
 
-## Options
+## The page
 
-`watch`:
+`wyzecrack` opens it in your browser. Chrome, Edge and Brave play the
+full 1080p stream; a browser that can't decode H.264 itself gets still
+frames instead (720p, about 10 a second). Options:
 
-- `--target <ip>` names the camera (default: find it).
-- `--seconds <n>` stops after that long (default: until Ctrl-C).
-- `--out <dir>` sets the capture directory (default:
-  `captures/watch-<time>`).
-- `--no-video` skips the MP4 export.
-- `--enr <ENR>` supplies the camera's ENR instead of harvesting it.
-- `--reharvest` ignores the saved ENR and ID and gets them again.
-- `--no-nudge` doesn't reset the camera's connection to Wyze to make it
-  send its ENR; it waits for the camera to report in on its own.
-- `--harvest-timeout <seconds>` stops waiting for the ENR after that many
-  seconds.
+- `--listen <address>` serves it on another address (a tailnet address,
+  say) so you can watch from another device.
+- `--no-browser` prints the link instead of opening it.
+- `--out <dir>` sets where recordings go (default `./captures`).
+- `--port <n>` picks the port (default: any free one).
 
-`key` takes the same options as `watch`, apart from `--seconds`, `--out`
-and `--no-video`. The ENR and ID are saved in
-`/var/lib/wyzecrack/enr.json`.
+## Commands
 
-`run`:
+For scripts and headless hosts. Each one finds the camera by itself when
+the network has one Wyze device, and asks which one when it has several;
+`--target <camera ip>` skips the search.
 
-- `--target <ip>` names the camera (default: find it).
-- `--out <dir>` sets the capture directory (default: `captures/<time>`).
-- `--keep-going` splices every live view until Ctrl-C (default: stop after
-  the first).
-- `--enr <ENR>` supplies the camera's ENR instead of harvesting it.
-- `--reharvest` ignores the cached ENR.
-- `--harvest-timeout <seconds>` stops waiting for the ENR after that many
-  seconds.
-- `--no-nudge` doesn't reset the camera's connection to Wyze to make it
-  send its ENR.
-- `--no-events` leaves motion-event uploads alone.
-- `--no-video` skips the MP4 export.
-- `--on-path` skips the ARP step. Use it on a host that already carries the
-  camera's traffic on the camera's LAN interface (the lab does this).
-- `--journal` also logs all key material.
-- `--pass-through` diverts the session without decrypting it, as an A/B
-  control.
+- `wyzecrack watch` records the live view until Ctrl-C.
+  - `--seconds <n>` stops after that long.
+  - `--out <dir>` sets the capture directory (default
+    `captures/watch-<time>`).
+  - `--no-video` keeps only `av.bin` (no MP4 export).
+- `wyzecrack key` reads and saves a camera's key and ID. The page and
+  `watch` do this by themselves the first time.
+  - `--reharvest` reads them again, for a camera that was set up again in
+    the Wyze app.
+  - `--enr <ENR>` uses this key instead of reading it.
+  - `--no-nudge` waits for the camera to report its key on its own instead
+    of resetting its connection to Wyze.
+  - `--harvest-timeout <seconds>` gives up waiting for the key.
 
-`events` takes `--target`, `--on-path`, `--out` and `--count N` (stop after
-N clips).
+  `watch` takes these options too.
+- `wyzecrack events` saves motion clips until Ctrl-C; `--count <n>` stops
+  after that many, `--out <dir>` sets where.
+- `wyzecrack find` lists the Wyze devices on the network (`--iface` picks
+  the interface).
+- `wyzecrack check` checks that this computer can reroute the camera,
+  without touching it.
+- `wyzecrack cleanup` undoes the network changes of a wyzecrack that was
+  killed.
+- `wyzecrack extract <capture>` rebuilds the video from a capture's
+  `av.bin`.
 
-`find` takes `--iface`.
+Keys and camera IDs are saved in `/var/lib/wyzecrack/enr.json`.
 
-`check` takes `--target`.
+## Files
 
-## Output files
-
-`captures/<time>/` is owned by the user who invoked sudo.
+A live view's directory:
 
 | file | contents |
 |---|---|
-| `video.mp4`, `frame.jpg` | the decrypted live view at true speed (its HD part), and its last frame |
-| `video-640x360.mp4` | the SD start of the live view, before the app switches to HD |
-| `events/<time>_<id>/` | `clip.mp4` and `snapshot.jpg` for each motion event uploaded during the run |
-| `video.h264` | the raw Annex-B stream |
-| `av.bin` | every decrypted DTLS application record, both directions |
-| `splice.log` | engine milestones (handshakes, phone frame ACKs) |
-| `interpose.log` | every wrapper seen and sent, timestamped |
-| `journal.jsonl` | with `--journal`: key material and crypto decisions |
+| `video.mp4` | the live view in HD at true speed, with sound |
+| `video-640x360.mp4` | the first seconds, before the camera switches to HD (when they last 2 s or more) |
+| `frame.jpg` | the last picture |
+| `video.h264` | the raw H.264 stream |
+| `av.bin` | everything the camera sent, decrypted; `extract` rebuilds the video from it |
 
-With `--keep-going`, a capture can hold several live views. Each one's
-video goes to `session-N/`.
+A motion event's directory (`events/<time>_<id>/`) holds `clip.mp4`,
+`snapshot.jpg` and `meta.json` (the clip's length). The v2 uploads no
+snapshot, so its still is taken from the clip.
 
-`scripts/postmortem.py <capture dir>` summarizes a run from these files.
+Files are owned by the user who started wyzecrack.
 
 ## Troubleshooting
 
-- **"Connecting to the camera" takes a while, or "the camera did not
-  answer (AV login)":** Wyze cameras leave some new sessions waiting for
-  up to 30 s, at random. After 2 s the tool opens a second session
-  beside a slow one and keeps whichever gets in first, so most views start
-  within a few seconds; the page tries again if neither does
-  ([why](how-it-works.md)).
-- **The page says the camera doesn't answer, but it's switched on:** if
-  it was set up again in the Wyze app, its key changed. **Get its key
-  again** in the page reads the new one (the first-time step again).
-- **"the camera did not answer (discovery)":** the camera is off (switched
-  off in the Wyze app, or on a schedule) or unplugged. A camera that is
-  turned off stops all its P2P traffic, so it can't be watched.
-- **"Wyze did not return a UID":** the Wyze cloud refused the camera's
-  key, or changed this call. `wyzecrack run` still works: it catches a
-  live view that the Wyze app opens.
-- **The first time takes long:** the camera only sends its ENR at certain
+- **A camera takes a while to start:** Wyze Cam v3s leave some new
+  sessions waiting for up to 30 s, at random. After 2 s the tool opens a
+  second session beside a slow one and keeps whichever gets in first, so
+  most views start within a few seconds ([why](how-it-works.md)).
+- **"The camera doesn't answer":** it's switched off in the Wyze app (or
+  by a schedule), unplugged, or offline. If it was set up again in the
+  Wyze app, its key changed: **Get its key again** on the page, or
+  `wyzecrack key --reharvest`, reads the new one.
+- **The first time takes long:** the camera only sends its key at certain
   moments. The tool resets its connection to Wyze until it does, usually
-  within two to four minutes. On other models it waits for the camera to
-  report in on its own, usually within 20 minutes, or right away when it
-  sees motion.
-- **The live view plays in the app but nothing shows up here:** the phone
-  is probably on the camera's Wi-Fi. There the app reaches the camera
-  directly over the LAN, which doesn't pass through this computer; use a
-  phone on cellular or another network.
-
-- **"that live view did not pass through this host":** the camera opened
-  channels for a live view, but the stream never came through here. Some
-  of the camera's connections go straight through the router, probably
-  ones it opened before wyzecrack started. (Seen behind a home router
-  router: the camera's traffic to two of its relays never reached this
-  host while its other traffic did.) Unplugging the camera for 5 seconds
-  while wyzecrack runs fixes it: the connections it opens then pass
-  through here. (Before an unplug, 3 of 5 test views were missed; after
-  it, 3 of 3 were caught.)
-- **"waiting for the camera's ENR" for a long time:** trigger a motion
-  alarm. If the tool reports that the camera refuses the certificate, this
-  firmware no longer trusts the eMudhra CA. Supply the ENR with `--enr`.
-- **"no replies come back":** something on the host drops forwarded
-  traffic. Check its firewall.
-- **`engine failed` mentioning decryption:** the cached ENR is stale
-  because the camera was re-paired. Rerun with `--reharvest`.
-- **A run was killed and the camera is offline:** run `wyzecrack
-  cleanup`. The camera also recovers on its own within a few minutes, once
-  its ARP entry expires.
+  within two to four minutes. On models it hasn't been tried on, it waits
+  for the camera to report in on its own: usually within 20 minutes, or
+  right away when the camera sees motion.
+- **"The camera refused our certificate":** this firmware no longer
+  trusts the eMudhra CA, so the tool can't read its key. If you have the
+  key from elsewhere, pass it with `--enr`.
+- **"Wyze didn't hand out this camera's ID":** the Wyze cloud refused the
+  key or changed this call. Try again later.
+- **The camera lost its connection while it was rerouted:** something on
+  this computer drops forwarded traffic, such as an nftables firewall.
+  `wyzecrack check` reports it.
+- **wyzecrack was killed while it was rerouting a camera:** run
+  `wyzecrack cleanup`. The camera also recovers on its own within a few
+  minutes, once its ARP entry expires.

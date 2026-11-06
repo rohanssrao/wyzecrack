@@ -7,11 +7,10 @@ page (video decoded by the browser with WebCodecs, audio with WebAudio)
 and records it.
 
 The first time with a camera, the tool gets on its path to read its ENR
-off its HTTPS (cutting its internet for a minute if it doesn't send it
-soon), then asks Wyze for its UID with that ENR; both are cached. After
-that a live view is a direct LAN session (direct.py): nothing on the
-network is changed. If Wyze won't give the UID, the page falls back to
-splicing the live views the Wyze app opens (splice.py).
+off its HTTPS (resetting its MQTT connection until it reports in, see
+nudge.py), then asks Wyze for its UID with that ENR; both are cached.
+Every live view is a direct LAN session (direct.py): nothing on the
+network is changed.
 
 The server runs in the main thread (asyncio); the session runs in a
 worker thread and reports through `events`.
@@ -171,7 +170,7 @@ class Controller:
         self.camera = cam
         self.stop.clear()
         self.state = {"phase": "starting", "camera": cam, "steps": {},
-                      "error": None, "error_kind": None, "mode": "direct"}
+                      "error": None, "error_kind": None}
         self.set()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -189,9 +188,7 @@ class Controller:
 
     def _on_event(self, ev):
         k = ev["kind"]
-        if k == "onpath":
-            self._step("onpath", "active" if ev["state"] == "arming" else "done")
-        elif k == "enr":
+        if k == "enr":
             st = ev.get("stats") or {}
             if ev["state"] in ("waiting", "nudging"):
                 prev = (self.state.get("steps") or {}).get("enr") or {}
@@ -209,41 +206,6 @@ class Controller:
             status = {"active": "active", "done": "done"}.get(ev["state"],
                                                               "problem")
             self._step("uid", status, {"detail": ev.get("detail")})
-        elif k == "learning":
-            self._step("watch", "active", {"note": "learning"})
-        elif k == "watching":
-            self._step("watch", "active")
-            self.set(phase="waiting", session=None)
-        elif k == "bypass":
-            if ev["missing"]:
-                self._step("onpath", "problem")
-                self.set(hint="unplug")
-            else:
-                self._step("onpath", "done")
-                self.set(hint=None)
-                self.hub.send_json({"kind": "toast", "text": "All set: the camera's connections now come through here"})
-        elif k == "missed":
-            self.set(hint="bypass")
-            self.hub.send_json({"kind": "missed"})
-        elif k == "session":
-            s = ev["state"]
-            if s == "armed":
-                self.set(phase="connecting", session={"state": "armed"})
-            elif s == "handshake":
-                self.set(phase="connecting", session={"state": "handshake"})
-            elif s == "live":
-                # both handshakes are done; "live" waits for the first
-                # picture (the camera may still drop the session first)
-                self.set(phase="connecting", hint=None,
-                         session={"state": "joined"})
-            elif s == "failed":
-                self.set(phase="connecting",
-                         session={"state": "failed", "detail": ev.get("detail")})
-            elif s == "ended":
-                was_live = self.state.get("phase") == "live"
-                self.hub.send_json({"kind": "viewer_left",
-                                    "spliced": bool(ev.get("spliced")),
-                                    "had_video": was_live})
 
     def _run(self):
         from .cli import _give_to_user
@@ -258,7 +220,12 @@ class Controller:
             if uid:
                 self._watch(cam, cam_dir, enr, uid)
             else:
-                self._run_splice(cam, cam_dir)
+                detail = ((self.state.get("steps") or {}).get("uid") or {}).get(
+                    "detail") or {}
+                self.set(phase="error", error="Wyze didn't hand out this "
+                         "camera's ID, which watching it needs"
+                         + (f" ({detail.get('detail')})" if detail.get("detail")
+                            else "") + ". Try again later.")
         except SystemExit as e:
             self.set(phase="error", error=str(e.code or e))
         except Exception as e:  # noqa: BLE001
@@ -279,7 +246,6 @@ class Controller:
         from .cloud import CloudError
         mac = cam["mac"]
         enr, uid = _cached_enr(mac), _cached_uid(mac)
-        self.set(mode="direct")
         if enr:
             self._step("enr", "done", {"how": "cached"})
         if enr and uid:
@@ -295,11 +261,9 @@ class Controller:
                 self._step("uid", "problem", {"detail": str(e)})
                 return enr, None
         args = SimpleNamespace(target=cam["ip"], on_path=False, enr=None,
-                               reharvest=False, pass_through=False,
-                               journal=False, events_dir=cam_dir / "events",
+                               reharvest=False, events_dir=cam_dir / "events",
                                harvest_timeout=0)
-        armed = Armed(args, cam_dir, splice=False, harvest=True,
-                      changes=self.journal.scope())
+        armed = Armed(args, cam_dir, harvest=True, changes=self.journal.scope())
         armed.stop = self.stop
         armed.on_motion = self._motion
         self._step("enr", "active", {"seen": 0})
@@ -323,8 +287,7 @@ class Controller:
         sleep_lock = _inhibit_sleep("showing a live view")
         try:
             while not self.stop.is_set():
-                self.set(phase="connecting", hint=None,
-                         session={"state": "direct"})
+                self.set(phase="connecting", session={"state": "direct"})
                 scope = self.journal.scope()
                 d, why = None, ""
                 framing = _cached(cam["mac"]).get("framing")
@@ -380,29 +343,6 @@ class Controller:
             _release_inhibitor(sleep_lock)
             self._session_end(out, any_video)
 
-    def _run_splice(self, cam, cam_dir):
-        """The fallback: splice the live views the Wyze app opens."""
-        from .cli import Armed
-        args = SimpleNamespace(target=cam["ip"], on_path=False, enr=None,
-                               reharvest=False, pass_through=False,
-                               journal=False, events_dir=cam_dir / "events")
-        armed = Armed(args, cam_dir, splice=True, changes=self.journal.scope())
-        armed.stop = self.stop
-        armed.on_motion = self._motion
-        self.set(mode="splice")
-        self._step("onpath", "active")
-        with self._capture_paused(cam["mac"]), armed:
-            enr = armed.enr()
-            if not enr or self.stop.is_set():
-                return
-            sp = armed.splicer
-            sp.stop = sp.watcher.stop = self.stop
-            sp.session_dir = lambda: cam_dir / time.strftime("%Y%m%d-%H%M%S")
-            sp.on_av = self._on_av
-            sp.on_session_end = self._session_end
-            self._new_live()
-            sp.run(enr)
-
     # live media -> the page
     def _new_live(self, view_start=False):
         if view_start:
@@ -457,15 +397,9 @@ class Controller:
                 "height": st["size"][1] if st["size"] else None,
                 "seconds": round(time.time() - st["t0"], 1)}
 
-    def _session_end(self, out, spliced):
+    def _session_end(self, out, had_video):
         self._new_live()
-        if not spliced:
-            # keep what explains a miss, under .missed/, out of the library
-            keep = self.lib.root / ".missed" / out.name
-            keep.mkdir(parents=True, exist_ok=True)
-            for f in ("splice.log",):
-                if (out / f).exists():
-                    shutil.move(str(out / f), keep / f)
+        if not had_video:
             shutil.rmtree(out, ignore_errors=True)
             return
         t = threading.Thread(target=self._save, args=(out,), daemon=True)
@@ -486,11 +420,7 @@ class Controller:
         main = next((m for m in r["mp4s"] if m["path"].endswith("/video.mp4")),
                     None)
         if not main:
-            # joined, but the camera sent no picture before it hung up
-            keep = self.lib.root / ".missed" / out.name
-            keep.mkdir(parents=True, exist_ok=True)
-            if (out / "splice.log").exists():
-                shutil.move(str(out / "splice.log"), keep / "splice.log")
+            # the camera hung up before a whole picture
             shutil.rmtree(out, ignore_errors=True)
             self.hub.send_json({"kind": "dropped"})
             return
@@ -518,7 +448,7 @@ class Controller:
         self._send_captures()
 
     def _in_use(self, mac):
-        """The camera is being keyed or spliced right now (its capture
+        """The camera's key is being read right now (its capture
         resumes by itself afterwards)."""
         return self._paused == _key(mac)
 
@@ -568,8 +498,8 @@ class Controller:
                 self._stop_capture(mac)
 
     def _capturing(self, key, c):
-        # a capture paused for a key read or splice of the same camera is
-        # still saving clips: those sessions read its uploads themselves
+        # a capture paused for a key read of the same camera is still
+        # saving clips: the key read reads its uploads itself
         return c.running or self._paused == key
 
     def capture_status(self, mac):
@@ -585,8 +515,8 @@ class Controller:
 
     @contextlib.contextmanager
     def _capture_paused(self, mac):
-        """Getting a camera's key or splicing it routes it through this host
-        on its own; a motion capture of the same camera steps aside."""
+        """Getting a camera's key routes it through this host on its own; a
+        motion capture of the same camera steps aside."""
         with self._cap_lock:
             c = self.captures.get(_key(mac))
             paused = bool(c and c.running)

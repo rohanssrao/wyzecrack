@@ -6,24 +6,23 @@ HTTPS (steps 1 and 2 below). The UID never crosses the LAN, but Wyze's
 cloud returns it for the camera's MAC and ENR (step 3). With all three
 cached, the tool talks to the camera directly over the LAN, the way the
 Wyze app does on the camera's Wi-Fi (step 4), and nothing on the network
-is rerouted. Steps 5 and 6 are the fallback when Wyze won't return the
-UID: splicing the live views the Wyze app opens. Step 7 covers both.
+is rerouted. Step 5 turns what it records into video files.
 
 1. **Get on-path** (`onpath.py`). The tool ARP-poisons only the camera so
    this host becomes the camera's gateway, and MASQUERADEs the camera's
    traffic out under this host's address. The real router is never
    poisoned. Two-way poisoning makes a typical home router route the
    camera's spoofed packets back to the MITM (same 5-tuple, TTL dropping by
-   one per bounce), which black-holes the stream. The camera's existing
-   flows survive the switch, and the relays pick up the new NAT mapping
-   from the camera's next keepalive.
+   one per bounce), which black-holes the camera's traffic. The camera's
+   existing connections survive the switch: its servers pick up the new
+   NAT mapping from the camera's next keepalive.
 
 2. **Read the camera's HTTPS** (`cloud.py`). The camera's TLS client still
    trusts the eMudhra "EM OV TLS CA - G3C" intermediate, whose private key
    became public in October 2026 (a P-384 key with d=4). The camera's
-   tcp/443 is redirected to a local relay. For connections to
+   tcp/443 is redirected to a local proxy. For connections to
    `*.wyzecam.com`, and to the S3 bucket the v2 uploads its alarms to
-   (`c-t-usw2.s3.us-west-2.amazonaws.com`), the relay presents a leaf for
+   (`c-t-usw2.s3.us-west-2.amazonaws.com`), the proxy presents a leaf for
    the requested name signed under that intermediate and forwards the
    connection to the real server under the same name. Everything else
    (firmware and model downloads from S3, log uploads, for example) passes
@@ -82,7 +81,12 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
      the AuthKey (base64 of SHA256(ENR + MAC)[:6]), over the 28-byte
      header (32 bytes for discovery). The camera ignores packets whose
      trailer is wrong;
-   - DTLS records ride in cmd 0x1502 (the same client leg as step 6);
+   - DTLS records ride in cmd 0x1502. The session is DTLS 1.2 with
+     TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256, and the PSK is derived
+     from the ENR alone (`dtls.py`);
+   - the v2 frames the same session in ThroughTek's older IOTC format
+     (0x0601/0x0402 to set it up, 0x0407/0x0408 for data), obfuscated with
+     TransCode (`tutk.py`);
    - inside: an AV login whose password is the ENR, the K10000/K10002
      challenge (XXTEA with the ENR), and K10056 for 1080p. The camera then
      streams H.264 and 8 kHz PCM, acknowledged every 100 ms.
@@ -119,35 +123,13 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
    (`IOTC_Setup_Session_Alive_Timeout(30)`). The older (v2) framing has no
    such message that the tool knows of.
 
-5. **Catch the session** (`splice.py`, the fallback). Nothing is
-   diverted while the tool waits. When the app opens a live view, the
-   camera sends a 0x1102 channel-open to a fresh relay. At that moment the
-   tool pins TPROXY rules to the camera's exact 5-tuples toward that data
-   relay and toward each STUN relay (:3478). Both are needed: the phone's
-   ClientHello can arrive as cmd 0x1402 through a STUN relay while the
-   camera answers as 0x1502 on the data relay.
-
-6. **Splice the DTLS** (`dtls.py`). The session is DTLS 1.2 with
-   TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256, and the PSK is derived from
-   the ENR alone. The engine terminates both legs (server toward the phone,
-   client toward the camera) with flights byte-size-matched to the
-   originals. This lets it reuse each 0xCC51 wrapper and its header-keyed
-   trailer verbatim, so no UID or relay credentials are needed. It decrypts
-   the media to `av.bin` and re-encrypts it for the phone. Re-sent packets
-   keep the TTL a forwarded packet would have had. When re-originated
-   packets left with TTL 64, the camera stopped routing through the MITM.
-
-7. **Tear down and export** (`media.py`). When the camera goes quiet, the
-   tool removes its rules and hands the flows back to the kernel. It
-   reassembles the H.264 from TUTK media frames and remuxes it (without
-   re-encoding) into an MP4 paced to arrival time. The app starts each live
-   view in SD and switches the camera to 1080p a few seconds in, and each
-   resolution that lasted at least 2 s gets its own MP4. A spliced session
-   carries the media in the app's resend format; a direct one in the plain
-   format, the same records with an 8-byte shorter header. Frames that could not decode cleanly are
-   left out: any incomplete frame, plus the rest of its group of pictures.
-   Once the viewer leaves, the camera keeps streaming to the dead session
-   for a while but stops completing I-frames, so that tail is dropped.
+5. **Export** (`media.py`). The tool reassembles the H.264 from TUTK media
+   frames and remuxes it (without re-encoding) into an MP4 paced to
+   arrival time, with the audio as AAC. The camera starts each live view
+   in SD and switches to 1080p a few seconds in; each resolution that
+   lasted at least 2 s gets its own MP4. Frames that could not decode
+   cleanly are left out: any incomplete frame, plus the rest of its group
+   of pictures.
 
 ## The page
 
@@ -161,8 +143,8 @@ in the background for as long as the page is open: the camera is routed
 through this host (step 1) and its uploads are read (step 2), as with the
 `events` command. Several cameras can be captured at once, each with its
 own interceptor port, and a capture steps aside while the same camera's
-key is read or its live view is spliced. If a camera without a saved key
-uploads a clip, its key is saved from that upload.
+key is read. If a camera without a saved key uploads a clip, its key is
+saved from that upload.
 
 The page holds the single-instance lock and one journal (below) for its
 whole life. Each live view, capture and key read takes a scope of it and
@@ -173,15 +155,15 @@ for two cameras on the path) is put back when the last one is done.
 
 The tool only acts on the camera you pick. Watching opens a session to
 that camera alone and reroutes nothing. A camera is routed through this
-host only for its first-time key read, for a splice, or while you have
-turned on saving its motion clips. It never pre-connects to the other
+host only for its first-time key read, or while you have turned on saving
+its motion clips. It never pre-connects to the other
 cameras to save start time: a v3 that is slow to answer is waited for.
 To show which cameras are switched off, the picker sends each camera
 that has a saved key a few discovery packets, stopping once it answers;
 they change nothing on the camera.
 
-Every change to the host (iptables rules, the policy route, sysctls, the
-camera's ARP entry) is written to a journal in `/run/wyzecrack/` before
+Every change to the host (iptables rules, sysctls, the camera's ARP
+entry) is written to a journal in `/run/wyzecrack/` before
 it is made. However the tool exits, including Ctrl-C (once or repeatedly),
 SIGTERM or a closed terminal, it undoes the changes in reverse order. If
 the process is killed outright, `wyzecrack cleanup` or the next run
@@ -190,7 +172,7 @@ them are persistent.) Only one instance runs at a time.
 
 The tool also adds FORWARD accept rules for the camera, for firewalls that
 drop forwarded traffic (ufw, Docker, firewalld). These rules can't override
-a firewall that drops the traffic directly in nftables. In that case the
-tool warns when the camera's traffic stops coming back. While the tool
-runs, it holds a `systemd-inhibit` sleep lock, because a suspended host
-black-holes the camera.
+a firewall that drops the traffic directly in nftables; `wyzecrack check`
+warns about one. While it routes a camera or shows a live view, the tool
+holds a `systemd-inhibit` sleep lock: a suspended host black-holes a
+rerouted camera and ends a live view.

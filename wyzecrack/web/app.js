@@ -6,7 +6,6 @@ const mmss = (s) => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 6
 const api = (path, body) => fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}).then((r) => r.json());
 
 let state = { phase: "idle" };
-let saving = false;
 let camera = null;
 let hadPicture = false;     // this live view showed a picture (so it is saved)
 let ended = false;          // the page shows the ended view (Saving / Saved)
@@ -97,16 +96,10 @@ const STATUS = {
   key_nudge: ["🔑", "pulse", "Getting the camera's key", "Its connection to Wyze is reset a few times, which makes it report in with its key. About a minute, once per camera."],
   uid: ["🪪", "spin", "Asking Wyze for the camera's ID", "With the camera's own key, the way the camera itself asks."],
   direct: ["⚡", "spin", "Connecting to the camera", "Straight over your network; nothing is rerouted."],
-  onpath: ["⇄", "spin", "Getting on the camera's path", "Only this camera is rerouted through this computer; everything else on the network is untouched."],
-  enr: ["🔑", "pulse", "Waiting for the camera's key", "The camera sends it to Wyze when it sees motion. Walk in front of it (or wave at it) to speed this up. This only happens once per camera."],
   enr_refused: ["🔒", "bad", "The camera refused our certificate", "This firmware no longer trusts the eMudhra CA, so its key can't be read this way."],
-  learning: ["⇄", "spin", "Almost ready", "Learning the camera's relay paths."],
-  waiting: ["📱", "pulse", "Waiting for someone to watch", "Open this camera's live view in the Wyze app from a phone that isn't on this Wi-Fi (on cellular, or anywhere else). The feed shows up here as well."],
-  connecting: ["⚡", "spin", "Someone opened the live view", "Joining the stream…"],
-  joined: ["⚡", "spin", "Joined", "Waiting for the first picture…"],
-  saving: ["💾", "spin", "The viewer left", "Saving the video…"],
   stopping: ["⏻", "spin", "Stopping", "Putting the camera's network back the way it was."],
   stopping_direct: ["⏻", "spin", "Stopping", "Saving the recording."],
+  stopping_plain: ["⏻", "spin", "Stopping", ""],
   error: ["!", "bad", "Something went wrong", ""],
   ended_saving: ["💾", "spin", "Saving", "Writing the recording…"],
   ended: ["✓", "ok", "Saved", "This live view is at the top of Saved, below."],
@@ -122,17 +115,8 @@ function setStatus(key, extra) {
   $("#status-extra").textContent = extra || "";
 }
 
-const STEPS = {
-  direct: [["enr", "Key"], ["uid", "Camera ID"], ["live", "Live"]],
-  splice: [["onpath", "On path"], ["enr", "Key"], ["watch", "Viewer"]],
-};
-let stepsMode = null;
-
-function renderSteps(mode) {
-  if (mode === stepsMode) return;
-  stepsMode = mode;
-  $("#steps").innerHTML = STEPS[mode].map(([k, label]) => `<li data-step="${k}">${label}</li>`).join("");
-}
+const STEPS = [["enr", "Key"], ["uid", "Camera ID"], ["live", "Live"]];
+$("#steps").innerHTML = STEPS.map(([k, label]) => `<li data-step="${k}">${label}</li>`).join("");
 
 function applyState(s) {
   const prev = state.phase;
@@ -144,45 +128,37 @@ function applyState(s) {
     return;
   }
   if (s.camera && $("#session").classList.contains("hidden")) showSession(s.camera);
-  const direct = s.mode !== "splice";
-  renderSteps(direct ? "direct" : "splice");
   const steps = s.steps || {};
   for (const li of document.querySelectorAll("#steps li")) {
     const st = steps[li.dataset.step];
     li.className = st ? st.status : "";
   }
-  const last = document.querySelector('#steps li[data-step="' + (direct ? "live" : "watch") + '"]');
-  if (s.phase === "live" || (!direct && s.phase === "connecting")) last.className = "done";
-  else if (direct && s.phase === "connecting") last.className = "active";
+  const last = document.querySelector('#steps li[data-step="live"]');
+  if (s.phase === "live") last.className = "done";
+  else if (s.phase === "connecting") last.className = "active";
 
+  // first time with a camera: the key, then the ID; then connecting
+  const keyRead = steps.enr?.status === "active" || steps.uid?.status === "active";
   let key = s.phase;
-  if (direct && s.phase === "starting") {
-    // the key, then the ID, then connecting; on-path is an internal detail here
-    key = steps.enr?.status !== "done" ? "key" : steps.uid?.status !== "done" ? "uid" : "direct";
-  } else if (s.phase === "starting" && steps.onpath) key = "onpath";
-  if (steps.enr && steps.enr.status === "active" && s.phase !== "error") key = direct ? (steps.enr.detail?.nudging ? "key_nudge" : "key") : "enr";
-  if (steps.enr && steps.enr.status === "problem") key = "enr_refused";
-  if (direct && steps.uid && steps.uid.status === "active") key = "uid";
-  if (direct && s.phase === "connecting") key = "direct";
-  if (direct && s.phase === "stopping") key = "stopping_direct";
-  if (s.phase === "starting" && steps.watch?.detail?.note === "learning") key = "learning";
-  if (s.phase === "connecting" && s.session?.state === "joined") key = "joined";
+  if (s.phase === "starting") key = steps.enr?.status !== "done" ? "key" : steps.uid?.status !== "done" ? "uid" : "direct";
+  if (steps.enr?.status === "active" && s.phase !== "error") key = steps.enr.detail?.nudging ? "key_nudge" : "key";
+  if (steps.enr?.status === "problem") key = "enr_refused";
+  if (steps.uid?.status === "active") key = "uid";
+  if (s.phase === "connecting") key = "direct";
+  if (s.phase === "stopping") key = keyRead ? "stopping" : hadPicture ? "stopping_direct" : "stopping_plain";
   let extra = "";
-  if (key === "enr" || key === "key") { const n = steps.enr?.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
+  if (key === "key") { const n = steps.enr?.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
   if (key === "key_nudge") { const r = steps.enr?.detail?.resets || 0; extra = r ? `Reset ${r} of up to 8` : ""; }
   if (key === "direct") {
     if (prev !== "connecting" || !connectSince) connectSince = Date.now();
     const secs = Math.round((Date.now() - connectSince) / 1000);
     if (secs >= 5) extra = `Still waiting for the camera to answer (${secs} s).`;
   } else connectSince = null;
-  if (s.phase === "connecting" && s.session?.state === "failed") extra = "This attempt could not be joined; waiting for the app's retry.";
-  if (s.hint === "unplug" && (key === "waiting" || key === "learning")) extra = "One of the camera's connections goes around this computer, so some live views would be missed. Unplug the camera for 5 seconds now (and plug it back in); this page will tell you when it's fixed.";
-  else if (key === "waiting" && s.hint === "bypass") extra = "The last live view went around this computer, probably over a connection the camera opened before you started. Unplug the camera for 5 seconds; its new connections will come through here.";
   $("#rekey").classList.toggle("hidden", !(s.phase === "error" && s.error_kind === "no_answer"));
   const stage = $("#stage");
   stage.classList.toggle("is-live", s.phase === "live");
   $("#hud").classList.toggle("hidden", s.phase !== "live");
-  if (s.phase !== "live" && !(saving && s.phase === "waiting")) setStatus(key, extra);
+  if (s.phase !== "live") setStatus(key, extra);
   if (s.phase === "live" && prev !== "live") { recStart = (s.session?.since || Date.now() / 1000); $("#stage").classList.remove("dim"); hadPicture = true; }
   $("#stop").textContent = s.phase === "error" ? "Back" : "Stop";
 }
@@ -384,7 +360,7 @@ $("#full").onclick = () => { const s = $("#stage"); document.fullscreenElement ?
 
 setInterval(() => {
   if (state.phase === "live" && recStart) $("#rec").textContent = mmss(Date.now() / 1000 - recStart);
-  if (state.phase === "connecting" && state.mode !== "splice" && connectSince) applyState(state);
+  if (state.phase === "connecting" && connectSince) applyState(state);
 }, 1000);
 
 // ---------------------------------------------------------------- socket
@@ -406,14 +382,7 @@ function connect() {
       case "stats":
         if (ev.height) $("#res").textContent = `${ev.height}p`;
         break;
-      case "viewer_left":
-        $("#stage").classList.add("dim");
-        resetVideo(true);
-        if (ev.spliced && ev.had_video) { saving = true; setStatus("saving"); }
-        else if (ev.spliced) toast("The camera hung up before sending a picture · waiting for the next try");
-        break;
       case "library":
-        if (saving) { saving = false; if (state.phase === "waiting") setStatus("waiting"); }
         loadLibrary(ev.new);
         if (ev.new) {
           savedNew = true;
@@ -429,7 +398,6 @@ function connect() {
       case "captures": captures = ev.captures || {}; if (camera) showMotion(camera); break;
       // on the camera's page the ended view says it; elsewhere, a toast
       case "saving": if ($("#session").classList.contains("hidden")) toast("Saving the recording…"); break;
-      case "missed": toast("A live view went around this computer · see the tip above"); break;
     }
   };
   ws.onclose = () => setTimeout(connect, 1500);

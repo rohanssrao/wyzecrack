@@ -1,6 +1,6 @@
 """Turn the decrypted media stream into playable frames as it arrives.
 
-Feed it every camera->phone plaintext record (dtls.SpliceEngine on_av);
+Feed it every plaintext record from the camera (direct.Direct's on_av);
 it calls on_video(frame) for each complete, decodable H.264 access unit
 and on_audio(ts, pcm) for each audio frame (signed 16-bit little-endian
 PCM, 8 kHz mono, the camera's live audio format: codec 0x8C).

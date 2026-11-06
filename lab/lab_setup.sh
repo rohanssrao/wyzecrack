@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Netns lab mirroring the real topology after on-path mode is up:
-#   cam (10.99.0.20) --L2-- mid (10.99.0.10, runs wyzecrack) --L2-- gw (10.99.0.1, NAT) -- relays (203.0.113.x)
+#   cam (10.99.0.20) --L2-- mid (10.99.0.10, runs wyzecrack) --L2-- gw (10.99.0.1, NAT) -- internet (203.0.113.x)
 # cam's default route points at mid (what the camera-only ARP poison does)
 # and mid NATs the camera's traffic out, so wyzecrack runs with --on-path.
 set -eu
@@ -25,7 +25,6 @@ ip link add v-gwo type veth peer name v-rl
 ip link set v-gwo netns tfl-gw; ip link set v-rl netns tfl-relay
 ip -n tfl-gw addr add 203.0.113.254/24 dev v-gwo; ip -n tfl-gw link set v-gwo up
 ip -n tfl-relay addr add 203.0.113.1/24 dev v-rl; ip -n tfl-relay link set v-rl up
-ip -n tfl-relay addr add 203.0.113.2/24 dev v-rl      # STUN relay (:3478)
 ip -n tfl-relay addr add 203.0.113.3/24 dev v-rl      # fake api.wyzecam.com (:443)
 ip -n tfl-relay route add default via 203.0.113.254
 ip -n tfl-cam route add default via 10.99.0.10          # "poisoned" gateway

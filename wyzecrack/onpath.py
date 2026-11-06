@@ -16,12 +16,11 @@ class OnPath:
     the identical 5-tuple; its fast path then sent them back to us with
     the camera's MAC (TTL -1 per bounce, a 25 us ping-pong) and kept doing
     so after the MITM stopped, black-holing that camera flow until the
-    camera changed ports; the splice's own media came straight back
-    instead of reaching the relay. In router mode the real router only
-    ever routes our flows and its ARP table is untouched.
+    camera changed ports. In router mode the real router only ever routes
+    our flows and its ARP table is untouched.
 
-    The camera's existing flows survive the switch: the relays follow
-    the new NAT mapping from its next keepalive, no reboot needed.
+    The camera's existing connections survive the switch: its servers
+    follow the new NAT mapping from its next keepalive, no reboot needed.
 
     poison=False skips the ARP step for hosts that already carry the
     camera's traffic (a gateway, or the netns lab).

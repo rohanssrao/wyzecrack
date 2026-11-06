@@ -28,8 +28,7 @@ TransCode (tutk.py):
 Inside the DTLS session (PSK from the ENR, see dtls.py): an AV login
 whose password is the ENR, the K10000/K10002 challenge (XXTEA with the
 ENR), then the camera streams. Every decrypted record goes to on_av and
-av.bin in the same form the splice writes, so live.py and media.py work
-unchanged.
+av.bin, which live.py and media.py read.
 """
 import base64
 import hashlib
