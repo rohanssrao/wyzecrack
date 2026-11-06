@@ -44,3 +44,8 @@ Cam v2 (4.9.9).
 The camera protocol code follows the TUTK and Wyze support in
 [go2rtc](https://github.com/AlexxIT/go2rtc) (MIT License, see
 [NOTICE](NOTICE)).
+
+## License
+
+wyzecrack is licensed under the [GNU Affero General Public License v3.0
+or later](LICENSE).
