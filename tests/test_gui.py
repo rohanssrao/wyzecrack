@@ -26,9 +26,6 @@ class FakeController:
     def busy(self):
         return False
 
-    def stats(self):
-        return None
-
 
 def _library(tmp_path):
     lib = gui.Library(tmp_path)

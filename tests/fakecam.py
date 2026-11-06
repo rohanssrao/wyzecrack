@@ -270,8 +270,7 @@ class FakeCamera:
     # ------------------------------------------------------------- DTLS + AV
     def _records(self, payload):
         if self.leg is None:
-            full = hashlib.sha256(self.enr.encode()).digest()
-            self.leg = DTLSLeg("server", derive_psk(self.enr), Templates.embedded(), full)
+            self.leg = DTLSLeg("server", derive_psk(self.enr), Templates.embedded())
         leg, out = self.leg, b""
         for rtype, ver, epoch, seq, body in parse_records(payload):
             if rtype == RT_HANDSHAKE and epoch == 0:

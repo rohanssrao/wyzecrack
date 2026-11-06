@@ -76,7 +76,6 @@ function showSession(c) {
   $("#cam-name").textContent = displayName(c);
   $("#cam-sub").textContent = c.name ? `${c.model} · ${c.ip}` : c.ip;
   showMotion(c);
-  $("#crumb").textContent = "";
   loadLibrary();
 }
 
@@ -85,7 +84,6 @@ function showPicker() {
   $("#again").classList.add("hidden");
   $("#session").classList.add("hidden");
   $("#picker").classList.remove("hidden");
-  $("#crumb").textContent = "";
   resetVideo();
   scan();
 }
@@ -159,7 +157,7 @@ function applyState(s) {
   stage.classList.toggle("is-live", s.phase === "live");
   $("#hud").classList.toggle("hidden", s.phase !== "live");
   if (s.phase !== "live") setStatus(key, extra);
-  if (s.phase === "live" && prev !== "live") { recStart = (s.session?.since || Date.now() / 1000); $("#stage").classList.remove("dim"); hadPicture = true; }
+  if (s.phase === "live" && prev !== "live") { recStart = (s.since || Date.now() / 1000); $("#stage").classList.remove("dim"); hadPicture = true; }
   $("#stop").textContent = s.phase === "error" ? "Back" : "Stop";
 }
 
@@ -379,9 +377,6 @@ function connect() {
     switch (ev.kind) {
       case "state": applyState(ev); break;
       case "video_config": configure(ev); break;
-      case "stats":
-        if (ev.height) $("#res").textContent = `${ev.height}p`;
-        break;
       case "library":
         loadLibrary(ev.new);
         if (ev.new) {

@@ -317,8 +317,7 @@ class Direct:
         self.sock.bind((local_ip or "0.0.0.0", 0))
         self.peer = (ip, disco_port)          # becomes the camera's P2P port
         self.sid, self.ticket = os.urandom(8), 0
-        full = hashlib.sha256(enr.encode()).digest()
-        self.leg = DTLSLeg("client", derive_psk(enr), Templates.embedded(), full)
+        self.leg = DTLSLeg("client", derive_psk(enr), Templates.embedded())
         self.av_seq = self.cmd_seq = self.ka_seq = self.ack_flags = 0
         self.rx_start = self.rx_end = 0xFFFF
         self.rx_init = False
@@ -413,7 +412,6 @@ class Direct:
             self._send(self._wrap(records))
 
     def _send_app(self, plaintext):
-        self._log_av(0, plaintext)
         self._send_dtls(self.leg.encrypt_record(RT_APPDATA, plaintext))
 
     def _recv(self, timeout):
@@ -451,8 +449,9 @@ class Direct:
 
     # ------------------------------------------------------------- session
     def record(self, av_log=None, on_av=None):
-        """Append the session's plaintext to av_log, and/or hand it to
-        on_av(direction, time, plaintext)."""
+        """Append what the camera sends, decrypted, to av_log, and/or hand
+        it to on_av(time, plaintext). (What the tool sends is left out: its
+        AV login carries the ENR.)"""
         self.on_av = on_av
         if av_log:
             self.av_f = open(av_log, "ab")
@@ -548,7 +547,6 @@ class Direct:
 
     def _handshake(self, deadline):
         self._flight = self.leg.client_hello()
-        self._cam_repeats = 0
         self._until(deadline, "DTLS handshake",
                     lambda: self._send_dtls(self._flight),
                     lambda: self.leg.handshake_done, every=1.0)
@@ -725,17 +723,11 @@ class Direct:
             self._send_dtls(flight)
         elif (self.leg.state == "wait_cam_fin"
               and all(m[0] in (HS_SH, HS_SKE, HS_SHD) for m in msgs)):
-            # the camera repeated its flight: ours was lost, or it rejected
-            # our Finished; dtls.py's retries cover the known variants
-            self._cam_repeats += 1
-            if self._cam_repeats % 2 == 0:
-                new = (self.leg.client_rebuild_flight() if self._cam_repeats == 2
-                       else self.leg.client_retry_flight())
-                self._flight = new or self._flight
+            # the camera repeated its flight: ours was lost
             self._send_dtls(self._flight)
 
     def _app(self, pt):
-        self._log_av(1, pt)
+        self._log_av(pt)
         if len(pt) < 2:
             return
         magic = struct.unpack_from("<H", pt, 0)[0]
@@ -751,14 +743,14 @@ class Direct:
         elif magic == MAGIC_IOCTRL:
             self.ctrl.append(pt)
 
-    def _log_av(self, direction, plaintext):
+    def _log_av(self, plaintext):
         now = time.time()
         if self.av_f:
-            self.av_f.write(struct.pack("<BdI", direction, now, len(plaintext))
+            self.av_f.write(struct.pack("<BdI", 1, now, len(plaintext))
                             + plaintext)
         if self.on_av:
             try:
-                self.on_av(direction, now, plaintext)
+                self.on_av(now, plaintext)
             except Exception as e:  # noqa: BLE001
                 self.log(f"[!] live view callback failed: {e!r}")
 

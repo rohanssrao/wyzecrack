@@ -11,11 +11,12 @@ from cryptography.hazmat.primitives import serialization
 from wyzecrack import cloud as enr
 
 
-def test_find_enr_unescapes_and_finds_mac():
+def test_device_info_unescapes_and_finds_mac():
     body = (b'POST /device/system/set_device_info HTTP/1.1\r\n\r\n'
             b'{"mac":"d03f27a1b2c3","enr":"gekMdn0XjZoWF\\/mD","x":1}')
-    assert enr.find_enr(body) == ("gekMdn0XjZoWF/mD", "D03F27A1B2C3")
-    assert enr.find_enr(b'{"mac":"D03F27A1B2C3"}') is None
+    info = enr.device_info(body)
+    assert (info["enr"], info["mac"]) == ("gekMdn0XjZoWF/mD", "D03F27A1B2C3")
+    assert enr.device_info(b'{"mac":"D03F27A1B2C3"}') is None
 
 
 def test_leaf_validates_against_the_emudhra_intermediate():
@@ -96,7 +97,7 @@ def test_long_sni_still_gets_a_leaf():
 
 
 def test_bad_enr_escape_is_ignored():
-    assert enr.find_enr(b'{"enr":"ab\\xcd"}') is None
+    assert enr.device_info(b'{"enr":"ab\\xcd"}') is None
 
 
 def test_device_info_reads_both_request_shapes():

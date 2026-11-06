@@ -105,12 +105,9 @@ def _mac_key(mac):
 
 def _cache():
     try:
-        d = json.loads((STATE_DIR / "enr.json").read_text())
+        return json.loads((STATE_DIR / "enr.json").read_text())
     except (OSError, ValueError):
         return {}
-    # early versions keyed entries by camera IP, with the MAC inside
-    return {(_mac_key(v["mac"]) if v.get("mac") else k): v
-            for k, v in d.items()}
 
 
 def _cached(mac):
@@ -268,7 +265,6 @@ class Armed:
     def _enter(self):
         from .cloud import CloudTap
         from .onpath import OnPath, neighbor_mac
-        from . import events
         a = self.a
         target = _pick_target(a)
         a.target = target
@@ -291,11 +287,9 @@ class Armed:
         if self.dry:
             return
         self._sleep_lock = _inhibit_sleep("camera gateway")
-        events.emit("onpath", state="arming")
         self.onpath.start()
         if self.tap:
             self.tap.start()
-        events.emit("onpath", state="on")
 
     def enr(self):
         a = self.a

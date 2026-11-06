@@ -12,17 +12,22 @@ def _rec(direction, payload, ts=0.0):
 def _media(ft, ch, frame_no, cidx, paysize, payload, last=0):
     # frame types with bit 0x08 carry 8 extra header bytes at [8:16]
     o = 8 if ft & 0x08 else 0
-    hdr = bytearray(36 + o)
-    hdr[0] = 0x0C
-    hdr[1] = ft
+    hdr = bytearray(28 + o)
+    hdr[0], hdr[1] = ch, ft
     struct.pack_into("<H", hdr, 2, 0x000C)
-    struct.pack_into("<H", hdr, 16 + o, ch)
-    struct.pack_into("<H", hdr, 20 + o, last)
-    struct.pack_into("<H", hdr, 22 + o, cidx)
-    struct.pack_into("<H", hdr, 24 + o, paysize)
-    struct.pack_into("<I", hdr, 28 + o, frame_no - 1)
-    struct.pack_into("<I", hdr, 32 + o, frame_no)
+    struct.pack_into("<H", hdr, 8 + o, ch)
+    struct.pack_into("<H", hdr, 12 + o, last)
+    struct.pack_into("<H", hdr, 14 + o, cidx)
+    struct.pack_into("<H", hdr, 16 + o, paysize)
+    struct.pack_into("<I", hdr, 20 + o, frame_no - 1)
+    struct.pack_into("<I", hdr, 24 + o, frame_no)
     return bytes(hdr) + payload
+
+
+def _video_frames(path):
+    s = av_extract.sessions(path)
+    return ([t for t in av_extract.assemble(s[0]) if t[1] in av_extract.VIDEO_CHANNELS]
+            if s else [])
 
 
 def _write(blob):
@@ -49,10 +54,10 @@ def test_reassembly_dedupe_frameinfo_strip():
         _rec(1, _media(0x00, 5, 7, 1, len(p2), p2, last=3)),
         # audio is not video
         _rec(1, _media(0x01, 3, 1, 0x0028, 4, b"\x11\x22\x33\x44", last=1)),
-        _rec(1, b"\x0c\x00-truncated"),
+        _rec(1, b"\x05\x00\x0c-truncated"),
     ]))
     try:
-        frames = av_extract.extract_combined(path)
+        frames = _video_frames(path)
         assert [(f[1], f[2], f[4]) for f in frames] == [(5, 7, True)]
         assert frames[0][3] == sps + p1 + p2 + b"\xCC" * 12
     finally:
@@ -66,19 +71,20 @@ def test_missing_middle_chunk_is_incomplete():
         _rec(1, _media(0x01, 5, 7, 0x0028, 8, b"\xCC" * 8, last=3)),
     ]))
     try:
-        (f,) = av_extract.extract_combined(path)
+        (f,) = _video_frames(path)
         assert f[4] is False
     finally:
         os.unlink(path)
 
 
-def test_sessions_split_on_frame_reset_and_gap():
+def test_sessions_split_at_session_marks():
     one = lambda fno, ts: _rec(1, _media(0x01, 7, fno, 0x0028, 8, b"\x41" * 8, last=1), ts)
-    path = _write(b"".join([one(n, n * 0.05) for n in range(1, 120)]
-                           + [one(n, 10 + n * 0.05) for n in range(1, 5)]     # reset
-                           + [one(n, 30 + n * 0.05) for n in range(5, 9)]))   # gap
+    mark = _rec(av_extract.SESSION_MARK, b"")
+    path = _write(b"".join([mark] + [one(n, n * 0.05) for n in range(1, 120)]
+                           + [mark] + [one(n, 10 + n * 0.05) for n in range(1, 5)]
+                           + [mark, mark]))                # an empty session
     try:
-        assert [len(s) for s in av_extract.sessions(path)] == [119, 4, 4]
+        assert [len(s) for s in av_extract.sessions(path)] == [119, 4]
     finally:
         os.unlink(path)
 

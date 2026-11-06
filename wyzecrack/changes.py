@@ -74,10 +74,8 @@ _GONE = ("does not exist", "Bad rule", "No chain", "No such file",
 def _undo(item):
     """Undo one change; raises RuntimeError if it could not be undone."""
     kind = item["kind"]
-    if kind in ("ipt", "ip"):
-        argv = (["iptables", "-w", *item["args"]] if kind == "ipt"
-                else ["ip", *item["args"]])
-        r = run(argv)
+    if kind == "ipt":
+        r = run(["iptables", "-w", *item["args"]])
         if r.returncode and not any(g in r.stderr for g in _GONE):
             raise RuntimeError(r.stderr.strip() or f"exit {r.returncode}")
     elif kind == "sysctl":
@@ -98,7 +96,6 @@ def _undo(item):
 
 DESCRIBE = {
     "ipt": lambda i: "iptables " + " ".join(i["args"]),
-    "ip": lambda i: "ip " + " ".join(i["args"]),
     "sysctl": lambda i: f"{i['path']} = {i['value']}",
     "arp": lambda i: f"restore the camera's ARP entry for its gateway ({i['iface']})",
 }

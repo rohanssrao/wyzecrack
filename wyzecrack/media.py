@@ -1,46 +1,31 @@
 """Reassemble the decrypted TUTK/Wyze AV media of a session's av.bin.
 
 av.bin entry format (written by direct.Direct): "<BdI" = direction byte
-(0 = to the camera, 1 = from the camera, 255 = a new session starts),
-capture timestamp (double), payload length (u32 LE), then the decrypted
-DTLS application-data record. (Captures from older versions, which
-spliced the Wyze app's live views, have the same format.)
+(1 = from the camera, 255 = a new session starts), capture timestamp
+(double), payload length (u32 LE), then the decrypted DTLS application
+record.
 
-Media records from the camera (first byte 0x0c) carry a 36-byte header:
+Media records from the camera carry a 28-byte header:
 
-  [0]     0x0c magic
+  [0]     channel: 0x03 audio, 0x05/0x06 video (I), 0x07 video (P)
   [1]     frame type: 0x08/0x09 start, 0x00/0x04 cont, 0x01/0x05 end
-  [2:4]   0x000c protocol version
-  [4:6]   packet sequence
-  [6:8]   stream session constant
-  [10:12] unix-ms low 16 bits
-  [16]    channel: 0x03 audio, 0x05/0x06 video (I), 0x07 video (P)
-  [17]    flags (0x01 on end packets)
-  [18:20] global chunk sequence
-  [20:22] last chunk index of the frame
-  [22:24] chunk index within the frame (0x0028 on end packets marks a
+  [2]     protocol version: 0x0c (v3), 0x0b (v2)
+  [8]     channel again
+  [12:14] last chunk index of the frame
+  [14:16] chunk index within the frame (0x0028 on end packets marks a
           40-byte FrameInfo trailer inside the payload, cf. go2rtc
           pkg/tutk frame.go ParsePacketHeader)
-  [24:26] payload size
-  [28:32] previous frame number
-  [32:36] frame number
-  [36:]   payload
+  [16:18] payload size
+  [20:24] previous frame number
+  [24:28] frame number
+  [28:]   payload
 
 Frame types with bit 0x08 set (0x08 start, 0x09 single-packet frame,
-0x0d) carry 8 extra header bytes at [8:16]: every field above from [8]
-on sits 8 bytes later and the payload starts at [44]. Every I-frame's
-first chunk and most single-packet P-frames use it (run14: 40 of ~560
-frames), so parsing them with the 36-byte layout corrupts exactly the
-frames that start a new picture. Bit 0x01 marks a frame's last packet.
-
-That is the resend ("wrapped") format the Wyze app asks for. A direct
-session (direct.py, which logs in like go2rtc) gets the plain format: the
-same records without the first 8 bytes of the outer header, so [0] is the
-channel and the fields above sit 8 bytes earlier (channel at [8], or [16]
-with the 0x08 bit; payload at [28] or [36]).
-
-Output: one Annex-B .h264 per channel, ordered by first appearance.
-Verified against live captures (fw 4.36.17.21): H.264 640x360.
+0x0d) carry 8 extra header bytes: every field above from [8] on sits 8
+bytes later and the payload starts at [36]. Every I-frame's first chunk
+and most single-packet P-frames use it, so parsing them with the short
+layout corrupts exactly the frames that start a new picture. Bit 0x01
+marks a frame's last packet.
 """
 
 import os
@@ -48,6 +33,7 @@ import struct
 
 VIDEO_CHANNELS = (5, 6, 7)
 MEDIA_CHANNELS = (3, 5, 6, 7)
+HEADER = 8                  # bytes before the [8] fields above
 # audio codecs in the FrameInfo: the v3 sends 16-bit PCM (0x8C), the v2
 # G.711 mu-law (0x89); both 8 kHz mono. G.711 is decoded to 16-bit PCM
 # here, so everything downstream sees one format.
@@ -81,18 +67,11 @@ def parse_media(p):
     count), or None for anything else. `count` is the frame's packet
     count (chunks 0..count-2 plus the end packet). The end packet's chunk
     index comes back as 0xFFFF so it sorts last; a 0x0028 marker there
-    means the payload ends with the 40-byte FrameInfo, which is stripped.
-    Takes both the wrapped (resend) and the plain record format."""
-    if len(p) < 28:
-        return None
-    if p[0] == 0x0C:
-        base = 16                       # wrapped: 16-byte outer header
-    elif p[0] in MEDIA_CHANNELS and p[2] in (0x0B, 0x0C):
-        base = 8                        # plain: 8-byte outer header
-    else:
+    means the payload ends with the 40-byte FrameInfo, which is stripped."""
+    if len(p) < 28 or p[0] not in MEDIA_CHANNELS or p[2] not in (0x0B, 0x0C):
         return None
     ft = p[1]
-    o = base + (8 if ft & 0x08 else 0)
+    o = HEADER + (8 if ft & 0x08 else 0)
     if len(p) < o + 20:
         return None
     ch = p[o]
@@ -123,37 +102,24 @@ def read_entries(path):
         off += 13 + ln
 
 
-# a new camera AV session (another live view, or a rebuilt engine)
-# restarts frame numbers; a gap this long also starts a new session
-SESSION_GAP = 5.0
-# an av.bin entry with this direction byte (and no payload) marks the start
-# of a session explicitly (direct.py writes one per session)
+# an av.bin entry with this "direction" (and no payload) marks the start
+# of a session (direct.py writes one per session): frame numbers restart
 SESSION_MARK = 255
 
 
-def sessions(path, direction=1):
+def sessions(path):
     """Camera media records of av.bin, split per AV session:
     [[(ts, parsed), ...], ...]. Frame numbers are only unique within one."""
-    out, cur, last_ts, top = [], [], None, {}
+    out, cur = [], []
     for d, ts, p in read_entries(path):
         if d == SESSION_MARK:
             if cur:
                 out.append(cur)
-            cur, top, last_ts = [], {}, None
+            cur = []
             continue
-        if d != direction:
-            continue
-        m = parse_media(p)
-        if m is None:
-            continue
-        ch, frame_no = m[0], m[1]
-        if cur and ((last_ts is not None and ts - last_ts > SESSION_GAP)
-                    or frame_no + 50 < top.get(ch, 0)):
-            out.append(cur)
-            cur, top = [], {}
-        cur.append((ts, m))
-        top[ch] = max(top.get(ch, 0), frame_no)
-        last_ts = ts
+        m = parse_media(p) if d == 1 else None
+        if m is not None:
+            cur.append((ts, m))
     if cur:
         out.append(cur)
     return out
@@ -182,14 +148,6 @@ def assemble(records):
         blob = b"".join(pl for _, pl in sorted(f["pkts"].items()))
         out.append((f["t"], key[0], key[1], blob, complete))
     return out
-
-
-def extract_combined(path, direction=1):
-    """All video frames (channels 5/6/7) of the first AV session, merged
-    in arrival order. The P-frames on one channel reference SPS/PPS
-    delivered on another, so this interleaving is what decodes."""
-    s = sessions(path, direction)
-    return [t for t in assemble(s[0]) if t[1] in VIDEO_CHANNELS] if s else []
 
 
 def _has_idr(blob):

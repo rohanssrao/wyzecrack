@@ -235,7 +235,7 @@ class Controller:
             if cam_dir.exists():
                 _give_to_user(cam_dir.parent, started)
             if self.state.get("phase") != "error":
-                self.set(phase="idle", session=None)
+                self.set(phase="idle", since=None)
             self.hub.send_json({"kind": "library"})
 
     def _key(self, cam, cam_dir):
@@ -287,7 +287,7 @@ class Controller:
         sleep_lock = _inhibit_sleep("showing a live view")
         try:
             while not self.stop.is_set():
-                self.set(phase="connecting", session={"state": "direct"})
+                self.set(phase="connecting")
                 scope = self.journal.scope()
                 d, why = None, ""
                 framing = _cached(cam["mac"]).get("framing")
@@ -351,19 +351,17 @@ class Controller:
             self.jpeg.close()       # the next stream starts at its own key frame
             self.jpeg = None
         self.live = LiveAssembler(on_video=self._video, on_audio=self._audio)
-        self.live_stats = {"frames": 0, "t0": None, "recent": [], "size": None,
-                           "codec": None}
+        self.live_stats = {"frames": 0, "size": None, "codec": None}
 
-    def _on_av(self, direction, ts, plaintext):
+    def _on_av(self, ts, plaintext):
         if self.live:
-            self.live.feed(direction, ts, plaintext)
+            self.live.feed(ts, plaintext)
 
     def _video(self, f):
         if self.state.get("phase") != "live":
             # the page's recording timer runs from the view's first picture
             self._view_since = self._view_since or time.time()
-            self.set(phase="live", session={"state": "live",
-                                            "since": self._view_since})
+            self.set(phase="live", since=self._view_since)
         st = self.live_stats
         codec = codec_string(f.sps)
         size = self.live.size
@@ -373,9 +371,6 @@ class Controller:
                                 "width": size[0] if size else None,
                                 "height": size[1] if size else None})
         st["frames"] += 1
-        now = time.time()
-        st["t0"] = st["t0"] or now
-        st["recent"] = [t for t in st["recent"] if now - t < 2] + [now]
         self.hub.send_bytes(struct.pack(">BBd", MSG_VIDEO, f.key, f.t) + f.data,
                             audience="h264")
         if self.hub.jpeg:
@@ -387,15 +382,6 @@ class Controller:
 
     def _audio(self, ts, pcm):
         self.hub.send_bytes(struct.pack(">Bd", MSG_AUDIO, ts) + pcm)
-
-    def stats(self):
-        st = self.live_stats
-        if not st or not st.get("t0") or self.state.get("phase") != "live":
-            return None
-        return {"fps": round(len(st["recent"]) / 2, 1), "frames": st["frames"],
-                "width": st["size"][0] if st["size"] else None,
-                "height": st["size"][1] if st["size"] else None,
-                "seconds": round(time.time() - st["t0"], 1)}
 
     def _session_end(self, out, had_video):
         self._new_live()
@@ -422,7 +408,6 @@ class Controller:
         if not main:
             # the camera hung up before a whole picture
             shutil.rmtree(out, ignore_errors=True)
-            self.hub.send_json({"kind": "dropped"})
             return
         cam = self.camera or {}
         meta = {"mac": cam.get("mac"), "ip": cam.get("ip"),
@@ -739,20 +724,8 @@ def make_app(token, hub, ctl, lib):
             hub.jpeg.discard(sock)
         return sock
 
-    async def ticker(app):
-        async def tick():
-            while True:
-                await asyncio.sleep(1)
-                st = ctl.stats()
-                if st:
-                    hub.send_json({"kind": "stats", **st})
-        task = asyncio.ensure_future(tick())
-        yield
-        task.cancel()
-
     app = web.Application(middlewares=[auth])
     app["quit"] = asyncio.Event()
-    app.cleanup_ctx.append(ticker)
     app.add_routes([
         web.get("/", index), web.get("/api/cameras", cameras),
         web.post("/api/start", start), web.post("/api/stop", stop),

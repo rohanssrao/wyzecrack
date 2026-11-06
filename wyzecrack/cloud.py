@@ -18,7 +18,6 @@ the camera's requests:
   pre-signed URLs, with no encryption beyond TLS.
 """
 import datetime as dt
-import ipaddress
 import json
 import os
 import re
@@ -161,10 +160,7 @@ def mint_leaf(host, workdir):
     # RSA-2048 is what the camera was seen accepting
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = dt.datetime.now(dt.timezone.utc)
-    try:
-        san = x509.IPAddress(ipaddress.ip_address(host))
-    except ValueError:
-        san = x509.DNSName(host)
+    san = x509.DNSName(host)
     cert = (x509.CertificateBuilder()
             # a CN is limited to 64 characters; the SAN is what clients check
             .subject_name(x509.Name(
@@ -192,12 +188,6 @@ def mint_leaf(host, workdir):
     certfile.write_bytes(b"".join(c.public_bytes(serialization.Encoding.PEM)
                                   for c in (cert, icert, *cross)))
     return str(certfile), str(keyfile)
-
-
-def find_enr(buf):
-    """(enr, mac or None) from an HTTP request buffer, or None."""
-    info = device_info(buf)
-    return (info["enr"], info.get("mac")) if info else None
 
 
 def device_info(buf):

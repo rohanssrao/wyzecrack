@@ -105,9 +105,6 @@ def test_parse_media_takes_the_plain_format():
     assert parse_media(first) == (5, 9, 0, b"\x00\x00\x00\x01\x67abc", False, 3)
     assert parse_media(mid) == (5, 9, 1, b"middle", False, 3)
     assert parse_media(end) == (5, 9, 0xFFFF, b"tail", True, 3)
-    # the wrapped form is the same record behind 8 more header bytes
-    wrapped = b"\x0c" + mid[1:8] + bytes(8) + mid[8:]
-    assert parse_media(wrapped) == parse_media(mid)
     assert parse_media(b"\x09\x00\x0c\x00" + bytes(40)) is None   # an ACK
 
 

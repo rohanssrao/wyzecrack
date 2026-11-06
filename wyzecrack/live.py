@@ -6,7 +6,6 @@ and on_audio(ts, pcm) for each audio frame (signed 16-bit little-endian
 PCM, 8 kHz mono, the camera's live audio format: codec 0x8C).
 """
 import struct
-import time
 
 from .media import parse_media
 
@@ -144,12 +143,8 @@ class LiveAssembler:
         self.gop_ok = False
         self.last_sps = None
         self.size = None
-        self.frames = self.dropped = 0
-        self.started = None
 
-    def feed(self, direction, ts, plaintext):
-        if direction != 1:
-            return
+    def feed(self, ts, plaintext):
         m = parse_media(plaintext)
         if m is None:
             return
@@ -202,7 +197,6 @@ class LiveAssembler:
                 self.wait_since = now
             if now - self.wait_since < REORDER_WAIT:
                 return
-            self.dropped += 1
             self.gop_ok = False
             self.next_no = min(self.ready)
             self.wait_since = None
@@ -219,9 +213,6 @@ class LiveAssembler:
                     self.size = sps_size(blob[blob.find(sps):]) or self.size
                 self.last_sps = sps
         if not self.gop_ok or self.last_sps is None:
-            self.dropped += 1
             return
-        self.frames += 1
-        self.started = self.started or time.time()
         if self.on_video:
             self.on_video(Frame(t, blob, key, self.last_sps))

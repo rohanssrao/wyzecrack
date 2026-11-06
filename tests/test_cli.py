@@ -5,10 +5,10 @@ import os
 from wyzecrack import cli
 
 
-def test_enr_cache_by_mac_and_old_ip_keyed_format(tmp_path, monkeypatch):
+def test_enr_cache_by_mac(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "STATE_DIR", tmp_path)
     (tmp_path / "enr.json").write_text(json.dumps(
-        {"192.168.1.20": {"enr": "old", "mac": "D03F27A1B2C3", "seen": 1}}))
+        {"D03F27A1B2C3": {"enr": "old", "seen": 1}}))
     assert cli._cached_enr("d0:3f:27:a1:b2:c3") == "old"
     cli._cache_enr("d0:3f:27:a1:b2:c3", "new")
     assert cli._cached_enr("D0:3F:27:A1:B2:C3") == "new"
