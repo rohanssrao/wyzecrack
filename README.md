@@ -23,10 +23,10 @@ Wyze a few times meanwhile, and its network goes back to normal
 afterwards. From then on, live views start within seconds.
 
 Every live view is recorded. When you press **Stop**, the recording
-appears under the camera's live view. The files are in a `captures`
-folder in the directory you started wyzecrack from. To keep a camera's
-motion clips too, turn on **Save this camera's motion clips** on its page.
-Clips are copied while wyzecrack is running.
+appears under the camera's live view, where you can play or delete it.
+Recordings and motion clips are saved in `~/Videos/wyzecrack`, a folder per
+camera. To keep a camera's motion clips too, turn on **Save motion clips**
+on its page. Clips are copied while wyzecrack is running.
 
 Tested with the Wyze Cam v3 (firmware 4.36.16 and 4.36.17) and the Wyze
 Cam v2 (4.9.9).

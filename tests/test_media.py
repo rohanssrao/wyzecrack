@@ -199,13 +199,17 @@ def test_only_the_main_resolution_is_kept(tmp_path):
         assert (c.streams.video[0].width, c.streams.video[0].frames) == (640, 60)
 
 
-def test_watch_keeps_only_the_video_and_its_still(tmp_path):
-    from wyzecrack import cli
+def test_a_saved_recording_is_its_video_still_and_meta(tmp_path):
+    import json
+    from wyzecrack.files import save_recording
     from test_jpegfeed import _h264_frames
     av_bin = tmp_path / "av.bin"
     _write_av_bin(av_bin, [(1000.0, _h264_frames(n=20))])
-    assert cli._export(av_bin, tmp_path)
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["frame.jpg", "video.mp4"]
+    r = save_recording(av_bin, tmp_path, "D03F27A1B2C3", 1000.0)
+    assert r["mp4"] and not r["error"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["frame.jpg", "meta.json", "video.mp4"]
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    assert meta["mac"] == "D03F27A1B2C3" and meta["started"] == 1000.0
 
 
 def test_a_session_that_starts_mid_gop_drops_its_lead_in(tmp_path):

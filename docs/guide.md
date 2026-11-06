@@ -9,7 +9,7 @@ frames instead (720p, about 10 a second). Options:
 - `--listen <address>` serves it on another address (a tailnet address,
   say) so you can watch from another device.
 - `--no-browser` prints the link instead of opening it.
-- `--out <dir>` sets where recordings go (default `./captures`).
+- `--out <dir>` sets where recordings go (default `~/Videos/wyzecrack`).
 - `--port <n>` picks the port (default: any free one).
 
 ## Commands
@@ -23,31 +23,38 @@ the network has one Wyze device, and asks which one when it has several;
   hangs up, it reconnects, as the page does, and gives up after three
   tries in a row without a picture; it's all one recording.
   - `--seconds <n>` stops after that many seconds of live view.
-  - `--out <dir>` sets where the recording goes (default
-    `captures/watch-<time>`).
+  - `--out <dir>` sets where the recording goes (default: a new folder in
+    the camera's folder, where the page lists it).
   - `--reharvest` reads the camera's key again, for a camera that was set
     up again in the Wyze app.
   - `--enr <ENR>` uses this key, and saves it, instead of reading it.
-- `wyzecrack events` saves motion clips until Ctrl-C; `--count <n>` stops
-  after that many, `--out <dir>` sets where.
+- `wyzecrack events` saves motion clips until Ctrl-C, in the camera's
+  `events` folder; `--count <n>` stops after that many, `--out <dir>` sets
+  where.
 - `wyzecrack cleanup` undoes the network changes of a wyzecrack that was
   killed.
 - `wyzecrack extract <recording>` tries again to write a recording's video,
   if that failed.
 
-Keys and camera IDs are saved in `/var/lib/wyzecrack/enr.json`.
+Keys and camera IDs are saved in `~/.local/share/wyzecrack/enr.json`, and the
+page's camera names and settings in `cameras.json` next to it.
 
 ## Files
 
-A recording is `video.mp4`, the live view in HD at true speed with sound,
-and `frame.jpg`, its last picture; the page's recordings also have a
-`meta.json` it lists them from. If writing the video failed, the
-recording keeps `av.bin`, everything the camera sent, decrypted, for
-`extract` to try again.
+Recordings and motion clips go in `~/Videos/wyzecrack` (your
+`XDG_VIDEOS_DIR` if you've set one), a folder per camera. The page lists
+each camera's files and can play, download and delete them.
 
-A motion event's directory (`events/<time>_<id>/`) holds `clip.mp4`,
-`snapshot.jpg` and `meta.json` (the clip's length). The v2 uploads no
-snapshot, so its still is taken from the clip.
+A recording is a folder named after the time it started, holding
+`video.mp4` (the live view in HD at true speed, with sound), `frame.jpg`
+(its last picture) and `meta.json` (which camera, when, how long). If
+writing the video failed, the folder keeps `av.bin`, everything the camera
+sent, decrypted, for `extract` to try again.
+
+Motion clips are in the camera's `events` folder, one folder per alarm
+(`<time>_<id>/`) with `clip.mp4`, `snapshot.jpg` and `meta.json` (the
+clip's length). The v2 uploads no snapshot, so its still is taken from the
+clip.
 
 Files are owned by the user who started wyzecrack.
 

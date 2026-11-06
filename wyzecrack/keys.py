@@ -1,5 +1,5 @@
 """A camera's key (ENR) and P2P ID (UID), read once and kept in
-/var/lib/wyzecrack/enr.json by camera MAC.
+enr.json in wyzecrack's data directory (files.data_dir), by camera MAC.
 
 The ENR comes off the camera's own HTTPS while the camera is routed
 through this host (onpath.Reroute); on the models it was tried on,
@@ -8,33 +8,23 @@ right away. The UID comes from Wyze's device API, asked with the camera's
 MAC and ENR (cloud.fetch_uid).
 """
 import json
-import os
 import time
-from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("WYZECRACK_STATE", "/var/lib/wyzecrack"))
+from .files import data_dir, mac_key, write_json
+
 # firmware to quote to Wyze when the camera's own report didn't say
 DEFAULT_FW = "4.36.17.21"
 
 
-def mac_key(mac):
-    return mac.replace(":", "").upper()
-
-
 def _load():
     try:
-        return json.loads((STATE_DIR / "enr.json").read_text())
+        return json.loads((data_dir() / "enr.json").read_text())
     except (OSError, ValueError):
         return {}
 
 
 def _store(d):
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = STATE_DIR / "enr.json.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps(d, indent=1) + "\n")
-    os.replace(tmp, STATE_DIR / "enr.json")
+    write_json(data_dir() / "enr.json", d, mode=0o600)
 
 
 def cached(mac):

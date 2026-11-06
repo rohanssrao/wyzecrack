@@ -7,13 +7,14 @@ import pytest
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
-from wyzecrack import gui  # noqa: E402
+from wyzecrack import files, gui  # noqa: E402
 
 
 class FakeController:
     def __init__(self):
         self.state = {"phase": "idle"}
         self.started = None
+        self.codec = None
 
     def start(self, cam):
         self.started = cam
@@ -44,7 +45,8 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_token_login_api_and_files(tmp_path):
+def test_token_login_api_and_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("WYZECRACK_STATE", str(tmp_path / "state"))
     lib = _library(tmp_path)
     ctl = FakeController()
 
@@ -63,6 +65,13 @@ def test_token_login_api_and_files(tmp_path):
             assert (await c.get("/files/../../etc/passwd")).status == 404
             r = await c.post("/api/start", json={"ip": "192.168.1.20", "mac": "x"})
             assert r.status == 200 and ctl.started["ip"] == "192.168.1.20"
+            assert lib_["folder"].endswith("my-camera-A1B2C3")
+            # deleting a recording takes its folder
+            video = lib_["recordings"][0]["video"]
+            assert (await c.post("/api/delete", json={"url": video})).status == 200
+            assert (await c.post("/api/delete", json={"url": video})).status == 404
+            lib_ = await (await c.get("/api/library?mac=d0:3f:27:a1:b2:c3")).json()
+            assert lib_["recordings"] == []
     run(go())
 
 
@@ -92,14 +101,14 @@ class _FakeCapture:
 def test_motion_capture_on_off_follow_and_pause(tmp_path, monkeypatch):
     from wyzecrack import onpath
     from wyzecrack.changes import Changes
-    monkeypatch.setattr(gui, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setenv("WYZECRACK_STATE", str(tmp_path / "state"))
     monkeypatch.setattr(onpath, "Reroute", _FakeCapture)
     _FakeCapture.made = []
     ctl = gui.Controller(gui.Hub(), gui.Library(tmp_path / "captures"),
                          Changes(tmp_path / "run"))
     cam = {"mac": "d0:3f:27:a1:b2:c3", "ip": "192.168.1.20", "model": "Wyze Cam v3"}
     ctl.set_motion(cam, True)
-    assert gui._names()["D03F27A1B2C3"]["motion"] is True
+    assert files.camera_settings()["D03F27A1B2C3"]["motion"] is True
     assert ctl.capture_status(cam["mac"]) == "on"
     # the camera moved to another address: the capture follows it
     ctl.ensure_captures([{**cam, "ip": "192.168.1.25", "motion": True}])
@@ -110,7 +119,7 @@ def test_motion_capture_on_off_follow_and_pause(tmp_path, monkeypatch):
         assert not _FakeCapture.made[1].running
     assert _FakeCapture.made[1].running
     ctl.set_motion(cam, False)
-    assert gui._names()["D03F27A1B2C3"]["motion"] is False
+    assert files.camera_settings()["D03F27A1B2C3"]["motion"] is False
     assert ctl.capture_status(cam["mac"]) is None
 
 

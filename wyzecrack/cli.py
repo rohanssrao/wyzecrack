@@ -113,30 +113,14 @@ def _close(journal):
     journal.release()
 
 
-def give_to_user(path, since):
-    """Under sudo, hand back the files this run created."""
-    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
-    if not uid:
-        return
-    for root, dirs, files in os.walk(path):
-        for n in [root, *(os.path.join(root, f) for f in dirs + files)]:
-            st = os.lstat(n)
-            if st.st_uid == 0 and st.st_mtime >= since - 1:
-                os.chown(n, int(uid), int(gid))
-
-
-def _default_out(prefix):
-    return Path(f"captures/{prefix}{time.strftime('%Y%m%d-%H%M%S')}")
-
-
-def _new_root(path):
-    """The topmost directory of `path` that does not exist yet (what this
-    run will create), or path itself if it exists."""
-    path = Path(path).absolute()
-    root = path
-    while not root.parent.exists():
-        root = root.parent
-    return root if not path.exists() else path
+def _camera_dir(mac):
+    """The camera's directory in the videos directory, as the page uses."""
+    from . import keys
+    from .discover import MODELS
+    from .files import Library, camera_settings, mac_key
+    model = keys.cached(mac).get("model")
+    return Library().camera_dir({"mac": mac, "model": MODELS.get(model, model),
+                                 **camera_settings().get(mac_key(mac), {})})
 
 
 # -- commands ---------------------------------------------------------------
@@ -145,6 +129,7 @@ def cmd_watch(a):
     --seconds). When the camera hangs up it reconnects, as the page does;
     everything goes into one recording."""
     from . import keys
+    from .files import make_dir
     from .view import watch
     started = time.time()
     target = _pick_target(a)
@@ -153,9 +138,8 @@ def cmd_watch(a):
         keys.save(mac, enr=a.enr)
     elif a.reharvest:
         keys.forget_enr(mac)
-    out = Path(a.out) if a.out else _default_out("watch-")
-    root = _new_root(out)
     journal = _journal()
+    out = None
     seen = set()                   # "live", "picture"
 
     def picture(frame):
@@ -175,7 +159,8 @@ def cmd_watch(a):
 
     try:
         enr, uid = keys.camera_key(journal, target, mac)
-        out.mkdir(parents=True, exist_ok=True)
+        out = make_dir(Path(a.out) if a.out else
+                       _camera_dir(mac) / time.strftime("%Y%m%d-%H%M%S"))
         watch(journal, target, mac, enr, uid, str(out / "av.bin"),
               threading.Event(), seconds=a.seconds, on_video=picture,
               on_status=status)
@@ -183,21 +168,21 @@ def cmd_watch(a):
         print()
     finally:
         _close(journal)
-    if (out / "av.bin").exists():
-        _export(out / "av.bin", out)
-    if out.is_dir() and not any(out.iterdir()):
-        out.rmdir()
-    if root.exists():
-        give_to_user(root, started)
+    if out is not None:
+        if (out / "av.bin").exists():
+            _export(out / "av.bin", out, mac, started)
+        if out.is_dir() and not any(out.iterdir()):
+            out.rmdir()
     return 0 if "picture" in seen else 1
 
 
 def cmd_events(a):
+    from .files import give_to_user, make_dir
     from .onpath import Reroute
     started = time.time()
     target = _pick_target(a)
-    out = Path(a.out) if a.out else _default_out("events-")
-    root = _new_root(out)
+    mac = _camera_mac(target)
+    out = make_dir(Path(a.out) if a.out else _camera_dir(mac) / "events")
     journal = _journal()
     saved = []
 
@@ -205,7 +190,7 @@ def cmd_events(a):
         print(f"[+] motion event: {path}")
         saved.append(path)
 
-    r = Reroute(journal, target, on_path=a.on_path, events_dir=out,
+    r = Reroute(journal, target, mac, on_path=a.on_path, events_dir=out,
                 on_motion=on_motion)
     try:
         r.start()
@@ -218,9 +203,8 @@ def cmd_events(a):
     finally:
         r.stop()
         _close(journal)
-    if out.exists():
-        give_to_user(root, started)
-        print(f"[+] {len(saved)} event file(s) in {out}/")
+    give_to_user(out, started)
+    print(f"[+] {len(saved)} event file(s) in {out}/")
     return 0
 
 
@@ -234,19 +218,14 @@ def cmd_cleanup(a):
     return 0
 
 
-def _export(av, outdir):
-    """video.mp4 and frame.jpg from av.bin, which then goes; it stays if
-    the export failed, for `extract` to try again."""
-    from .media import export
-    try:
-        r = export(str(av), str(outdir))
-    except Exception as e:  # noqa: BLE001
-        r = {"mp4": None, "error": repr(e)}
+def _export(av, outdir, mac=None, started=None):
+    """video.mp4, frame.jpg and meta.json from av.bin (files.save_recording)."""
+    from .files import save_recording
+    r = save_recording(av, outdir, mac, started)
     if r["error"]:
         print(f"[!] couldn't write the video ({r['error']}); "
               f"`wyzecrack extract {outdir}` tries again")
         return False
-    av.unlink()
     if not r["mp4"]:
         print("[!] the camera sent no whole picture")
         return False
@@ -266,7 +245,7 @@ def cmd_extract(a):
 
 def cmd_gui(a):
     from .gui import serve
-    return serve(listen=a.listen, port=a.port, out=a.out or "captures",
+    return serve(listen=a.listen, port=a.port, out=a.out,
                  browser=not a.no_browser)
 
 
@@ -315,7 +294,7 @@ def main(argv=None):
                    help="address to serve the page on (e.g. a tailnet address "
                         "to watch from another device)")
     g.add_argument("--port", type=int, default=0)
-    g.add_argument("--out", help="where recordings go (default ./captures)")
+    g.add_argument("--out", help="where recordings go (default ~/Videos/wyzecrack)")
     g.add_argument("--no-browser", action="store_true",
                    help="print the link instead of opening a browser")
     g.set_defaults(fn=cmd_gui)
@@ -329,7 +308,8 @@ def main(argv=None):
     w.add_argument("--reharvest", action="store_true",
                    help="read the camera's key again (after it was set up "
                         "again in the Wyze app)")
-    w.add_argument("--out", help="output directory (default captures/watch-<time>)")
+    w.add_argument("--out", help="output directory (default: the camera's "
+                                 "directory in ~/Videos/wyzecrack)")
     w.add_argument("--seconds", type=float, default=0,
                    help="stop after this long live (default: until Ctrl-C)")
     w.set_defaults(fn=cmd_watch)
@@ -341,7 +321,8 @@ def main(argv=None):
                     help="this host already carries the camera's traffic on "
                          "the camera's LAN interface (e.g. the lab): skip ARP "
                          "poisoning")
-    ev.add_argument("--out", help="output directory (default captures/events-<time>)")
+    ev.add_argument("--out", help="output directory (default: the camera's "
+                                  "events directory in ~/Videos/wyzecrack)")
     ev.add_argument("--count", type=int, default=0,
                     help="stop after this many clips (default: until Ctrl-C)")
     ev.set_defaults(fn=cmd_events)

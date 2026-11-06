@@ -31,104 +31,13 @@ from pathlib import Path
 from aiohttp import web
 
 from . import keys
-from .keys import STATE_DIR, mac_key
+from .files import (Library, camera_settings, give_to_user, mac_key, make_dir,
+                    save_camera_settings, save_recording)
 
 WEB = Path(__file__).parent / "web"
 QUIT = web.AppKey("quit", asyncio.Event)
 MSG_VIDEO, MSG_AUDIO, MSG_JPEG = 1, 2, 3
-NO_ANSWER = ("Is it switched on in the Wyze app? A camera that is turned off "
-             "can't be watched. If it is on and was set up again in the Wyze "
-             "app, its key has changed.")
-
-
-# -- camera directory -----------------------------------------------------
-def _names():
-    try:
-        return json.loads((STATE_DIR / "cameras.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_camera(mac, **fields):
-    """Remember the page's settings for a camera (its name, whether its
-    motion clips are saved), keyed by MAC."""
-    d = _names()
-    d.setdefault(mac_key(mac), {}).update(fields)
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = STATE_DIR / "cameras.json.tmp"
-    tmp.write_text(json.dumps(d, indent=1) + "\n")
-    os.replace(tmp, STATE_DIR / "cameras.json")
-
-
-def _slug(text):
-    keep = "".join(c if c.isalnum() else "-" for c in text.lower())
-    return "-".join(p for p in keep.split("-") if p)[:40] or "camera"
-
-
-class Library:
-    """Everything saved under the captures root: recordings (one directory
-    per live view, with meta.json) and motion events, per camera."""
-
-    def __init__(self, root):
-        # resolved, like the paths resolve() checks against it: a symlink
-        # anywhere above the captures root would otherwise refuse every file
-        self.root = Path(root).resolve()
-
-    def camera_dir(self, cam):
-        name = cam.get("name") or cam.get("model") or "camera"
-        return self.root / f"{_slug(name)}-{mac_key(cam['mac'])[-6:]}"
-
-    def recordings(self, mac=None):
-        out = []
-        for meta in self.root.glob("*/*/meta.json"):
-            try:
-                m = json.loads(meta.read_text())
-            except (OSError, ValueError):
-                continue
-            if mac and mac_key(m.get("mac", "")) != mac_key(mac):
-                continue
-            d = meta.parent
-            if not (d / "video.mp4").exists():
-                continue
-            out.append({**m, "video": self.url(d / "video.mp4"),
-                        "thumb": self.url(d / "frame.jpg")
-                        if (d / "frame.jpg").exists() else None})
-        return sorted(out, key=lambda r: r.get("started", 0), reverse=True)
-
-    def motion(self, mac=None):
-        out = []
-        for d in self.root.glob("*/events/*/"):
-            cam = d.parent.parent.name
-            if mac and not cam.endswith(mac_key(mac)[-6:]):
-                continue
-            clip, snap = d / "clip.mp4", d / "snapshot.jpg"
-            if not clip.exists() and not snap.exists():
-                continue
-            try:
-                seconds = json.loads((d / "meta.json").read_text()).get("seconds")
-            except (OSError, ValueError):
-                seconds = None
-            out.append({"t": d.stat().st_mtime,
-                        "clip": self.url(clip) if clip.exists() else None,
-                        "snapshot": self.url(snap) if snap.exists() else None,
-                        "seconds": seconds})
-        return sorted(out, key=lambda e: e["t"], reverse=True)
-
-    def thumb(self, mac):
-        for r in self.recordings(mac):
-            if r["thumb"]:
-                return r["thumb"]
-        for e in self.motion(mac):
-            if e["snapshot"]:
-                return e["snapshot"]
-        return None
-
-    def url(self, path):
-        return "/files/" + str(Path(path).absolute().relative_to(self.root))
-
-    def resolve(self, rel):
-        p = (self.root / rel).resolve()
-        return p if p.is_relative_to(self.root) and p.is_file() else None
+NO_ANSWER = "The camera doesn't answer."
 
 
 # -- the live view, in a worker thread ------------------------------------
@@ -146,6 +55,7 @@ class Controller:
         self.jpeg = None             # jpegfeed.JpegFeed while a page wants it
         self.codec = None            # of the stream the page decodes
         self.since = None            # when this view's first picture came
+        self.started = None          # when this view started
         self.saving = []             # export threads still running
 
     # state shown to the page
@@ -179,7 +89,6 @@ class Controller:
         self.set(steps=steps)
 
     def _run(self):
-        from .cli import give_to_user
         cam = self.camera
         cam_dir = self.lib.camera_dir(cam)
         started = time.time()
@@ -211,8 +120,8 @@ class Controller:
         """The live view until Stop: everything from the click to Stop is
         one recording, reconnects included."""
         from .view import watch
-        out = cam_dir / time.strftime("%Y%m%d-%H%M%S")
-        out.mkdir(parents=True, exist_ok=True)
+        self.started = time.time()
+        out = make_dir(cam_dir / time.strftime("%Y%m%d-%H%M%S"))
         self.since = None
 
         def status(kind, **info):
@@ -221,7 +130,7 @@ class Controller:
                 self.set(phase="connecting")
             elif kind == "retry":
                 self.hub.send_json({"kind": "toast", "text":
-                                    "The camera hung up · reconnecting"
+                                    "Camera disconnected. Reconnecting…"
                                     if info["hung_up"] else "Trying again…"})
             elif kind == "gave_up":
                 self.set(phase="error", error_kind="no_answer", error=NO_ANSWER)
@@ -271,34 +180,23 @@ class Controller:
         t.start()
 
     def _save(self, out):
-        from .cli import give_to_user
-        from .media import export
         self.hub.send_json({"kind": "saving"})
-        started = time.time()
-        try:
-            r = export(str(out / "av.bin"), str(out))
-        except Exception as e:  # noqa: BLE001
-            r = {"mp4": None, "error": repr(e)}
+        r = save_recording(out / "av.bin", out, (self.camera or {}).get("mac"),
+                           self.started)
         if r["error"]:
             # av.bin stays, for `wyzecrack extract` to try again
-            self.hub.send_json({"kind": "toast", "level": "error",
-                                "text": f"Could not save the video: {r['error']}"})
+            self.hub.send_json({"kind": "save_failed", "error": r["error"]})
             return
         if not r["mp4"]:
             # the camera hung up before a whole picture
             shutil.rmtree(out, ignore_errors=True)
             return
-        (out / "av.bin").unlink()
-        meta = {"mac": (self.camera or {}).get("mac"),
-                "started": out.stat().st_mtime, "seconds": round(r["seconds"], 1)}
-        (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
-        give_to_user(out.parent, started - 600)
         self.hub.send_json({"kind": "library", "new": self.lib.url(out / "video.mp4")})
 
     # -- motion clips, in the background -------------------------------
     def set_motion(self, cam, on):
         """Turn saving a camera's motion clips on or off (remembered)."""
-        _save_camera(cam["mac"], motion=bool(on), ip=cam.get("ip"))
+        save_camera_settings(cam["mac"], motion=bool(on), ip=cam.get("ip"))
         with self._cap_lock:
             if on and self._paused != mac_key(cam["mac"]):
                 self._start_capture(cam)
@@ -389,6 +287,7 @@ class Controller:
 
     def _motion(self, path):
         print(f"[+] motion event: {path}")
+        give_to_user(path.parents[2], time.time() - 300)
         if path.name == "clip.mp4":
             snap = path.with_name("snapshot.jpg")
             self.hub.send_json({"kind": "motion", "clip": self.lib.url(path),
@@ -457,7 +356,7 @@ def _cameras(lib):
     from .netutil import default_gateway, internet_iface
     iface = internet_iface()
     gw = default_gateway(iface)
-    names = _names()
+    names = camera_settings()
     out = []
     for ip, mac in find_cameras(iface, [v.get("ip") for v in names.values()]):
         known, saved = keys.cached(mac), names.get(mac_key(mac), {})
@@ -541,14 +440,31 @@ def make_app(token, hub, ctl, lib):
 
     async def name(request):
         body = await request.json()
-        _save_camera(body["mac"], name=body["name"].strip()[:60],
-                     ip=body.get("ip"))
+        save_camera_settings(body["mac"], name=body["name"].strip()[:60] or None,
+                             ip=body.get("ip"))
         return web.json_response({"ok": True})
+
+    def folder_of(mac, model=None):
+        return lib.camera_dir({"mac": mac, "model": model,
+                               **camera_settings().get(mac_key(mac), {})})
 
     async def library(request):
         mac = request.query.get("mac")
+        folder = _shown(folder_of(mac, request.query.get("model"))) if mac else None
         return web.json_response({"recordings": lib.recordings(mac),
-                                  "motion": lib.motion(mac)})
+                                  "motion": lib.motion(mac), "folder": folder})
+
+    async def delete(request):
+        body = await request.json()
+        if not lib.delete(body.get("url", "")):
+            return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"ok": True})
+
+    async def open_folder(request):
+        body = await request.json()
+        d = folder_of(body["mac"], body.get("model"))
+        ok = open_url(str(make_dir(d)))
+        return web.json_response({"ok": ok}, status=200 if ok else 500)
 
     async def files(request):
         p = lib.resolve(request.match_info["rel"])
@@ -566,6 +482,8 @@ def make_app(token, hub, ctl, lib):
         await sock.prepare(request)
         hub.clients.add(sock)
         await sock.send_str(json.dumps({"kind": "state", **ctl.state}))
+        if ctl.codec:          # a page that joins a live view mid-stream
+            await sock.send_str(json.dumps({"kind": "video_config", "codec": ctl.codec}))
         try:
             async for msg in sock:
                 if msg.type != web.WSMsgType.TEXT:
@@ -589,6 +507,7 @@ def make_app(token, hub, ctl, lib):
         web.post("/api/start", start), web.post("/api/stop", stop),
         web.post("/api/name", name), web.get("/api/library", library),
         web.post("/api/motion", motion), web.post("/api/rekey", rekey),
+        web.post("/api/delete", delete), web.post("/api/open", open_folder),
         web.post("/api/quit", quit_), web.get("/ws", ws),
         web.get("/files/{rel:.+}", files),
         web.static("/assets", WEB),
@@ -596,8 +515,16 @@ def make_app(token, hub, ctl, lib):
     return app
 
 
-def open_browser(url):
-    """Open url in the invoking user's desktop session, not as root."""
+def _shown(path):
+    """A path as the user would write it (~ for their home)."""
+    home = os.path.expanduser(f"~{os.environ.get('SUDO_USER', '')}")
+    p = str(path)
+    return "~" + p[len(home):] if p.startswith(home + "/") else p
+
+
+def open_url(url):
+    """Open a link or folder in the invoking user's desktop session, not
+    as root."""
     user = os.environ.get("SUDO_USER")
     env = {k: os.environ[k] for k in ("DISPLAY", "WAYLAND_DISPLAY",
                                       "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
@@ -618,12 +545,12 @@ def open_browser(url):
         return False
 
 
-def serve(listen="127.0.0.1", port=0, out="captures", browser=True):
+def serve(listen="127.0.0.1", port=0, out=None, browser=True):
     from .changes import Changes, signals_held
     token = secrets.token_urlsafe(18)
     hub = Hub()
     lib = Library(out)
-    lib.root.mkdir(parents=True, exist_ok=True)
+    make_dir(lib.root)
     journal = Changes()
     journal.acquire()            # one wyzecrack at a time; replays a crash's
     ctl = Controller(hub, lib, journal)
@@ -643,7 +570,7 @@ def serve(listen="127.0.0.1", port=0, out="captures", browser=True):
         site = web.SockSite(runner, sock)
         await site.start()
         print(f"\n  wyzecrack is running: {url}\n")
-        if browser and open_browser(url):
+        if browser and open_url(url):
             print("  (opened in your browser; Ctrl-C here quits)\n")
         else:
             print("  Open that link in a browser. Ctrl-C here quits.\n")

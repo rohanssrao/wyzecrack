@@ -2,74 +2,114 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>wyzecrack</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/style.css">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5' fill='%232ee6b8'/%3E%3C/svg%3E">
 </head>
 <body>
 <header class="top">
-  <div class="brand"><span class="dot"></span>wyzecrack</div>
-  <button class="ghost" id="quit" title="Stop and exit">Quit</button>
+  <div class="wrap top-in">
+    <a class="brand" href="#/">wyzecrack</a>
+    <button class="btn ghost" id="quit" type="button">Quit</button>
+  </div>
 </header>
+<div class="banner hidden" id="offline" role="status">Lost connection to wyzecrack. Reconnecting…</div>
 
-<main>
-  <!-- camera picker -->
-  <section id="picker" class="view">
-    <div class="hero">
-      <h1>Pick a camera</h1>
-      <p>Its live view plays here and is saved. The first time with a camera takes about two minutes.</p>
-    </div>
-    <div id="scan" class="scan">
-      <div class="radar"><span></span><span></span><span></span></div>
-      <div>Looking for Wyze cameras on your network…</div>
+<main class="wrap">
+  <section id="home" class="view">
+    <div class="page-head">
+      <h1>Cameras</h1>
+      <button class="btn" id="rescan" type="button" data-icon="refresh"><span>Rescan</span></button>
     </div>
     <div id="cams" class="cams"></div>
     <div id="nocams" class="empty hidden">
-      <p>No Wyze cameras answered. Is this computer on the same network as the camera?</p>
+      <h2>No cameras found</h2>
+      <p>Is this computer on the same network as the cameras?</p>
     </div>
-    <div class="row-actions"><button class="ghost" id="rescan">Scan again</button></div>
   </section>
 
-  <!-- one camera -->
-  <section id="session" class="view hidden">
-    <div class="stage" id="stage">
-      <canvas id="video"></canvas>
-      <div class="status">
-        <div class="status-icon" id="status-icon"></div>
-        <h2 id="status-title"></h2>
-        <p id="status-text"></p>
-        <div class="status-extra" id="status-extra"></div>
-        <button class="secondary hidden" id="rekey">Get its key again</button>
-        <button class="secondary hidden" id="again">Watch again</button>
+  <section id="camera" class="view hidden">
+    <a class="back" href="#/" data-icon="arrow-left"><span>Cameras</span></a>
+    <div class="cam-head">
+      <div class="cam-title">
+        <h1 id="cam-name"></h1>
+        <button class="icon-btn" id="rename" type="button" aria-label="Rename camera" title="Rename" data-icon="pencil"></button>
       </div>
-      <div class="hud hidden" id="hud">
-        <div class="hud-tl"><span class="pill live"><i></i>LIVE</span><span class="pill" id="rec">0:00</span></div>
-        <div class="hud-tr"><span class="pill" id="res"></span></div>
-        <div class="hud-br">
-          <button class="icon" id="audio" title="Sound">🔇</button>
-          <button class="icon" id="shot" title="Save a still">📷</button>
-          <button class="icon" id="full" title="Full screen">⛶</button>
+      <div class="cam-meta" id="cam-meta"></div>
+    </div>
+
+    <div class="player" id="player">
+      <div class="screen" id="screen">
+        <canvas id="video"></canvas>
+        <div class="overlay" id="overlay">
+          <div class="spinner" id="spinner"></div>
+          <h2 id="ov-title"></h2>
+          <p id="ov-text"></p>
+          <p class="ov-extra" id="ov-extra"></p>
+        </div>
+      </div>
+      <div class="toolbar" id="toolbar">
+        <div class="stream hidden" id="stream">
+          <span class="rec"><span class="rec-dot"></span><span id="rec-text"></span></span>
+          <span class="res" id="res"></span>
+        </div>
+        <div class="tools">
+          <span class="live-tools hidden" id="live-tools">
+            <button class="icon-btn" id="audio" type="button" aria-label="Turn sound on" title="Sound"></button>
+            <button class="icon-btn" id="shot" type="button" aria-label="Save a still" title="Save a still" data-icon="camera"></button>
+            <button class="icon-btn" id="full" type="button" aria-label="Full screen" title="Full screen"></button>
+          </span>
+          <span class="actions" id="actions"></span>
         </div>
       </div>
     </div>
-    <div class="bar">
-      <div class="cam-title"><span id="cam-name"></span><span class="sub" id="cam-sub"></span></div>
-      <ol class="steps" id="steps"></ol>
-      <button class="ghost" id="stop">Stop</button>
-    </div>
-    <div class="motion-row">
-      <label class="switch"><input type="checkbox" id="motion-toggle"><span class="knob"></span>Save this camera's motion clips</label>
-      <span class="motion-note" id="motion-note"></span>
-    </div>
-    <h3 class="saved-h">Saved <span class="count" id="saved-count"></span></h3>
-    <div class="tiles" id="saved"></div>
+
+    <label class="setting" for="motion">
+      <span>Save motion clips</span>
+      <input type="checkbox" role="switch" class="switch" id="motion">
+    </label>
+    <p class="setting-error hidden" id="motion-error"></p>
+
+    <section class="saved">
+      <div class="saved-head">
+        <h2>Saved <span class="count" id="saved-count"></span></h2>
+        <div class="folder">
+          <span class="path" id="folder-path"></span>
+          <button class="btn small hidden" id="open-folder" type="button" data-icon="folder"><span>Open folder</span></button>
+        </div>
+      </div>
+      <div class="tiles" id="saved"></div>
+    </section>
   </section>
 </main>
 
-<div class="modal hidden" id="modal"><div class="modal-box"><button class="icon close" id="modal-close">✕</button><video id="player" controls playsinline></video></div></div>
-<div class="toasts" id="toasts"></div>
-<footer class="foot">For cameras you own or may test.</footer>
+<dialog id="play-dialog" class="play-dialog" aria-labelledby="play-title">
+  <div class="dialog-head">
+    <h2 id="play-title"></h2>
+    <button class="icon-btn" id="play-close" type="button" aria-label="Close" data-icon="x"></button>
+  </div>
+  <div class="play-body"><video id="play-video" controls playsinline></video></div>
+  <p class="dialog-error hidden" id="play-error" role="alert"></p>
+  <div class="dialog-foot">
+    <a class="btn" id="play-download" data-icon="download"><span>Download</span></a>
+    <button class="btn danger-ghost" id="play-delete" type="button" data-icon="trash"><span>Delete</span></button>
+  </div>
+</dialog>
+
+<dialog id="confirm" class="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <div class="dialog-foot">
+      <button class="btn" value="cancel" id="confirm-cancel"></button>
+      <button class="btn primary" value="ok" id="confirm-ok"></button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
 <script src="/assets/app.js"></script>
 </body>
 </html>

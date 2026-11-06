@@ -6,7 +6,7 @@ from wyzecrack import keys
 
 
 def test_saved_by_mac(tmp_path, monkeypatch):
-    monkeypatch.setattr(keys, "STATE_DIR", tmp_path)
+    monkeypatch.setenv("WYZECRACK_STATE", str(tmp_path))
     (tmp_path / "enr.json").write_text(json.dumps({"D03F27A1B2C3": {"enr": "old"}}))
     assert keys.cached("d0:3f:27:a1:b2:c3")["enr"] == "old"
     keys.save("d0:3f:27:a1:b2:c3", enr="new", uid="U", model=None)
@@ -16,7 +16,7 @@ def test_saved_by_mac(tmp_path, monkeypatch):
 
 
 def test_forgetting_the_key_keeps_the_uid(tmp_path, monkeypatch):
-    monkeypatch.setattr(keys, "STATE_DIR", tmp_path)
+    monkeypatch.setenv("WYZECRACK_STATE", str(tmp_path))
     keys.save("D03F27A1B2C3", enr="e", uid="U", framing="cc51")
     keys.forget_enr("D03F27A1B2C3")
     assert keys.cached("D03F27A1B2C3") == {"uid": "U"}
