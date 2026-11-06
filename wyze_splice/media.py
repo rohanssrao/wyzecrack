@@ -124,6 +124,9 @@ def read_entries(path):
 # a new camera AV session (another live view, or a rebuilt engine)
 # restarts frame numbers; a gap this long also starts a new session
 SESSION_GAP = 5.0
+# an av.bin entry with this direction byte (and no payload) marks the start
+# of a session explicitly (direct.py writes one per session)
+SESSION_MARK = 255
 
 
 def sessions(path, direction=1):
@@ -131,6 +134,11 @@ def sessions(path, direction=1):
     [[(ts, parsed), ...], ...]. Frame numbers are only unique within one."""
     out, cur, last_ts, top = [], [], None, {}
     for d, ts, p in read_entries(path):
+        if d == SESSION_MARK:
+            if cur:
+                out.append(cur)
+            cur, top, last_ts = [], {}, None
+            continue
         if d != direction:
             continue
         m = parse_media(p)
@@ -322,6 +330,25 @@ def make_mp4(h264_path, mp4_path, frames, audio=None):
     return n
 
 
+def clip_facts(mp4_path, jpg_path=None, at=1.0):
+    """{"seconds": length} of a motion clip; with jpg_path, also save the
+    picture `at` s in (or the last one, if shorter) as a still. The v2
+    uploads no snapshot of its own."""
+    import av
+    img, seconds = None, None
+    with av.open(mp4_path) as inp:
+        if inp.duration:
+            seconds = round(inp.duration / 1e6, 1)
+        if jpg_path:
+            for frame in inp.decode(video=0):
+                img = frame.to_image()
+                if frame.time is not None and frame.time >= at:
+                    break
+    if img is not None:
+        img.save(jpg_path, quality=90)
+    return {"seconds": seconds}
+
+
 def last_frame_jpeg(h264_path, jpg_path):
     """Decode the stream and save its last picture (needs Pillow)."""
     import av
@@ -374,20 +401,30 @@ def _size(h264_path):
 MIN_SIDE_SECONDS = 2.0
 
 
-def export(av_bin, outdir):
+def export(av_bin, outdir, merge=False):
     """av.bin -> per AV session (one per live view; a single session is
     written to outdir itself, several to outdir/session-N): video.h264
     (all clean GOPs), one true-speed MP4 per resolution (video.mp4 is the
     longest; others video-WxH.mp4) and frame.jpg, the last picture of
-    video.mp4. Returns totals plus every MP4 written."""
+    video.mp4. Returns totals plus every MP4 written.
+
+    merge=True writes the sessions as one recording instead (the page's:
+    one live view that reconnected when the camera hung up); the picture
+    holds still across each gap."""
     res = {"frames": 0, "dropped": 0, "mp4s": [], "sessions": 0}
-    parts = [([t for t in assemble(recs) if t[1] in VIDEO_CHANNELS], recs)
+    parts = [([t for t in assemble(recs) if t[1] in VIDEO_CHANNELS], recs, None)
              for recs in sessions(av_bin)]
     parts = [p for p in parts if p[0]]
-    for n, (every, recs) in enumerate(parts, 1):
+    if merge and len(parts) > 1:
+        # frame numbers restart with each session, so assemble and dedupe
+        # audio per session, then lay them end to end
+        parts = [([t for p in parts for t in p[0]], (),
+                  [a for p in parts for a in audio_frames(p[1], float("-inf"),
+                                                          float("inf"))])]
+    for n, (every, recs, audio) in enumerate(parts, 1):
         d = outdir if len(parts) == 1 else os.path.join(outdir, f"session-{n}")
         try:
-            r = _export_session(every, d, recs)
+            r = _export_session(every, d, recs, audio)
         except Exception as e:  # noqa: BLE001  (one bad session must not
             res.setdefault("errors", []).append(f"{d}: {e!r}")  # cost the rest)
             continue
@@ -401,7 +438,23 @@ def export(av_bin, outdir):
     return res
 
 
-def _export_session(every, outdir, records=()):
+def _drop_brief_sides(segs):
+    """Leave out brief stretches at another resolution than the main one
+    (the SD moment at the start of each session), so that the stretches
+    either side of one join up again."""
+    if len(segs) < 2:
+        return segs
+    total = {}
+    for seg in segs:
+        sps = _sps(seg[0][3])
+        total[sps] = total.get(sps, 0) + seg[-1][0] - seg[0][0]
+    main_sps = max(total, key=total.get)
+    kept = [seg for seg in segs if _sps(seg[0][3]) == main_sps
+            or seg[-1][0] - seg[0][0] >= MIN_SIDE_SECONDS]
+    return segments([t for seg in kept for t in seg]) if kept else segs
+
+
+def _export_session(every, outdir, records=(), audio=None):
     os.makedirs(outdir, exist_ok=True)
     tagged = decodable(every)
     res = {"frames": len(tagged), "dropped": len(every) - len(tagged),
@@ -411,12 +464,10 @@ def _export_session(every, outdir, records=()):
     h264 = os.path.join(outdir, "video.h264")
     with open(h264, "wb") as f:
         f.write(b"".join(t[3] for t in tagged))
-    segs = segments(tagged)
+    segs = _drop_brief_sides(segments(tagged))
     main = max(range(len(segs)), key=lambda i: len(segs[i]))
     used = set()
     for i, seg in enumerate(segs):
-        if i != main and seg[-1][0] - seg[0][0] < MIN_SIDE_SECONDS:
-            continue          # e.g. the first SD moment before HD kicks in
         part = os.path.join(outdir, f".seg{i}.h264")
         with open(part, "wb") as f:
             f.write(b"".join(t[3] for t in seg))
@@ -432,8 +483,10 @@ def _export_session(every, outdir, records=()):
         used.add(name)
         mp4 = os.path.join(outdir, name)
         try:
+            t0, t1 = seg[0][0], seg[-1][0]
             make_mp4(part, mp4, seg,
-                     audio_frames(records, seg[0][0], seg[-1][0]))
+                     audio_frames(records, t0, t1) if audio is None else
+                     [a for a in audio if t0 - 0.5 <= a[0] <= t1 + 0.5])
         except Exception as e:  # noqa: BLE001
             res.setdefault("errors", []).append(f"{mp4}: {e!r}")
             os.remove(part)

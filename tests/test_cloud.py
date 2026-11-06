@@ -1,9 +1,11 @@
 """Cloud interception: ENR and event parsing, and the eMudhra-signed leaf."""
+import json
 import socket
 import ssl
 import tempfile
 import threading
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 
 from wyze_splice import cloud as enr
@@ -82,6 +84,8 @@ def test_client_hello_sni():
     assert enr.client_hello_sni(b"GET / HTTP/1.1\r\n") is None  # not TLS
     assert enr.intercepts("api.wyzecam.com")
     assert not enr.intercepts("sinker-t-usw2.s3.us-west-2.amazonaws.com")
+    assert enr.intercepts("c-t-usw2.s3.us-west-2.amazonaws.com")    # v2 alarms
+    assert not enr.intercepts("wyze-iot.s3.us-west-2.amazonaws.com")
     assert not enr.intercepts("")
 
 
@@ -150,3 +154,37 @@ def test_fetch_uid_refusal_is_a_cloud_error(monkeypatch):
         b'{"code":"1000","msg":"service is error","data":null}'))
     with pytest.raises(enr.CloudError):
         enr.fetch_uid("D03F27A1B2C3", "x", "WYZE_CAKP2JFUS", "4.36.17.21")
+
+
+def test_event_name_for_a_v2_upload():
+    # a Wyze Cam v2 (4.9.9.3006) PUT to its S3 bucket, 2026-11-05
+    path = (b"/2CAA8ED4E5F6/2026-01-01/2CAA8ED4E5F6021767225800_1767225800810_2_2_0/"
+            b"fedcba9876543210fedcba9876543210_-1.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256")
+    folder, fname = enr.event_name(path)
+    assert fname == "clip.mp4" and folder.endswith("_1767225800")
+
+
+def test_a_clip_without_snapshot_gets_a_still_and_its_length(tmp_path):
+    av = pytest.importorskip("av")
+    from fractions import Fraction
+    mp4 = tmp_path / "src.mp4"
+    with av.open(str(mp4), "w") as out:
+        s = out.add_stream("libx264", rate=10)
+        s.width, s.height, s.pix_fmt = 320, 240, "yuv420p"
+        s.time_base = Fraction(1, 10)
+        for i in range(30):
+            f = av.VideoFrame(320, 240, "yuv420p")
+            for plane in f.planes:
+                plane.update(bytes([i * 8]) * plane.buffer_size)
+            f.pts = i
+            for pkt in s.encode(f):
+                out.mux(pkt)
+        for pkt in s.encode(None):
+            out.mux(pkt)
+    tap = enr.CloudTap(None, "192.168.1.23", events_dir=tmp_path / "events")
+    path = (b"/2CAA8ED4E5F6/2026-01-01/2CAA8ED4E5F6021767225800_1767225800810_2_2_0/"
+            b"fedcba9876543210fedcba9876543210_-1.mp4?X-Amz-Algorithm=x")
+    tap._on_request("PUT", path, {}, mp4.read_bytes())
+    d = next((tmp_path / "events").iterdir())
+    assert (d / "clip.mp4").exists() and (d / "snapshot.jpg").stat().st_size > 0
+    assert json.loads((d / "meta.json").read_text())["seconds"] == pytest.approx(3.0, abs=0.2)

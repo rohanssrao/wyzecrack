@@ -31,6 +31,15 @@ Run as root on Linux, from the repo, after `uv sync`:
     sudo KILL_AT=6 KILL_SIG=TERM bash lab/lab_run.sh splice
                                          # signal the tool mid-session (TERM, HUP, INT2 =
                                          # Ctrl-C twice, KILL = then `cleanup`)
+    sudo bash lab/lab_watch.sh           # direct mode: `watch` against a fake camera
+    sudo FRAMING=iotc bash lab/lab_watch.sh
+                                         # the v2's older framing
+    sudo LOGIN_DELAY=4 bash lab/lab_watch.sh
+                                         # a camera slow to take the AV login
+    sudo QUIET_AFTER=3 SECS=30 bash lab/lab_watch.sh
+                                         # the camera drops off mid-view
+    sudo KILL_AT=5 KILL_SIG=TERM bash lab/lab_watch.sh
+                                         # signal `watch` mid-view (TERM, INT, KILL = then `cleanup`)
     sudo bash lab/arp_check.sh           # the ARP step: camera-only poison, then restore
     sudo bash lab/labsuite.sh            # all of the above; one PASS/FAIL line each in
                                          # /tmp/wslab-suite.txt
@@ -49,3 +58,9 @@ A run passes when:
 A run that was signalled mid-session only has to leave nothing behind.
 Captures and logs land in `/tmp/wslab-out`. `lab_run.sh` captures the
 `mid` box with `tcpdump` (override with `TCPDUMP=`).
+
+`lab_watch.sh` runs `tests/fakecam.py` as the camera in the `cam`
+namespace and `wyze-splice watch` in `mid`, with the camera's key saved
+beforehand. It passes when the view went live and was recorded, hanging up
+switched the camera's video and audio off (K10010), and no firewall rule
+or journal is left in `mid`.

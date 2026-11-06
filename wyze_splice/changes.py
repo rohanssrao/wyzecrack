@@ -11,6 +11,11 @@ is recorded as data in a journal file before it is made, so that:
   next run, before it starts) replays the journal.
 
 One instance at a time: the journal directory is guarded by an flock.
+Within that instance, parts that come and go independently (the page's
+live views and motion captures, each camera's on-path routing) each take a
+scope() of the one journal, and undo only what they did. A sysctl that two
+parts set is shared: the first part's saved value is kept, and it is put
+back when the last part that needs it is done.
 """
 import contextlib
 import fcntl
@@ -110,6 +115,8 @@ class Changes:
         self._next = 0
         self._lock = threading.RLock()
         self._lockf = None
+        self._holders = {}       # sysctl item token -> tokens that need it
+        self._alias = {}         # sharing token -> the item token it shares
 
     # -- locking ---------------------------------------------------------
     def acquire(self):
@@ -156,11 +163,26 @@ class Changes:
             self._save()
             return token
 
+    def _release(self, tokens):
+        """The item tokens these tokens free: a shared sysctl only once its
+        last holder lets go."""
+        free = set()
+        for t in tokens:
+            real = self._alias.pop(t, t)
+            holders = self._holders.get(real)
+            if holders is not None:
+                holders.discard(t)
+                if holders:
+                    continue
+                del self._holders[real]
+            free.add(real)
+        return free
+
     def undo(self, tokens):
         """Undo these changes, newest first. One that cannot be undone
         stays in the journal (for `wyze-splice cleanup`) and is reported."""
-        tokens = set(tokens)
         with self._lock, signals_held():
+            tokens = self._release(tokens)
             for tok, item in reversed(list(self.items)):
                 if tok not in tokens:
                     continue
@@ -178,26 +200,104 @@ class Changes:
         """Drop journal entries without undoing them (for changes that
         turned out not to have been made by us)."""
         with self._lock:
-            self.items = [(t, i) for t, i in self.items if t not in set(tokens)]
+            tokens = self._release(tokens)
+            self.items = [(t, i) for t, i in self.items if t not in tokens]
             self._save()
 
     def undo_all(self):
-        self.undo([t for t, _ in self.items])
+        with self._lock:
+            self._holders.clear()
+            self._alias.clear()
+            self.undo([t for t, _ in self.items])
+
+    def scope(self):
+        return Scope(self)
 
     # -- helpers for the common changes ----------------------------------
+    def _share(self, path):
+        """A token sharing the journal's entry for this sysctl, or None."""
+        for tok, item in self.items:
+            if item["kind"] == "sysctl" and item["path"] == str(path):
+                self._holders.setdefault(tok, {tok})
+                alias = self._next
+                self._next += 1
+                self._holders[tok].add(alias)
+                self._alias[alias] = tok
+                return alias
+        return None
+
     def sysctl(self, path, value):
-        """Set a sysctl, recording its old value."""
+        """Set a sysctl, recording its old value (or sharing the entry of a
+        part of this run that set it first)."""
         p = Path(path)
-        old = p.read_text().strip()
-        tok = self.add("sysctl", path=str(p), value=old)
-        p.write_text(f"{value}\n")
-        return tok
+        with self._lock:
+            tok = self._share(p)
+            if tok is None:
+                old = p.read_text().strip()
+                tok = self.add("sysctl", path=str(p), value=old)
+                self._holders[tok] = {tok}
+            p.write_text(f"{value}\n")
+            return tok
 
     def remember_sysctl(self, path):
         """Record a sysctl's current value so it is restored, without
         changing it (for values the kernel changes as a side effect)."""
         p = Path(path)
-        return self.add("sysctl", path=str(p), value=p.read_text().strip())
+        with self._lock:
+            tok = self._share(p)
+            if tok is None:
+                tok = self.add("sysctl", path=str(p), value=p.read_text().strip())
+                self._holders[tok] = {tok}
+            return tok
+
+
+class Scope:
+    """One part of a run in the run's journal (Changes.scope()). It has the
+    journal's interface, but undo_all() undoes only this part's changes,
+    and acquire()/release() are the owner's business."""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.tokens = []
+        self._lock = threading.Lock()
+
+    def _keep(self, tok):
+        with self._lock:
+            self.tokens.append(tok)
+        return tok
+
+    def add(self, kind, **item):
+        return self._keep(self.parent.add(kind, **item))
+
+    def sysctl(self, path, value):
+        return self._keep(self.parent.sysctl(path, value))
+
+    def remember_sysctl(self, path):
+        return self._keep(self.parent.remember_sysctl(path))
+
+    def _drop(self, tokens):
+        tokens = set(tokens)
+        with self._lock:
+            self.tokens = [t for t in self.tokens if t not in tokens]
+
+    def undo(self, tokens):
+        tokens = list(tokens)
+        self.parent.undo(tokens)
+        self._drop(tokens)
+
+    def forget(self, tokens):
+        tokens = list(tokens)
+        self.parent.forget(tokens)
+        self._drop(tokens)
+
+    def undo_all(self):
+        self.undo(list(self.tokens))
+
+    def acquire(self):
+        pass
+
+    def release(self):
+        pass
 
 
 def load(path):

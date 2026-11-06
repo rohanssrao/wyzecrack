@@ -48,6 +48,11 @@ from .tutk import trans_code_blob, untrans_code_blob
 
 DISCO_PORT = 32761
 CMD_DISCO, CMD_KEEPALIVE, CMD_DTLS = 0x1002, 0x1202, 0x1502
+# the session close, laid out like a keepalive. The camera sends it (4x)
+# when it gives up on a session; sent to it, it ends the session at once.
+# Otherwise the camera keeps a closed session for its 30 s alive timeout,
+# and it holds at most 5 (IOTC_Set_Max_Session_Number(5) in the firmware).
+CMD_CLOSE = 0x1302
 # the older IOTC framing
 IOTC_DISCO_REQ, IOTC_DISCO_RES = 0x0601, 0x0602
 IOTC_SESSION_REQ, IOTC_SESSION_RES = 0x0402, 0x0404
@@ -62,9 +67,20 @@ K_AUTH, K_CHALLENGE, K_CHALLENGE_RESP, K_AUTH_RESULT = 10000, 10001, 10002, 1000
 K_RESOLUTION, K_RESOLUTION_RESP = 10056, 10057
 K_CHANNEL, K_CHANNEL_RESP = 10010, 10011    # [media, 1 on / 2 off]
 MEDIA_VIDEO, MEDIA_AUDIO, CHANNEL_OFF = 1, 2, 2
-# a camera that is serving other viewers can take 10 s or more to answer
-# the AV login (seen on two v3s: answers after 8 to 12 s, resent every s)
 OPEN_TIMEOUT = 30
+# A camera answers some sessions' AV login (or DTLS handshake) at once and
+# others only after 5-25 s, or never before it drops them at 30 s. Sessions
+# are slow independently of each other: of two opened together, one logged
+# in after 0.2 s and the other after 21 s (both v3s, 2026-11-05). So
+# open_first() starts a second session beside a slow one and keeps
+# whichever logs in first.
+HEDGE_AFTER = 2.0         # a second session if the first hasn't logged in
+ROTATE_EVERY = 6.0        # then the older one is replaced this often
+AT_ONCE = 2               # the camera holds 5 sessions; others may be viewers
+LOGIN_EVERY = 0.5         # the answer follows the first resend it takes
+# a camera that is on answers discovery within 0.1 s; one that is switched
+# off, offline, or set up again (a new key) never does
+DISCO_GIVE_UP = 10.0
 HD_1080P, BITRATE_MAX = 1, 0xF0             # K10056 frame size 0 (+1), kbps
 ACK_EVERY = 0.1
 SILENT_AFTER = 6.0                          # camera quiet this long: gone
@@ -198,13 +214,98 @@ def find_hl(data):
     return cmd, data[i + 16:i + 16 + n]
 
 
+def open_first(make, timeout=OPEN_TIMEOUT, stop=None, av_log=None, on_av=None,
+               resolution=HD_1080P):
+    """A session opened like Direct.open(), hedged: make(stop_event) returns
+    a new Direct that gives up when stop_event is set. When the first
+    hasn't logged in after HEDGE_AFTER s, a second runs beside it, and every
+    ROTATE_EVERY s after that the older is replaced, at most AT_ONCE at a
+    time. The first to log in is opened (with av_log and on_av); the others
+    hang up at once. A camera that doesn't answer discovery gets one
+    session only. Raises CameraGone, saying how far the best one got."""
+    began = time.monotonic()
+    deadline = began + timeout
+    won, lock = threading.Event(), threading.Lock()
+    tries = []                        # (direct, thread, stop event, result)
+
+    def run(d, box, n):
+        t0 = time.monotonic()
+        try:
+            d.login(deadline)
+            with lock:
+                if not won.is_set():
+                    box["won"] = True
+                    won.set()
+                    return
+        except CameraGone:
+            pass
+        except Exception as e:  # noqa: BLE001 - a bad packet ends this try only
+            box["error"] = e
+        if os.environ.get("WYZE_SPLICE_DEBUG"):
+            d.log(f"[d] session {n} ended at the {d.stage()} after "
+                  f"{time.monotonic() - t0:.1f} s"
+                  + (f": {box['error']!r}" if "error" in box else ""))
+        d.close()                     # lost or gave up: free its camera slot
+
+    def launch():
+        ev = threading.Event()
+        d, box = make(ev), {}
+        t = threading.Thread(target=run, args=(d, box, len(tries) + 1),
+                             daemon=True)
+        tries.append((d, t, ev, box))
+        t.start()
+
+    winner = None
+    try:
+        launch()
+        next_try = time.monotonic() + HEDGE_AFTER
+        while not won.wait(0.05):
+            now = time.monotonic()
+            if stop is not None and stop.is_set():
+                raise CameraGone("stopped")
+            answered = any(x[0].framing for x in tries)
+            if now > deadline or (not answered and now - began > DISCO_GIVE_UP):
+                best = max((x[0].stage() for x in tries), key=_STAGES.index)
+                raise CameraGone(f"the camera did not answer ({best})")
+            running = [x for x in tries if x[1].is_alive()]
+            if now < next_try or (running and not any(x[0].framing
+                                                      for x in running)):
+                continue              # a camera that isn't answering at all
+            if len(running) >= AT_ONCE:
+                running[0][2].set()   # the older one steps aside
+            launch()
+            next_try = now + ROTATE_EVERY
+        winner = next(x for x in tries if x[3].get("won"))
+    finally:
+        for x in tries:
+            if x is not winner:
+                x[2].set()
+        for x in tries:
+            if x is not winner:
+                x[1].join(3)
+    d = winner[0]
+    d.stop, d.tries = stop, len(tries)
+    d.record(av_log, on_av)
+    try:
+        d.finish(deadline, resolution)
+    except BaseException:
+        d.close()
+        raise
+    return d
+
+
+_STAGES = ["discovery", "DTLS handshake", "AV login", "logged in"]
+
 class Direct:
     """One live session with one camera. open() connects and authenticates;
     pump() then runs the session (call it in a loop); close() hangs up."""
 
     def __init__(self, ip, uid, enr, mac, local_ip=None, on_av=None,
-                 av_log=None, log=print, stop=None):
+                 av_log=None, log=print, stop=None, framing=None,
+                 disco_port=DISCO_PORT):
         self.ip, self.enr, self.mac, self.log = ip, enr, mac, log
+        self.disco_port = disco_port          # another one only in tests
+        self.known_framing = framing          # from a previous session
         self.stop = stop                      # threading.Event: give up
         self.uid, self.authkey = uid.encode(), auth_key(enr, mac)
         self.key = self.uid + self.authkey
@@ -215,7 +316,7 @@ class Direct:
         # under half a second of it
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         self.sock.bind((local_ip or "0.0.0.0", 0))
-        self.peer = (ip, DISCO_PORT)          # becomes the camera's P2P port
+        self.peer = (ip, disco_port)          # becomes the camera's P2P port
         self.sid, self.ticket = os.urandom(8), 0
         full = hashlib.sha256(enr.encode()).digest()
         self.leg = DTLSLeg("client", derive_psk(enr), Templates.embedded(), full)
@@ -227,8 +328,8 @@ class Direct:
         self.streaming = False                # set once open() is done
         self.next_ack = None                  # acking starts after login
         self.last_rx = time.monotonic()
-        self.on_av = on_av
-        self.av_f = open(av_log, "ab") if av_log else None
+        self.on_av, self.av_f = None, None
+        self.record(av_log, on_av)
         self.info = {}                        # the camera's K10003 JSON
         self.seen = ReplayWindow()            # the camera sends media twice
         self.stats = {"rx": 0, "tx": 0, "bad_trailer": 0, "bad_record": 0,
@@ -254,11 +355,11 @@ class Direct:
         struct.pack_into("<I", h, 24, 1)
         return bytes(h) + records + self._trailer(bytes(h))
 
-    def _keepalive(self):
+    def _keepalive(self, cmd=CMD_KEEPALIVE):
         self.ka_seq += 2
         b = bytearray(28)
         b[0:2] = b"\x51\xcc"
-        struct.pack_into("<HH", b, 4, CMD_KEEPALIVE, 0x24)
+        struct.pack_into("<HH", b, 4, cmd, 0x24)
         struct.pack_into("<I", b, 16, self.ka_seq & 0xFFFFFFFF)
         b[20:28] = self.sid
         return bytes(b) + self._trailer(bytes(b))
@@ -350,16 +451,42 @@ class Direct:
         return kind, data
 
     # ------------------------------------------------------------- session
+    def record(self, av_log=None, on_av=None):
+        """Append the session's plaintext to av_log, and/or hand it to
+        on_av(direction, time, plaintext)."""
+        self.on_av = on_av
+        if av_log:
+            self.av_f = open(av_log, "ab")
+            # media.SESSION_MARK: frame numbers start over from here
+            self.av_f.write(struct.pack("<BdI", 255, time.time(), 0))
+
     def open(self, timeout=OPEN_TIMEOUT, resolution=HD_1080P):
         deadline = time.monotonic() + timeout
+        self.login(deadline)
+        self.finish(deadline, resolution)
+        return self
+
+    def login(self, deadline):
+        """Discovery, the DTLS handshake and the AV login: what a camera is
+        sometimes slow to answer (see open_first)."""
         self._discover(deadline)
         self._handshake(deadline)
         self._av_login(deadline)
+
+    def finish(self, deadline, resolution=HD_1080P):
+        """Authenticate and pick the resolution; media flows from here."""
         self._authenticate(deadline)
         self.command(K_RESOLUTION, bytes([resolution])
                      + struct.pack("<HH", BITRATE_MAX, 0), K_RESOLUTION_RESP)
         self.streaming = True
-        return self
+
+    def stage(self):
+        """How far login() got."""
+        if self.login_resp is not None:
+            return "logged in"
+        if self.leg.handshake_done:
+            return "AV login"
+        return "DTLS handshake" if self.framing else "discovery"
 
     def _until(self, deadline, what, send, done, every=0.5):
         """Send `send()` every `every` s, pumping replies, until done()."""
@@ -397,9 +524,12 @@ class Direct:
                 got["done"] = True
 
         def hello():
-            # both framings: whichever the camera speaks, it answers
-            self._send(self._disco(0), (self.ip, DISCO_PORT))
-            self._send_iotc(self._iotc_disco(1), (self.ip, DISCO_PORT))
+            # both framings, unless an earlier session told us which one
+            # the camera speaks: whichever it speaks, it answers
+            if self.known_framing in (None, "cc51"):
+                self._send(self._disco(0), (self.ip, self.disco_port))
+            if self.known_framing in (None, "iotc"):
+                self._send_iotc(self._iotc_disco(1), (self.ip, self.disco_port))
 
         self._on_disco = on
         self._until(deadline, "discovery", hello, lambda: "framing" in got)
@@ -436,7 +566,7 @@ class Direct:
             self._send_app(p2)
 
         self._until(deadline, "AV login", send,
-                    lambda: self.login_resp is not None, every=1.0)
+                    lambda: self.login_resp is not None, every=LOGIN_EVERY)
         self._ack()
         self.next_ack = time.monotonic() + ACK_EVERY
 
@@ -661,6 +791,9 @@ class Direct:
             if self.leg.handshake_done:
                 # a DTLS close_notify; the camera also times out on its own
                 self._send_dtls(self.leg.encrypt_record(RT_ALERT, b"\x01\x00"))
+            if self.framing == "cc51" and self.sid is not None:
+                for _ in range(4):           # as the camera does: UDP
+                    self._send(self._keepalive(CMD_CLOSE))
         except OSError:
             pass
         self.sock.close()

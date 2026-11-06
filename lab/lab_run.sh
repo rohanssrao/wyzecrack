@@ -65,7 +65,7 @@ if [ "$MODE" = splice ]; then
   fi
   # anything the tool installed must be gone (lab_setup's own MASQUERADE stays)
   ip netns exec tfl-mid sh -c '
-    iptables-save | grep -E "TPROXY|REDIRECT|10\.99\.0\.20/32 -j ACCEPT|ACCEPT.*--dport (443|18443)"
+    iptables-save | grep -E "TPROXY|REDIRECT|10\.99\.0\.20/32 -j ACCEPT|10\.99\.0\.20/32 -p tcp -m tcp --dport [0-9]+ -j ACCEPT"
     ip rule | grep -E "5917|fwmark"
     [ "$(cat /proc/sys/net/ipv4/conf/all/accept_local)" = 0 ] || echo "accept_local=1"
     [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || echo "ip_forward changed"' >> $OUT/leftovers.txt

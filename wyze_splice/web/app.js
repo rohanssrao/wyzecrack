@@ -8,6 +8,9 @@ const api = (path, body) => fetch(path, body ? { method: "POST", headers: { "Con
 let state = { phase: "idle" };
 let saving = false;
 let camera = null;
+let hadPicture = false;     // this live view showed a picture (so it is saved)
+let ended = false;          // the page shows the ended view (Saving / Saved)
+let savedNew = false;       // this view's recording has been written
 
 // ---------------------------------------------------------------- picker
 async function scan() {
@@ -29,7 +32,8 @@ function camCard(c) {
   const body = el("div", "body");
   const name = el("div", "name", `<span>${esc(displayName(c))}</span><button class="edit" title="Rename">✎</button>`);
   const status = c.online === false ? "off or offline" : c.ready ? "ready" : c.key_known ? "key saved" : null;
-  const bits = [c.name ? c.model : null, c.ip, status, c.tested ? null : "untested model"].filter(Boolean);
+  const saving = c.capturing === "on" ? "saving motion clips" : c.capturing === "error" ? "motion clips: not saving" : null;
+  const bits = [c.name ? c.model : null, c.ip, status, saving, c.tested ? null : "untested model"].filter(Boolean);
   const meta = el("div", "meta", esc(bits.join(" · ")));
   name.querySelector(".edit").onclick = (ev) => { ev.stopPropagation(); rename(c, name); };
   card.onclick = () => start(c);
@@ -58,6 +62,8 @@ function rename(c, node) {
 
 async function start(c) {
   camera = c;
+  hadPicture = ended = savedNew = false;
+  $("#again").classList.add("hidden");
   const r = await api("/api/start", { ...c, name: c.name });
   if (r.error) toast(r.error, "error");
   showSession(c);
@@ -70,11 +76,14 @@ function showSession(c) {
   $("#session").classList.remove("hidden");
   $("#cam-name").textContent = displayName(c);
   $("#cam-sub").textContent = c.name ? `${c.model} · ${c.ip}` : c.ip;
+  showMotion(c);
   $("#crumb").textContent = "";
   loadLibrary();
 }
 
 function showPicker() {
+  ended = false;
+  $("#again").classList.add("hidden");
   $("#session").classList.add("hidden");
   $("#picker").classList.remove("hidden");
   $("#crumb").textContent = "";
@@ -99,6 +108,8 @@ const STATUS = {
   stopping: ["⏻", "spin", "Stopping", "Putting the camera's network back the way it was."],
   stopping_direct: ["⏻", "spin", "Stopping", "Saving the recording."],
   error: ["!", "bad", "Something went wrong", ""],
+  ended_saving: ["💾", "spin", "Saving", "Writing the recording…"],
+  ended: ["✓", "ok", "Saved", "This live view is at the top of Saved, below."],
 };
 
 function setStatus(key, extra) {
@@ -127,7 +138,9 @@ function applyState(s) {
   const prev = state.phase;
   state = s;
   if (s.phase === "idle") {
-    if (!$("#session").classList.contains("hidden") && prev !== "idle") showPicker();
+    if (!$("#session").classList.contains("hidden") && prev !== "idle") {
+      if (hadPicture) showEnded(); else showPicker();
+    }
     return;
   }
   if (s.camera && $("#session").classList.contains("hidden")) showSession(s.camera);
@@ -165,11 +178,12 @@ function applyState(s) {
   if (s.phase === "connecting" && s.session?.state === "failed") extra = "This attempt could not be joined; waiting for the app's retry.";
   if (s.hint === "unplug" && (key === "waiting" || key === "learning")) extra = "One of the camera's connections goes around this computer, so some live views would be missed. Unplug the camera for 5 seconds now (and plug it back in); this page will tell you when it's fixed.";
   else if (key === "waiting" && s.hint === "bypass") extra = "The last live view went around this computer, probably over a connection the camera opened before you started. Unplug the camera for 5 seconds; its new connections will come through here.";
+  $("#rekey").classList.toggle("hidden", !(s.phase === "error" && s.error_kind === "no_answer"));
   const stage = $("#stage");
   stage.classList.toggle("is-live", s.phase === "live");
   $("#hud").classList.toggle("hidden", s.phase !== "live");
   if (s.phase !== "live" && !(saving && s.phase === "waiting")) setStatus(key, extra);
-  if (s.phase === "live" && prev !== "live") { recStart = (s.session?.since || Date.now() / 1000); $("#stage").classList.remove("dim"); }
+  if (s.phase === "live" && prev !== "live") { recStart = (s.session?.since || Date.now() / 1000); $("#stage").classList.remove("dim"); hadPicture = true; }
   $("#stop").textContent = s.phase === "error" ? "Back" : "Stop";
 }
 
@@ -184,13 +198,57 @@ $("#quit").onclick = async () => {
 };
 $("#rescan").onclick = scan;
 
+// the view ended and was saved: stay on the camera's page, its recording
+// at the top of Saved
+function showEnded() {
+  ended = true;
+  resetVideo(true);
+  $("#stage").classList.add("dim");
+  $("#hud").classList.add("hidden");
+  $("#rekey").classList.add("hidden");
+  setStatus(savedNew ? "ended" : "ended_saving");
+  $("#again").classList.remove("hidden");
+  $("#stop").textContent = "Back";
+}
+$("#again").onclick = () => { if (camera) start(camera); };
+
+$("#rekey").onclick = async () => {
+  if (!camera) return;
+  $("#rekey").classList.add("hidden");
+  await api("/api/rekey", { mac: camera.mac });
+  await start(camera);
+};
+
+// ---------------------------------------------------------------- motion clips
+let captures = {};
+const macKey = (mac) => (mac || "").replace(/:/g, "").toUpperCase();
+
+function showMotion(c) {
+  const cap = captures[macKey(c.mac)];
+  $("#motion-toggle").checked = !!(cap ? cap.on || cap.error : c.motion);
+  const note = $("#motion-note");
+  note.classList.toggle("error", !!(cap && cap.error));
+  note.textContent = cap && cap.error
+    ? `Not saving motion clips: ${cap.error}`
+    : "While wyze-splice is open, this camera's internet traffic goes through this computer so its clips can be copied. If this computer sleeps or shuts down meanwhile, the camera is offline for up to about a minute.";
+}
+
+$("#motion-toggle").onchange = async (e) => {
+  if (!camera) return;
+  const on = e.target.checked;
+  camera.motion = on;
+  const r = await api("/api/motion", { ...camera, on });
+  if (on && r.capturing === "on") toast("Saving this camera's motion clips");
+  else if (!on) toast("No longer saving motion clips");
+};
+
 // ---------------------------------------------------------------- library
 async function loadLibrary(fresh) {
   if (!camera) return;
   const lib = await api(`/api/library?mac=${encodeURIComponent(camera.mac)}`);
   const items = [
     ...lib.recordings.map((r) => ({ t: r.started, src: r.video, img: r.thumb, kind: "live", len: mmss(r.seconds) })),
-    ...lib.motion.map((m) => ({ t: m.t, src: m.clip, img: m.snapshot, kind: "motion", len: "0:12" })),
+    ...lib.motion.map((m) => ({ t: m.t, src: m.clip, img: m.snapshot, kind: "motion", len: m.seconds ? mmss(m.seconds) : "" })),
   ].sort((a, b) => b.t - a.t);
   const box = $("#saved");
   $("#saved-count").textContent = items.length || "";
@@ -199,7 +257,7 @@ async function loadLibrary(fresh) {
   for (const it of items) {
     const t = el("div", "tile" + (fresh && it.src === fresh ? " fresh" : ""));
     const when = new Date(it.t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-    t.innerHTML = `<div class="img" style="background-image:url('${esc(it.img || "")}')"><span class="pill kind">${it.kind === "live" ? "Live view" : "Motion"}</span><span class="pill len">${it.len}</span><div class="play">▶</div></div><div class="cap">${when}</div>`;
+    t.innerHTML = `<div class="img" style="background-image:url('${esc(it.img || "")}')"><span class="pill kind">${it.kind === "live" ? "Live view" : "Motion"}</span>${it.len ? `<span class="pill len">${it.len}</span>` : ""}<div class="play">▶</div></div><div class="cap">${when}</div>`;
     if (it.src) t.onclick = () => play(it.src);
     box.append(t);
   }
@@ -357,14 +415,20 @@ function connect() {
       case "library":
         if (saving) { saving = false; if (state.phase === "waiting") setStatus("waiting"); }
         loadLibrary(ev.new);
-        if (ev.new) { toast("Live view saved"); }
+        if (ev.new) {
+          savedNew = true;
+          if (ended) setStatus("ended");
+          else if ($("#session").classList.contains("hidden")) toast("Live view saved");
+        }
         break;
       case "motion":
         toast("Motion detected · clip saved");
         loadLibrary();
         break;
       case "toast": toast(ev.text, ev.level); break;
-      case "saving": toast("Saving the recording…"); break;
+      case "captures": captures = ev.captures || {}; if (camera) showMotion(camera); break;
+      // on the camera's page the ended view says it; elsewhere, a toast
+      case "saving": if ($("#session").classList.contains("hidden")) toast("Saving the recording…"); break;
       case "missed": toast("A live view went around this computer · see the tip above"); break;
     }
   };

@@ -78,3 +78,45 @@ def test_signals_are_deferred_not_lost():
         assert got == ["block finished", "handled"]
     finally:
         signal.signal(signal.SIGTERM, old)
+
+
+def test_scopes_undo_only_their_own_changes(tmp_path):
+    c = ch.Changes(tmp_path)
+    a, b = c.scope(), c.scope()
+    with unittest.mock.patch.object(ch, "run") as run:
+        run.return_value.returncode = 0
+        a.add("ipt", args=["-D", "A"])
+        b.add("ipt", args=["-D", "B"])
+        a.undo_all()
+        run.assert_called_once_with(["iptables", "-w", "-D", "A"])
+        assert len(json.loads((tmp_path / "changes.json").read_text())) == 1
+        b.undo_all()
+    assert not (tmp_path / "changes.json").exists()
+
+
+def test_a_sysctl_two_scopes_set_is_restored_by_the_last_one(tmp_path):
+    c = ch.Changes(tmp_path)
+    fwd, side = tmp_path / "ip_forward", tmp_path / "forwarding"
+    fwd.write_text("0\n")
+    side.write_text("0\n")
+    a, b = c.scope(), c.scope()
+    a.remember_sysctl(side)
+    a.sysctl(fwd, 1)
+    side.write_text("1\n")                 # the kernel's side effect
+    b.remember_sysctl(side)                # b must not save the 1
+    b.sysctl(fwd, 1)
+    a.undo_all()                           # b still needs forwarding on
+    assert fwd.read_text() == "1\n" and side.read_text() == "1\n"
+    b.undo_all()
+    assert fwd.read_text() == "0\n" and side.read_text() == "0\n"
+    assert not (tmp_path / "changes.json").exists()
+
+
+def test_the_owners_undo_all_restores_everything(tmp_path):
+    c = ch.Changes(tmp_path)
+    fwd = tmp_path / "ip_forward"
+    fwd.write_text("0\n")
+    c.scope().sysctl(fwd, 1)
+    c.scope().sysctl(fwd, 1)
+    c.undo_all()                           # e.g. the page quitting
+    assert fwd.read_text() == "0\n"

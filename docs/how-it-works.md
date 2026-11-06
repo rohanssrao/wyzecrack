@@ -22,17 +22,20 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
    trusts the eMudhra "EM OV TLS CA - G3C" intermediate, whose private key
    became public in October 2026 (a P-384 key with d=4). The camera's
    tcp/443 is redirected to a local relay. For connections to
-   `*.wyzecam.com`, the relay presents a leaf for the requested name signed
-   under that intermediate and forwards the connection to the real server
-   under the same name. Everything else (firmware and model downloads from
-   S3, for example) passes through as raw TCP. The tool reads two things
-   from the camera's requests:
+   `*.wyzecam.com`, and to the S3 bucket the v2 uploads its alarms to
+   (`c-t-usw2.s3.us-west-2.amazonaws.com`), the relay presents a leaf for
+   the requested name signed under that intermediate and forwards the
+   connection to the real server under the same name. Everything else
+   (firmware and model downloads from S3, log uploads, for example) passes
+   through as raw TCP, and so does a bucket host whose leaf the camera
+   refused once, so that its retry still reaches Wyze. The tool reads two
+   things from the camera's requests:
    - the ENR, the per-camera secret in the JSON of its POSTs to
      api.wyzecam.com (`enr`) and device-api.wyzecam.com (`device_enr`);
    - motion events: for each alarm, the camera PUTs a snapshot and a 12 s
-     1080p clip (H.264 with A-law audio) to cpl-t-sightsafe.wyzecam.com
-     through pre-signed URLs. The only encryption on these uploads is the
-     TLS the tool terminates.
+     1080p clip (H.264 with A-law audio) through pre-signed URLs: the v3
+     to cpl-t-sightsafe.wyzecam.com, the v2 to that S3 bucket. The only
+     encryption on these uploads is the TLS the tool terminates.
 
    The camera sends its ENR in every device-API request, but it makes
    few: at boot, on motion alarms, and in its metrics report. In firmware
@@ -44,10 +47,12 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
    only that one: a TCP RST spoofed from the broker plus an iptables
    REJECT for the connection, both journaled. It repeats the reset each
    time the camera has reconnected, until the report arrives, at most 8
-   times. On v3 A that took 4 to 6 resets and 90 to 115 s. The
-   camera stays online apart from a few seconds per reconnect, and live
-   views are unaffected. The nudge only runs on the v3 (`NUDGE_MODELS`);
-   `--no-nudge` turns it off.
+   times. On v3 A that took 4 to 6 resets and 90 to 115 s; on the
+   v2 (4.9.9.3006) one reset, after which the camera
+   posted `set_device_info` with its ENR. The camera stays online apart
+   from a few seconds per reconnect, and live views are unaffected. The
+   nudge runs on the models it was tried on (`NUDGE_MODELS`: the v3 and
+   the v2); `--no-nudge` turns it off.
 
    An earlier version cut all of the camera's traffic until it noticed.
    That produced the report only when the burst of connection events
@@ -84,13 +89,35 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
 
    The camera answers from a different port than the one it was sent to,
    which a stateful host firewall drops, so the tool opens udp from the
-   camera to its socket for the session (journaled). The live view usually
-   starts within a second or two; a camera that is serving other viewers
-   can take 10 s or more to answer the AV login, so the tool keeps asking
-   for up to 30 s. When the tool hangs up, it first switches the camera's
-   video and audio off (K10010). Otherwise the camera keeps streaming to
-   the dead session for about 30 s, using Wi-Fi bandwidth and overlapping
-   the next session.
+   camera to its socket for the session (journaled).
+
+   A camera answers some sessions' DTLS handshake or AV login at once and
+   others only after 5 to 25 s, or never: it drops those after 30 s with
+   cmd 0x1302. Sessions are slow independently of each other. Of two
+   opened at the same moment, one logged in after 0.2 s and the other
+   after 21 s; in another pair, one never got an answer and the other
+   logged in after 1.2 s. Recent sessions, other viewers, the host's
+   network and the session close below didn't explain it; the delay is
+   inside the camera (both v3s, 4.36.17.21). So when a session hasn't
+   logged in after 2 s, the tool opens a second one beside it and keeps
+   whichever logs in first (`open_first`). Every 6 s after that it
+   replaces the older of the two. It never holds more than two, because
+   the camera takes five sessions in all (`IOTC_Set_Max_Session_Number(5)`
+   in the v2 firmware) and other viewers need theirs. A camera that
+   doesn't answer discovery within 10 s is switched off, offline, or has a
+   new key, and gets no second session. Before this, a quarter of single
+   sessions to the v3s got no answer within 30 s and the median was about
+   8 s; with it, six views of v3 A started after 0.5 to 15 s
+   (median 4 s), none failing. The v2 wasn't affected (0.5 to 2.2 s).
+
+   When the tool hangs up, it first switches the camera's video and audio
+   off (K10010); otherwise the camera keeps streaming to the dead session
+   for about 30 s. It then sends cmd 0x1302 (laid out like a keepalive,
+   with the session id at [20:28]), the message the camera itself sends
+   when it drops a session. The camera ends the session at once instead of
+   keeping it for its 30 s alive timeout
+   (`IOTC_Setup_Session_Alive_Timeout(30)`). The older (v2) framing has no
+   such message that the tool knows of.
 
 5. **Catch the session** (`splice.py`, the fallback). Nothing is
    diverted while the tool waits. When the app opens a live view, the
@@ -121,6 +148,26 @@ UID: splicing the live views the Wyze app opens. Step 7 covers both.
    left out: any incomplete frame, plus the rest of its group of pictures.
    Once the viewer leaves, the camera keeps streaming to the dead session
    for a while but stops completing I-frames, so that tail is dropped.
+
+## The page
+
+The page (`gui.py`) runs one live view at a time. Everything from the
+click to Stop is one recording: when the camera hangs up, the page opens a
+new session and records into the same capture, and the export joins the
+stretches (the picture holds still across the gap).
+
+**Motion clips** (`motion.py`), when turned on for a camera, are copied
+in the background for as long as the page is open: the camera is routed
+through this host (step 1) and its uploads are read (step 2), as with the
+`events` command. Several cameras can be captured at once, each with its
+own interceptor port, and a capture steps aside while the same camera's
+key is read or its live view is spliced. If a camera without a saved key
+uploads a clip, its key is saved from that upload.
+
+The page holds the single-instance lock and one journal (below) for its
+whole life. Each live view, capture and key read takes a scope of it and
+undoes only its own changes. A sysctl that two of them need (ip_forward,
+for two cameras on the path) is put back when the last one is done.
 
 ## Safety
 

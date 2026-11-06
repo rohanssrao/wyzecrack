@@ -82,6 +82,7 @@ main { max-width: 1240px; margin: 0 auto; padding: 24px; }
 .status-icon.spin::after { content: ""; position: absolute; inset: -4px; border-radius: 50%;
   border: 2px solid transparent; border-top-color: var(--accent); animation: spin 1s linear infinite; }
 .status-icon.bad { background: rgba(255,77,94,.12); }
+.status-icon.ok { background: rgba(46,230,184,.14); color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 .hud > div { position: absolute; display: flex; gap: 8px; }
 .hud-tl { top: 14px; left: 14px; } .hud-tr { top: 14px; right: 14px; } .hud-br { bottom: 14px; right: 14px; }
@@ -105,6 +106,18 @@ main { max-width: 1240px; margin: 0 auto; padding: 24px; }
 .steps li.done::before { background: var(--accent); }
 .steps li.problem { color: var(--amber); }
 .steps li.problem::before { background: var(--amber); }
+button.secondary { margin-top: 14px; background: var(--panel2); color: var(--text); border: 1px solid var(--line); }
+button.secondary:hover { border-color: var(--accent); }
+.motion-row { display: flex; align-items: baseline; gap: 14px; margin-top: 22px; flex-wrap: wrap; }
+.switch { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; user-select: none; }
+.switch input { position: absolute; opacity: 0; pointer-events: none; }
+.switch .knob { width: 34px; height: 20px; border-radius: 99px; background: var(--line); position: relative; transition: background .15s; flex: none; }
+.switch .knob::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.switch input:checked + .knob { background: var(--accent); }
+.switch input:checked + .knob::after { transform: translateX(14px); }
+.switch input:focus-visible + .knob { box-shadow: 0 0 0 3px rgba(46,230,184,.35); }
+.motion-note { color: var(--muted); font-size: 12px; max-width: 640px; }
+.motion-note.error { color: var(--amber); }
 .saved-h { margin: 34px 0 12px; font-size: 15px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
 .count { color: var(--muted); font-weight: 400; font-size: 13px; }
 .tiles > p { grid-column: 1 / -1; margin: 0; }

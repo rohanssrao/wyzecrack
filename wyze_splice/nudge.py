@@ -18,7 +18,9 @@ before produced a report only when their burst of events happened to
 overflow the buffer.
 
 Live on v3 A (fw 4.36.17.21): the report came after 4 to 6
-resets.
+resets. On a Wyze Cam v2 (4.9.9.3006, MQTT in its separate iotclient
+process) one reset was enough: within seconds the camera posted
+set_device_info, with its ENR, to api.wyzecam.com.
 
 A reset is a TCP RST sent to the camera as if from the broker, with the
 sequence number the camera's own last segment acknowledged, so it takes

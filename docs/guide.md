@@ -70,9 +70,14 @@ video goes to `session-N/`.
 ## Troubleshooting
 
 - **"Connecting to the camera" takes a while, or "the camera did not
-  answer (AV login)":** the camera is slow to take a new viewer, for
-  example while others are watching it. The tool keeps asking for 30 s,
-  and the page then tries again.
+  answer (AV login)":** Wyze cameras leave some new sessions waiting for
+  up to 30 s, at random. After 2 s the tool opens a second session
+  beside a slow one and keeps whichever gets in first, so most views start
+  within a few seconds; the page tries again if neither does
+  ([why](how-it-works.md)).
+- **The page says the camera doesn't answer, but it's switched on:** if
+  it was set up again in the Wyze app, its key changed. **Get its key
+  again** in the page reads the new one (the first-time step again).
 - **"the camera did not answer (discovery)":** the camera is off (switched
   off in the Wyze app, or on a schedule) or unplugged. A camera that is
   turned off stops all its P2P traffic, so it can't be watched.
@@ -80,9 +85,10 @@ video goes to `session-N/`.
   key, or changed this call. `wyze-splice run` still works: it catches a
   live view that the Wyze app opens.
 - **The first time takes long:** the camera only sends its ENR at certain
-  moments. On a v3 the tool resets its connection to Wyze until it does,
-  usually within two minutes. A v2 isn't nudged; it reports in on its own,
-  usually within 20 minutes, or right away when it sees motion.
+  moments. The tool resets its connection to Wyze until it does, usually
+  within two to four minutes. On other models it waits for the camera to
+  report in on its own, usually within 20 minutes, or right away when it
+  sees motion.
 - **The live view plays in the app but nothing shows up here:** the phone
   is probably on the camera's Wi-Fi. There the app reaches the camera
   directly over the LAN, which doesn't pass through this computer; use a

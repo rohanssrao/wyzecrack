@@ -143,3 +143,41 @@ def test_parse_media_decodes_v2_audio():
     ch, frame_no, cidx, pcm, end, count = parse_media(rec)
     assert (ch, frame_no, end) == (3, 5, True)
     assert struct.unpack("<8h", pcm) == (0, -32124) * 4
+
+
+def _write_av_bin(path, stretches):
+    """av.bin with one camera session per (start time, access units)."""
+    import os
+    import struct
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from fakecam import media_record
+    with open(path, "wb") as f:
+        for t0, units in stretches:
+            f.write(struct.pack("<BdI", 255, t0, 0))        # a new session
+            for i, au in enumerate(units):
+                rec = media_record(i + 1, au, key=(i == 0))
+                f.write(struct.pack("<BdI", 1, t0 + i / 20, len(rec)) + rec)
+
+
+def test_one_recording_across_a_reconnect(tmp_path):
+    import av
+    import pytest
+    from wyze_splice.media import export
+    try:
+        from test_jpegfeed import _h264_frames
+        units = _h264_frames(n=20)
+    except pytest.skip.Exception:
+        raise
+    av_bin = tmp_path / "av.bin"
+    _write_av_bin(av_bin, [(1000.0, units), (1004.0, units)])  # 3 s gap
+    merged = tmp_path / "merged"
+    r = export(str(av_bin), str(merged), merge=True)
+    assert [m["path"] for m in r["mp4s"]] == [str(merged / "video.mp4")]
+    with av.open(str(merged / "video.mp4")) as c:
+        v = c.streams.video[0]
+        assert v.frames == 40
+        assert float(v.duration * v.time_base) > 4.5      # the gap is kept
+    split = tmp_path / "split"
+    r = export(str(av_bin), str(split))
+    assert sorted(p.name for p in split.iterdir() if p.is_dir()) == ["session-1", "session-2"]

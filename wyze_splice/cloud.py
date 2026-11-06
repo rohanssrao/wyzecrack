@@ -120,11 +120,12 @@ uL5ChFWOQU+ErSDnUq7yr+pjBQ==
 
 
 SO_ORIGINAL_DST = 80
-INTERCEPT_PORT = 18443
+INTERCEPT_PORT = 0           # any free port (several taps can run at once)
 DEBUG = bool(os.environ.get("WYZE_SPLICE_DEBUG"))
-# PUT /<MAC>/<date>/<alarm id>_<alarm ms>_<n>_<file type>_<n>/<uuid>_1.<ext>
+# PUT /<MAC>/<date>/<alarm id>_<alarm ms>_<n>_<file type>_<n>/<uuid>_<n>.<ext>,
+# <n> 1 from the v3 (cpl-t-sightsafe.wyzecam.com), -1 from the v2 (S3)
 EVENT_PATH_RE = re.compile(rb"^/[0-9A-F]{12}/[0-9-]+/([0-9A-F]+)_(\d{13})_\d+_(\d)_\d+/"
-                           rb"[0-9a-f]+_\d+\.(jpg|mp4)")
+                           rb"[0-9a-f]+_-?\d+\.(jpg|mp4)")
 MAX_BODY = 64 << 20
 ENR_RE = re.compile(rb'"(?:device_)?enr"\s*:\s*"((?:[^"\\]|\\.)+)"')
 MAC_RE = re.compile(rb'"(?:mac|device_id)"\s*:\s*"([0-9A-Fa-f]{12})"')
@@ -261,14 +262,20 @@ def fetch_uid(mac, enr, model, fw, hw="0.0.0.0", timeout=20):
     return uid
 
 
-# Only Wyze's own names are terminated; everything else the camera sends
-# to tcp/443 (firmware and model downloads from S3, anything pinned,
-# non-TLS) is relayed as raw TCP, untouched.
+# Only Wyze's own names are terminated, plus the S3 bucket the Wyze Cam v2
+# (4.9.9) uploads its motion snapshots and clips to (c-t-usw2 seen); the
+# v3 sends them to cpl-t-sightsafe.wyzecam.com. Everything else the camera
+# sends to tcp/443 (firmware and model downloads, logs to sinker-t-*,
+# anything pinned, non-TLS) is relayed as raw TCP, untouched.
 INTERCEPT_SUFFIX = ".wyzecam.com"
+ALARM_BUCKET_RE = re.compile(r"^c-t-[a-z0-9]+\.s3\.[a-z0-9-]+\.amazonaws\.com$")
 
 
 def intercepts(sni):
-    return bool(sni) and sni.lower().endswith(INTERCEPT_SUFFIX)
+    if not sni:
+        return False
+    sni = sni.lower()
+    return sni.endswith(INTERCEPT_SUFFIX) or bool(ALARM_BUCKET_RE.match(sni))
 
 
 def client_hello_sni(data):
@@ -389,6 +396,7 @@ class CloudTap:
         self.stats = {"connections": 0, "intercepted": 0, "passed": 0,
                       "tls_failed": 0}
         self.hosts = {}
+        self.refused = set()       # non-Wyze hosts whose leaf the camera refused
         self._work = tempfile.mkdtemp(prefix="wyze-splice-certs-")
         self._ctx_lock = threading.Lock()
         self._tokens = []
@@ -412,6 +420,8 @@ class CloudTap:
             srv.close()
             raise SystemExit(f"TCP port {self.port} is busy ({e.strerror})")
         srv.listen(32)
+        # port 0: any free one, so that several cameras can be read at once
+        self.port = srv.getsockname()[1]
         self._srv = srv
         threading.Thread(target=self._accept, daemon=True).start()
 
@@ -490,7 +500,7 @@ class CloudTap:
             if DEBUG:
                 print(f"[d] camera -> {dst[0]}:{dst[1]} sni={sni!r} "
                       f"{'intercept' if intercepts(sni) else 'pass'}")
-            if not intercepts(sni):
+            if not intercepts(sni) or sni in self.refused:
                 self.stats["passed"] += 1
                 up = socket.create_connection(dst, timeout=15)
                 _pump(c, up, None)
@@ -499,8 +509,13 @@ class CloudTap:
             try:
                 tc = self._ctx_for(sni).wrap_socket(c, server_side=True)
             except (ssl.SSLError, OSError):
-                # the camera refused our certificate
+                # the camera refused our certificate. For a bucket upload,
+                # its retry goes through untouched, so the event still
+                # reaches Wyze; Wyze's own names are tried again (the key
+                # is read from those)
                 self.stats["tls_failed"] += 1
+                if not sni.lower().endswith(INTERCEPT_SUFFIX):
+                    self.refused.add(sni)
                 return
             self.stats["intercepted"] += 1
             cctx = ssl.create_default_context()
@@ -524,7 +539,7 @@ class CloudTap:
     def _on_request(self, method, path, headers, body):
         if DEBUG:
             print(f"[d] camera {method} {headers.get(b'host', b'?').decode('latin-1')}"
-                  f"{path.decode('latin-1')[:60]} ({len(body)} B, ENR "
+                  f"{path.decode('latin-1')[:200]} ({len(body)} B, ENR "
                   f"{'in it' if ENR_RE.search(body) else 'not in it'})")
         if not self.enr_found.is_set():
             info = device_info(body)
@@ -538,9 +553,25 @@ class CloudTap:
                 d = self.events_dir / name[0]
                 d.mkdir(parents=True, exist_ok=True)
                 (d / name[1]).write_bytes(body)
+                if name[1] == "clip.mp4":
+                    _describe_clip(d)
                 self.events.append(d / name[1])
                 if self.on_event:
                     self.on_event(d / name[1])
+
+
+def _describe_clip(d):
+    """meta.json with the clip's length, and a still from the clip when the
+    camera sent no snapshot (the v2 doesn't). Best effort."""
+    from .media import clip_facts
+    try:
+        snap = d / "snapshot.jpg"
+        facts = clip_facts(str(d / "clip.mp4"),
+                           None if snap.exists() else str(snap))
+        (d / "meta.json").write_text(json.dumps(facts) + "\n")
+    except Exception as e:  # noqa: BLE001
+        if DEBUG:
+            print(f"[d] couldn't read the clip in {d}: {e!r}")
 
 
 # per-operation timeout and idle cutoff for relayed connections: generous,

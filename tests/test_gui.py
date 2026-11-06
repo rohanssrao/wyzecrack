@@ -74,3 +74,57 @@ def test_library_thumb_prefers_recordings(tmp_path):
     lib = _library(tmp_path)
     assert lib.thumb("D0:3F:27:A1:B2:C3").endswith("frame.jpg")
     assert lib.thumb("aa:bb:cc:dd:ee:ff") is None
+
+
+class _FakeCapture:
+    made = []
+
+    def __init__(self, journal, ip, mac, events_dir, on_event):
+        self.ip, self.mac, self.running, self.error = ip, mac, False, None
+        self.starts = self.stops = 0
+        _FakeCapture.made.append(self)
+
+    def start(self):
+        self.running = True
+        self.starts += 1
+
+    def stop(self):
+        self.running = False
+        self.stops += 1
+
+
+def test_motion_capture_on_off_follow_and_pause(tmp_path, monkeypatch):
+    from wyze_splice import motion
+    from wyze_splice.changes import Changes
+    monkeypatch.setattr(gui, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(motion, "MotionCapture", _FakeCapture)
+    _FakeCapture.made = []
+    ctl = gui.Controller(gui.Hub(), gui.Library(tmp_path / "captures"),
+                         Changes(tmp_path / "run"))
+    cam = {"mac": "d0:3f:27:a1:b2:c3", "ip": "192.168.1.20", "model": "Wyze Cam v3"}
+    ctl.set_motion(cam, True)
+    assert gui._names()["D03F27A1B2C3"]["motion"] is True
+    assert ctl.capture_status(cam["mac"]) == "on"
+    # the camera moved to another address: the capture follows it
+    ctl.ensure_captures([{**cam, "ip": "192.168.1.25", "motion": True}])
+    assert [c.ip for c in _FakeCapture.made] == ["192.168.1.20", "192.168.1.25"]
+    assert not _FakeCapture.made[0].running and _FakeCapture.made[1].running
+    # getting the key routes the camera on its own: the capture steps aside
+    with ctl._capture_paused(cam["mac"]):
+        assert not _FakeCapture.made[1].running
+    assert _FakeCapture.made[1].running
+    ctl.set_motion(cam, False)
+    assert gui._names()["D03F27A1B2C3"]["motion"] is False
+    assert ctl.capture_status(cam["mac"]) is None
+
+
+def test_library_serves_files_under_a_symlinked_root(tmp_path):
+    real = tmp_path / "real"
+    _library(real)
+    (tmp_path / "link").symlink_to(real)
+    lib = gui.Library(tmp_path / "link")
+    rec = lib.recordings("d0:3f:27:a1:b2:c3")[0]
+    rel = rec["video"].removeprefix("/files/")
+    assert lib.resolve(rel) is not None
+    (tmp_path / "secret.txt").write_text("x")
+    assert lib.resolve("../secret.txt") is None

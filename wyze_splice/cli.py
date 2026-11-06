@@ -29,11 +29,11 @@ from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
 # Models on which the ENR nudge (nudge.py: resetting the camera's MQTT
-# connection until it sends its metrics report) has been tried live. On
-# the Wyze Cam v2 an outage left the camera offline in the Wyze app for
-# over an hour, so it gets no nudge until one has been tried with someone
-# there to power-cycle it.
-NUDGE_MODELS = {"WYZE_CAKP2JFUS"}
+# connection until it reports in) has been tried live and the camera
+# stayed online. The v2 got it only after a test with someone there to
+# power-cycle it (an internet outage had once left one offline for over an
+# hour): the v2, 4.9.9.3006, key after one reset, 2026-11-05.
+NUDGE_MODELS = {"WYZE_CAKP2JFUS", "WYZEC1-JZ"}
 # firmware to quote to Wyze when the camera's own report didn't say
 DEFAULT_FW = "4.36.17.21"
 
@@ -124,6 +124,31 @@ def _cached_enr(mac):
 
 def _cached_uid(mac):
     return _cached(mac).get("uid")
+
+
+def _remember_framing(mac, d):
+    """After a session opened: which framing the camera speaks, so the next
+    session only sends that one's discovery."""
+    if d.framing and _cached(mac).get("framing") != d.framing:
+        _cache_enr(mac, _cached_enr(mac), framing=d.framing)
+
+
+def _forget_key(mac):
+    """Drop a camera's ENR, for a camera that was set up again in the Wyze
+    app; the next session reads it again."""
+    d = _cache()
+    entry = d.get(_mac_key(mac))
+    if not entry:
+        return
+    # the UID is the camera's for life; the ENR (and so the AuthKey that
+    # signs every packet) changes when it is set up again
+    for k in ("enr", "framing"):
+        entry.pop(k, None)
+    tmp = STATE_DIR / "enr.json.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(d, indent=1) + "\n")
+    os.replace(tmp, STATE_DIR / "enr.json")
 
 
 def _cache_enr(mac, enr, **fields):
@@ -236,9 +261,12 @@ class Armed:
     lock, on-path routing, the HTTPS interceptor and the splicer. Leaving
     it (normally, by exception, Ctrl-C, SIGTERM or SIGHUP) undoes it all."""
 
-    def __init__(self, a, out, splice, dry=False, harvest=False):
+    def __init__(self, a, out, splice, dry=False, harvest=False, changes=None):
         self.a, self.out, self.want_splice, self.dry = a, out, splice, dry
         self.want_harvest = harvest
+        # a scope of a longer-lived journal (the page's), or None to take
+        # the single-instance lock and a journal of its own
+        self.scope = changes
         self.iface = self.gateway = None
         self.onpath = self.tap = self.splicer = None
         self.cam_mac = None
@@ -252,7 +280,7 @@ class Armed:
     def __enter__(self):
         from .changes import Changes
         _need_root_linux()
-        self.changes = Changes()
+        self.changes = self.scope or Changes()
         self.changes.acquire()
         atexit.register(self._teardown)
         try:
@@ -598,7 +626,7 @@ def cmd_watch(a):
     """The live view straight from the camera, recorded until Ctrl-C (or
     --seconds)."""
     from .changes import Changes, signals_held
-    from .direct import CameraGone, Direct, open_firewall
+    from .direct import CameraGone, Direct, open_firewall, open_first
     from .netutil import local_ip_for
     started = time.time()
     target, mac, enr, uid = _direct_key(a)
@@ -607,16 +635,23 @@ def cmd_watch(a):
     out.mkdir(parents=True, exist_ok=True)
     changes = Changes()
     changes.acquire()
-    d = Direct(target, uid, enr, mac, local_ip=local_ip_for(target),
-               av_log=str(out / "av.bin"))
-    ok = False
+    framing = _cached(mac).get("framing")
+
+    def make(stop):
+        s = Direct(target, uid, enr, mac, local_ip=local_ip_for(target),
+                   stop=stop, framing=framing)
+        open_firewall(changes, target, s.port)
+        return s
+
+    d, ok = None, False
     sleep_lock = _inhibit_sleep("recording a live view")
     try:
-        open_firewall(changes, target, d.port)
         t0 = time.monotonic()
-        d.open()
-        print(f"[+] live from {target} after {time.monotonic() - t0:.1f} s; "
-              f"recording to {out}/ (Ctrl-C to stop)")
+        d = open_first(make, av_log=str(out / "av.bin"))
+        _remember_framing(mac, d)
+        print(f"[+] live from {target} after {time.monotonic() - t0:.1f} s"
+              + (f" ({d.tries} sessions tried)" if d.tries > 1 else "")
+              + f"; recording to {out}/ (Ctrl-C to stop)")
         ok = True
         end = time.monotonic() + a.seconds if a.seconds else None
         tick = time.monotonic() + 5
@@ -631,9 +666,10 @@ def cmd_watch(a):
     except (CameraGone, ValueError) as e:
         print(f"[!] {e}")
     finally:
-        if os.environ.get("WYZE_SPLICE_DEBUG"):
-            print(f"[d] session ({d.framing} framing): {d.stats}")
-        d.close()
+        if d:
+            if os.environ.get("WYZE_SPLICE_DEBUG"):
+                print(f"[d] session ({d.framing} framing): {d.stats}")
+            d.close()
         with signals_held():
             changes.undo_all()
         changes.release()
@@ -653,7 +689,7 @@ def cmd_check(a):
     with armed:
         print(f"[+] camera {a.target} ({armed.cam_mac}) on {armed.iface}, "
               f"gateway {armed.gateway}")
-        print("[+] TPROXY, conntrack netlink, UDP 47821 and TCP 18443: ok")
+        print("[+] TPROXY, conntrack netlink and UDP 47821: ok")
         print("[+] ENR: " + ("cached" if armed.enr() else
                              "not cached yet; the first run harvests it"))
         policy = ipt("-S", "FORWARD").stdout.splitlines()[:1]

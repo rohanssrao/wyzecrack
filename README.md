@@ -20,14 +20,14 @@ Only use this against cameras you own or are authorized to test.
 - For the page: a current browser. Chrome, Brave and Edge decode the
   1080p stream themselves. Browsers that can't decode H.264 (Playwright's
   Firefox, for example) get 720p still frames from the tool instead, about
-  10 a second. Not tried in Safari yet.
+  10 a second. WebKit, Safari's engine, decodes the H.264 itself (tried in
+  Playwright's macOS build, not in Safari itself).
 
 Tested from a NixOS host against three Wyze Cam v3s (WYZE_CAKP2JFUS,
 firmware 4.36.17.21 and 4.36.16.7064) and a Wyze Cam v2 (WYZEC1-JZ,
-4.9.9.3006). On the v2, only watching has been tried, with a key taken from
-elsewhere: the tool hasn't read a v2's key itself yet. The lab suite also passes on
-Debian 12 (iptables 1.8.9, nf_tables backend); `lab/debian-check.sh` runs
-it in a throwaway container.
+4.9.9.3006). The lab suite also passes on Debian 12 (iptables 1.8.9,
+nf_tables backend); `lab/debian-check.sh` runs it in a throwaway
+container.
 
 ## First run
 
@@ -41,20 +41,24 @@ browser:
 
 1. **Pick a camera.** It lists the Wyze cameras on the network, with their
    model.
-2. **The first time with a camera** takes about two minutes. The tool
+2. **The first time with a camera** takes two to four minutes. The tool
    reroutes the camera's traffic through this computer and reads the
    camera's key (its ENR) off the camera's own HTTPS. To make the camera
    send it now, it resets the camera's connection to Wyze a few times; the
-   camera reconnects within seconds each time. The tool then asks Wyze for the camera's ID, presenting that key
-   as the camera does. Both are saved, and the camera's network goes back
-   to normal.
+   camera reconnects within seconds each time. The tool then asks Wyze for
+   the camera's ID, presenting that key as the camera does. Both are
+   saved, and the camera's network goes back to normal.
 3. **Watch.** The live view plays in the page in 1080p, with sound if you
-   turn it on, straight from the camera over the LAN. Stop saves it.
+   turn it on, straight from the camera over the LAN. Stop saves it as
+   one recording, even if the camera hung up and the page reconnected.
 
-After the first time, a camera's live view starts within seconds and
-nothing on the network is rerouted. If Wyze won't return a camera's ID,
-the page instead waits for someone to open the camera in the Wyze app and
-plays that live view ([how](docs/how-it-works.md)).
+After the first time, a camera's live view usually starts within seconds
+and nothing on the network is rerouted. To also keep the camera's motion
+clips, turn on **Save this camera's motion clips** under its live view:
+while the page is open, that camera's traffic goes through this computer
+and every clip it uploads to Wyze is saved too. If Wyze won't return a
+camera's ID, the page instead waits for someone to open the camera in the
+Wyze app and plays that live view ([how](docs/how-it-works.md)).
 
 ## Commands
 
