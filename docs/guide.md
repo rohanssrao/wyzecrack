@@ -63,7 +63,7 @@ Files are owned by the user who started wyzecrack.
   `wyzecrack watch --reharvest`, reads the new one.
 - **The first time takes long:** the camera only sends its key at certain
   moments. The tool resets its connection to Wyze until it does, usually
-  within two to four minutes. On models it hasn't been tried on, it waits
+  within one or two minutes, sometimes four. On models it hasn't been tried on, it waits
   for the camera to report in on its own: usually within 20 minutes, or
   right away when the camera sees motion.
 - **"The camera refused our certificate":** this firmware no longer
