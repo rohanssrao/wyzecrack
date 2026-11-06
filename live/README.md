@@ -2,7 +2,7 @@
 
 These scripts run the real Wyze Android app in an emulator on the test host
 and open the camera's live view through ThroughTek's relays while
-`wyze-splice` runs, so the whole chain can be tested without anyone
+`wyzecrack` runs, so the whole chain can be tested without anyone
 holding a phone.
 
 The emulator's direct paths to the camera are blocked for the test, as a

@@ -21,11 +21,11 @@ import struct
 import threading
 import time
 
-from wyze_splice import direct
-from wyze_splice.dtls import (HS_CH, HS_CKE, RT_APPDATA, RT_CCS, RT_HANDSHAKE,
+from wyzecrack import direct
+from wyzecrack.dtls import (HS_CH, HS_CKE, RT_APPDATA, RT_CCS, RT_HANDSHAKE,
                               DTLSLeg, Templates, derive_psk, parse_hs,
                               parse_records)
-from wyze_splice.tutk import trans_code_blob, untrans_code_blob
+from wyzecrack.tutk import trans_code_blob, untrans_code_blob
 
 CC51, IOTC = "cc51", "iotc"
 

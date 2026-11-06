@@ -1,14 +1,14 @@
-"""wyze-splice: watch a Wyze Cam v3 from the local network.
+"""wyzecrack: watch and record Wyze cameras from their local network.
 
-  wyze-splice                          open the app (pick a camera, watch it)
-  sudo wyze-splice watch               record the live view straight from the camera
-  sudo wyze-splice key                 get and save the camera's ENR and UID
-  sudo wyze-splice run                 splice the next live view, save events
-  sudo wyze-splice events              only save motion-event clips
-  sudo wyze-splice find                list Wyze devices on this LAN
-  sudo wyze-splice check               pre-flight checks, camera untouched
-  sudo wyze-splice cleanup             undo what a crashed run left behind
-  wyze-splice extract <capture>/av.bin rebuild the video from a capture
+  wyzecrack                          open the app (pick a camera, watch it)
+  sudo wyzecrack watch               record the live view straight from the camera
+  sudo wyzecrack key                 get and save the camera's ENR and UID
+  sudo wyzecrack run                 splice the next live view, save events
+  sudo wyzecrack events              only save motion-event clips
+  sudo wyzecrack find                list Wyze devices on this LAN
+  sudo wyzecrack check               pre-flight checks, camera untouched
+  sudo wyzecrack cleanup             undo what a crashed run left behind
+  wyzecrack extract <capture>/av.bin rebuild the video from a capture
 
 run and events find the camera by themselves when the LAN has one Wyze
 device, and ask which one when it has several; --target <camera ip> skips
@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
+STATE_DIR = Path(os.environ.get("WYZECRACK_STATE", "/var/lib/wyzecrack"))
 # Models on which the ENR nudge (nudge.py: resetting the camera's MQTT
 # connection until it reports in) has been tried live and the camera
 # stayed online. The v2 got it only after a test with someone there to
@@ -81,7 +81,7 @@ def _inhibit_sleep(why):
         return None
     # `tail --pid` also ends the lock when this process is killed outright
     p = subprocess.Popen([exe, "--what=sleep:idle:handle-lid-switch",
-                          "--who=wyze-splice", f"--why={why}",
+                          "--who=wyzecrack", f"--why={why}",
                           "tail", f"--pid={os.getpid()}", "-f", "/dev/null"],
                          start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -597,7 +597,7 @@ def _direct_key(a):
         try:
             uid = uid_from_wyze(target, mac, enr)
         except CloudError as e:
-            sys.exit(f"{e}; `wyze-splice run` still works, by catching a "
+            sys.exit(f"{e}; `wyzecrack run` still works, by catching a "
                      f"live view the app opens")
     if enr and uid:
         return target, mac, enr, uid
@@ -611,7 +611,7 @@ def _direct_key(a):
         sys.exit("no ENR seen; trigger a motion alarm and try again, or "
                  "pass --enr")
     if not uid:
-        sys.exit("Wyze didn't hand out the camera's UID; `wyze-splice run` "
+        sys.exit("Wyze didn't hand out the camera's UID; `wyzecrack run` "
                  "still works, by catching a live view the app opens")
     return target, mac, enr, uid
 
@@ -657,7 +657,7 @@ def cmd_watch(a):
         tick = time.monotonic() + 5
         while end is None or time.monotonic() < end:
             d.pump(0.5)
-            if os.environ.get("WYZE_SPLICE_DEBUG") and time.monotonic() >= tick:
+            if os.environ.get("WYZECRACK_DEBUG") and time.monotonic() >= tick:
                 print(f"[d] {time.strftime('%T')} rx {d.stats['rx']} "
                       f"ignored {d.stats.get('ignored', 0)} tx {d.stats['tx']}")
                 tick += 5
@@ -667,7 +667,7 @@ def cmd_watch(a):
         print(f"[!] {e}")
     finally:
         if d:
-            if os.environ.get("WYZE_SPLICE_DEBUG"):
+            if os.environ.get("WYZECRACK_DEBUG"):
                 print(f"[d] session ({d.framing} framing): {d.stats}")
             d.close()
         with signals_held():
@@ -798,13 +798,13 @@ def _sudo_reexec():
         return
     exe = shutil.which("sudo")
     if not exe:
-        sys.exit("wyze-splice needs root; run it as root")
-    print("wyze-splice needs root to reroute the camera's traffic.")
+        sys.exit("wyzecrack needs root; run it as root")
+    print("wyzecrack needs root to reroute the camera's traffic.")
     keep = ",".join(k for k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
                                 "DBUS_SESSION_BUS_ADDRESS", "PYTHONPATH")
                     if k in os.environ)
     argv = [exe] + ([f"--preserve-env={keep}"] if keep else []) + \
-        [sys.executable, "-m", "wyze_splice", *sys.argv[1:]]
+        [sys.executable, "-m", "wyzecrack", *sys.argv[1:]]
     os.execv(exe, argv)
 
 
@@ -833,7 +833,7 @@ def main(argv=None):
     sys.stdout = _QuietStream(sys.stdout)
     sys.stderr = _QuietStream(sys.stderr)
     _install_signals()
-    ap = argparse.ArgumentParser(prog="wyze-splice", description=__doc__,
+    ap = argparse.ArgumentParser(prog="wyzecrack", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
     g = sub.add_parser("gui", help="the app (default): pick a camera, watch along")

@@ -6,7 +6,7 @@ import sys
 import time
 import unittest
 
-from wyze_splice import rawnet
+from wyzecrack import rawnet
 
 
 def _udp_frame(src, dst, sport, dport, payload, proto=17):
@@ -91,7 +91,7 @@ class TestLiveFilter(unittest.TestCase):
 
 
 def test_wyze_ouis():
-    from wyze_splice.discover import is_wyze
+    from wyzecrack.discover import is_wyze
     assert is_wyze("D0:3F:27:A1:B2:C3") and is_wyze("2c:aa:8e:00:00:01")
     assert is_wyze("a4:da:22:2f:00:01") and not is_wyze("a4:da:22:3f:00:01")
     assert not is_wyze("02:00:00:00:00:01")

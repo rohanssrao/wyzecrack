@@ -1,10 +1,10 @@
 # Lab
 
 The lab is a network-namespace replica of a home LAN as it looks once
-`wyze-splice run` has made itself the camera's router. It tests the splice
+`wyzecrack run` has made itself the camera's router. It tests the splice
 end to end without a camera or phone:
 
-    cam 10.99.0.20 --(L2)-- mid 10.99.0.10 (wyze-splice --on-path) --(L2)-- gw 10.99.0.1 (NAT) -- relays 203.0.113.x
+    cam 10.99.0.20 --(L2)-- mid 10.99.0.10 (wyzecrack --on-path) --(L2)-- gw 10.99.0.1 (NAT) -- relays 203.0.113.x
 
 The camera's default route points at `mid`, and `mid` NATs its traffic. On
 a real LAN, the camera-only ARP poison plus MASQUERADE produce the same
@@ -18,7 +18,7 @@ result.
 Run as root on Linux, from the repo, after `uv sync`:
 
     sudo bash lab/lab_run.sh direct      # control: no splice, peers talk through the kernel
-    sudo bash lab/lab_run.sh splice      # the same session through wyze-splice
+    sudo bash lab/lab_run.sh splice      # the same session through wyzecrack
     sudo MULTIPATH=1 bash lab/lab_run.sh splice
                                          # phone's ClientHello arrives via the STUN relay as 0x1402
     sudo FAIL_FIRST=1 CAM_IGNORE_FIRST_CH=1 DUR=30 bash lab/lab_run.sh splice
@@ -60,7 +60,7 @@ Captures and logs land in `/tmp/wslab-out`. `lab_run.sh` captures the
 `mid` box with `tcpdump` (override with `TCPDUMP=`).
 
 `lab_watch.sh` runs `tests/fakecam.py` as the camera in the `cam`
-namespace and `wyze-splice watch` in `mid`, with the camera's key saved
+namespace and `wyzecrack watch` in `mid`, with the camera's key saved
 beforehand. It passes when the view went live and was recorded, hanging up
 switched the camera's video and audio off (K10010), and no firewall rule
 or journal is left in `mid`.

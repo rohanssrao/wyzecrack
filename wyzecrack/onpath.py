@@ -27,7 +27,7 @@ class OnPath:
     camera's traffic (a gateway, or the netns lab).
 
     Every change goes through the Changes journal, so a crash is undone by
-    `wyze-splice cleanup` or the next run."""
+    `wyzecrack cleanup` or the next run."""
 
     def __init__(self, changes, cam_ip, iface, poison, gateway=None):
         self.changes = changes

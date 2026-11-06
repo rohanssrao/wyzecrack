@@ -36,7 +36,7 @@ import time
 from .rawnet import (ACCEPT, DROP, JEQ_K, LD_B_ABS, LD_H_ABS, LD_W_ABS,
                      PACKET_OUTGOING, RET_K, _ip, open_raw)
 
-DEBUG = bool(os.environ.get("WYZE_SPLICE_DEBUG"))
+DEBUG = bool(os.environ.get("WYZECRACK_DEBUG"))
 MQTT_PORT = 8883
 SETTLE = 5          # s after a reconnect: let it publish (that logs metrics)
 MAX_RESETS = 8      # each adds ~1 KB; the buffer holds 5 KB

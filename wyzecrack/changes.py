@@ -7,7 +7,7 @@ is recorded as data in a journal file before it is made, so that:
   SIGTERM and SIGHUP held off until it finishes (a second Ctrl-C cannot
   cut it short), and with the undo commands in their own session so a
   terminal's Ctrl-C never reaches them;
-- after a crash, SIGKILL or power loss, `wyze-splice cleanup` (and the
+- after a crash, SIGKILL or power loss, `wyzecrack cleanup` (and the
   next run, before it starts) replays the journal.
 
 One instance at a time: the journal directory is guarded by an flock.
@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-RUN_DIR = Path(os.environ.get("WYZE_SPLICE_RUN", "/run/wyze-splice"))
+RUN_DIR = Path(os.environ.get("WYZECRACK_RUN", "/run/wyzecrack"))
 _SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 
 
@@ -128,7 +128,7 @@ class Changes:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             f.close()
-            raise SystemExit("another wyze-splice is already running "
+            raise SystemExit("another wyzecrack is already running "
                              "(only one runs at a time)")
         self._lockf = f
         stale = load(self.path)
@@ -140,7 +140,7 @@ class Changes:
                 self.path.write_text(json.dumps(left, indent=1))
                 raise SystemExit("some changes could not be undone (see "
                                  "above); fix that, then run "
-                                 "`wyze-splice cleanup` again")
+                                 "`wyzecrack cleanup` again")
             self.path.unlink(missing_ok=True)
 
     def release(self):
@@ -180,7 +180,7 @@ class Changes:
 
     def undo(self, tokens):
         """Undo these changes, newest first. One that cannot be undone
-        stays in the journal (for `wyze-splice cleanup`) and is reported."""
+        stays in the journal (for `wyzecrack cleanup`) and is reported."""
         with self._lock, signals_held():
             tokens = self._release(tokens)
             for tok, item in reversed(list(self.items)):

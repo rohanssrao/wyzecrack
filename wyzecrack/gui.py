@@ -1,6 +1,6 @@
-"""wyze-splice's graphical front end: a small local web app.
+"""wyzecrack's graphical front end: a small local web app.
 
-`wyze-splice` (no command) starts it: a server on 127.0.0.1 with a
+`wyzecrack` (no command) starts it: a server on 127.0.0.1 with a
 one-time token in its URL, opened in the invoking user's browser. The page
 lists the Wyze cameras on the LAN; picking one plays its live view in the
 page (video decoded by the browser with WebCodecs, audio with WebAudio)
@@ -34,7 +34,7 @@ from . import events
 from .live import LiveAssembler, codec_string
 
 WEB = Path(__file__).parent / "web"
-STATE_DIR = Path(os.environ.get("WYZE_SPLICE_STATE", "/var/lib/wyze-splice"))
+STATE_DIR = Path(os.environ.get("WYZECRACK_STATE", "/var/lib/wyzecrack"))
 MSG_VIDEO, MSG_AUDIO, MSG_JPEG = 1, 2, 3
 
 
@@ -723,11 +723,11 @@ def make_app(token, hub, ctl, lib):
         # address bar shows no secret and other pages can't drive the API
         if request.query.get("t") == token:
             resp = web.HTTPFound(request.path)
-            resp.set_cookie("wyze_splice", token, httponly=True,
+            resp.set_cookie("wyzecrack", token, httponly=True,
                             samesite="Strict")
             raise resp
-        if request.cookies.get("wyze_splice") != token:
-            return web.Response(status=403, text="Open the link wyze-splice "
+        if request.cookies.get("wyzecrack") != token:
+            return web.Response(status=403, text="Open the link wyzecrack "
                                 "printed in its terminal.")
         return await handler(request)
 
@@ -862,7 +862,7 @@ def _tee(path):
         f = open(path, "a")
     except OSError:
         return
-    f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} wyze-splice started\n")
+    f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} wyzecrack started\n")
     sys.stdout = _Tee(sys.stdout, f)
 
 
@@ -895,10 +895,10 @@ def serve(listen="127.0.0.1", port=0, out="captures", browser=True):
     hub = Hub()
     lib = Library(out)
     lib.root.mkdir(parents=True, exist_ok=True)
-    _tee(lib.root / "wyze-splice.log")
+    _tee(lib.root / "wyzecrack.log")
     from .changes import Changes, signals_held
     journal = Changes()
-    journal.acquire()            # one wyze-splice at a time; replays a crash's
+    journal.acquire()            # one wyzecrack at a time; replays a crash's
     ctl = Controller(hub, lib, journal)
     app = make_app(token, hub, ctl, lib)
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
@@ -916,7 +916,7 @@ def serve(listen="127.0.0.1", port=0, out="captures", browser=True):
         await runner.setup()
         site = web.SockSite(runner, sock)
         await site.start()
-        print(f"\n  wyze-splice is running: {url}\n")
+        print(f"\n  wyzecrack is running: {url}\n")
         if browser and open_browser(url):
             print("  (opened in your browser; Ctrl-C here quits)\n")
         else:

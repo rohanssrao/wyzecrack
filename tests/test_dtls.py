@@ -6,7 +6,7 @@ import struct
 import sys
 import time
 
-from wyze_splice.dtls import (  # noqa: E402
+from wyzecrack.dtls import (  # noqa: E402
     DTLSLeg, FLIGHT_SIZES, HS_CH, HS_CKE, HS_FIN, HS_NST, RT_APPDATA,
     RT_CCS, RT_HANDSHAKE, SpliceEngine, Templates, WRAPPER_HDR,
     WRAPPER_TRL, build_record, derive_psk, parse_hs, parse_records,
@@ -451,7 +451,7 @@ def test_session_key_ignores_the_per_path_ticket():
     """Live 2026-11-04: the phone's ClientHello came as 0x1402 with ticket
     3e02 via a STUN relay; the camera's flights were 0x1502 with ticket
     ef89 on the data relay. Same session id, same session."""
-    from wyze_splice.dtls import session_key
+    from wyzecrack.dtls import session_key
     sid = bytes.fromhex("513361dc1b4ebf55")
     via_stun = bytes(14) + bytes.fromhex("3e02") + sid + bytes(30)
     via_data = bytes(14) + bytes.fromhex("ef89") + sid + bytes(30)

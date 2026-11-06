@@ -1,4 +1,4 @@
-# wyze-splice
+# wyzecrack
 
 Watch and record a Wyze Cam v3 or v2 from its local network, with no phone
 and no Wyze account. It can also decrypt the live views the owner's Wyze
@@ -33,7 +33,7 @@ container.
 
 ```
 uv sync
-.venv/bin/wyze-splice
+.venv/bin/wyzecrack
 ```
 
 It asks for your password (it needs root) and opens a page in your
@@ -67,17 +67,17 @@ commands too; they also ask for the password themselves.
 
 | command | does |
 |---|---|
-| `wyze-splice` | the page: pick a camera, watch it, everything saved |
-| `wyze-splice watch` | record the live view straight from the camera, until Ctrl-C or `--seconds N` |
-| `wyze-splice key` | get and save a camera's ENR and ID (the page and `watch` do this themselves) |
-| `wyze-splice run` | splice the next live view the Wyze app opens; also saves motion events meanwhile |
-| `wyze-splice events` | only save motion events (`clip.mp4` + `snapshot.jpg`), until Ctrl-C or `--count N` |
-| `wyze-splice find` | list Wyze devices on the LAN (by their IEEE MAC prefixes) |
-| `wyze-splice check` | run all of `run`'s pre-flight checks without touching the camera |
-| `wyze-splice cleanup` | undo the network changes of a run that was killed |
-| `wyze-splice extract <capture>` | rebuild the video from a capture's `av.bin` |
+| `wyzecrack` | the page: pick a camera, watch it, everything saved |
+| `wyzecrack watch` | record the live view straight from the camera, until Ctrl-C or `--seconds N` |
+| `wyzecrack key` | get and save a camera's ENR and ID (the page and `watch` do this themselves) |
+| `wyzecrack run` | splice the next live view the Wyze app opens; also saves motion events meanwhile |
+| `wyzecrack events` | only save motion events (`clip.mp4` + `snapshot.jpg`), until Ctrl-C or `--count N` |
+| `wyzecrack find` | list Wyze devices on the LAN (by their IEEE MAC prefixes) |
+| `wyzecrack check` | run all of `run`'s pre-flight checks without touching the camera |
+| `wyzecrack cleanup` | undo the network changes of a run that was killed |
+| `wyzecrack extract <capture>` | rebuild the video from a capture's `av.bin` |
 
-`wyze-splice gui --listen <address>` serves the page on another address
+`wyzecrack gui --listen <address>` serves the page on another address
 (a tailnet address, say) to watch from another device; `--no-browser`
 just prints the link. For each command's options, use `--help` or see
 [docs/guide.md](docs/guide.md#options).

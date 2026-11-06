@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Direct mode end to end: a fake camera (tests/fakecam.py) in the cam
-# namespace, `wyze-splice watch` in mid with the camera's key already saved.
+# namespace, `wyzecrack watch` in mid with the camera's key already saved.
 # usage: [FRAMING=cc51|iotc] [LOGIN_DELAY=s] [QUIET_AFTER=s]
 #        [KILL_AT=s KILL_SIG=TERM|INT|KILL] [SECS=8] sudo bash lab_watch.sh
 # Result: $OUT/watch.json (what the camera saw and what was recorded) and
@@ -11,7 +11,7 @@ REPO=$(dirname "$LAB")
 PY=${PY:-$REPO/.venv/bin/python}
 SECS=${SECS:-8}
 OUT=/tmp/wslab-out; rm -rf $OUT; mkdir -p $OUT/state
-TOOLENV="WYZE_SPLICE_DEBUG=1 PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc WYZE_SPLICE_STATE=$OUT/state WYZE_SPLICE_RUN=$OUT/run"
+TOOLENV="WYZECRACK_DEBUG=1 PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc WYZECRACK_STATE=$OUT/state WYZECRACK_RUN=$OUT/run"
 bash $LAB/lab_setup.sh up
 cd $REPO
 MAC=$(ip -n tfl-cam -o link show eth0 | sed -E 's/.*link\/ether ([0-9a-f:]+).*/\1/')
@@ -25,7 +25,7 @@ ip netns exec tfl-cam env PYTHONPYCACHEPREFIX=/tmp/pyc $PY tests/fakecam.py \
    > $OUT/cam.json 2> $OUT/cam.err &
 CAM=$!
 sleep 1.5
-ip netns exec tfl-mid env $TOOLENV $PY -m wyze_splice watch --target 10.99.0.20 \
+ip netns exec tfl-mid env $TOOLENV $PY -m wyzecrack watch --target 10.99.0.20 \
    --seconds $SECS --out $OUT/watch > $OUT/watch.out 2>&1 &
 TOOL=$!
 if [ -n "${KILL_AT:-}" ]; then
@@ -33,7 +33,7 @@ if [ -n "${KILL_AT:-}" ]; then
   case ${KILL_SIG:-TERM} in
     INT) kill -INT $TOOL ;;
     KILL) kill -KILL $TOOL; sleep 0.5
-          ip netns exec tfl-mid env $TOOLENV $PY -m wyze_splice cleanup >> $OUT/watch.out 2>&1 ;;
+          ip netns exec tfl-mid env $TOOLENV $PY -m wyzecrack cleanup >> $OUT/watch.out 2>&1 ;;
     *) kill -$KILL_SIG $TOOL ;;
   esac
   echo killed > $OUT/killed.txt

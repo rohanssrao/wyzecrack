@@ -8,7 +8,7 @@ import threading
 import pytest
 from cryptography.hazmat.primitives import serialization
 
-from wyze_splice import cloud as enr
+from wyzecrack import cloud as enr
 
 
 def test_find_enr_unescapes_and_finds_mac():

@@ -9,8 +9,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 from fakecam import CC51, IOTC, FakeCamera  # noqa: E402
 
-from wyze_splice import direct  # noqa: E402
-from wyze_splice.live import LiveAssembler  # noqa: E402
+from wyzecrack import direct  # noqa: E402
+from wyzecrack.live import LiveAssembler  # noqa: E402
 
 UID, ENR, MAC = "ABCDEFGHJKLMNPQR111A", "gekMdn0XjZoWF/mD", "D03F27A1B2C3"
 

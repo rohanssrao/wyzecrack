@@ -540,8 +540,8 @@ BYPASS_JUDGE_AFTER = 45
 BYPASS_HINT = (
     "[!] that live view did not pass through this host: some of the "
     "camera's\n    connections go straight through the router, probably ones "
-    "it opened\n    before wyze-splice started (routers often fast-path busy "
-    "connections).\n    Unplug the camera for 5 seconds while wyze-splice "
+    "it opened\n    before wyzecrack started (routers often fast-path busy "
+    "connections).\n    Unplug the camera for 5 seconds while wyzecrack "
     "runs; the connections\n    it opens then pass through here.")
 
 # the phone sends AV acknowledgements several times a second while it

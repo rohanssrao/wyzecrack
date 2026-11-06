@@ -2,7 +2,7 @@
 import json
 import os
 
-from wyze_splice import cli
+from wyzecrack import cli
 
 
 def test_enr_cache_by_mac_and_old_ip_keyed_format(tmp_path, monkeypatch):

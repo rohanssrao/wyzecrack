@@ -8,7 +8,7 @@ import pytest
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
-from wyze_splice import gui  # noqa: E402
+from wyzecrack import gui  # noqa: E402
 
 
 class FakeController:
@@ -57,8 +57,8 @@ def test_token_login_api_and_files(tmp_path):
         async with TestClient(TestServer(app)) as c:
             assert (await c.get("/api/library")).status == 403
             r = await c.get("/?t=tok", allow_redirects=False)
-            assert r.status == 302 and "wyze_splice=tok" in r.headers["Set-Cookie"]
-            c.session.cookie_jar.update_cookies({"wyze_splice": "tok"})
+            assert r.status == 302 and "wyzecrack=tok" in r.headers["Set-Cookie"]
+            c.session.cookie_jar.update_cookies({"wyzecrack": "tok"})
             lib_ = await (await c.get("/api/library?mac=d0:3f:27:a1:b2:c3")).json()
             assert [r["seconds"] for r in lib_["recordings"]] == [33.2]
             assert len(lib_["motion"]) == 1
@@ -94,8 +94,8 @@ class _FakeCapture:
 
 
 def test_motion_capture_on_off_follow_and_pause(tmp_path, monkeypatch):
-    from wyze_splice import motion
-    from wyze_splice.changes import Changes
+    from wyzecrack import motion
+    from wyzecrack.changes import Changes
     monkeypatch.setattr(gui, "STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(motion, "MotionCapture", _FakeCapture)
     _FakeCapture.made = []

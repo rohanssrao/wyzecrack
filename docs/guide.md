@@ -1,4 +1,4 @@
-# wyze-splice guide
+# wyzecrack guide
 
 ## Options
 
@@ -18,7 +18,7 @@
 
 `key` takes the same options as `watch`, apart from `--seconds`, `--out`
 and `--no-video`. The ENR and ID are saved in
-`/var/lib/wyze-splice/enr.json`.
+`/var/lib/wyzecrack/enr.json`.
 
 `run`:
 
@@ -82,7 +82,7 @@ video goes to `session-N/`.
   off in the Wyze app, or on a schedule) or unplugged. A camera that is
   turned off stops all its P2P traffic, so it can't be watched.
 - **"Wyze did not return a UID":** the Wyze cloud refused the camera's
-  key, or changed this call. `wyze-splice run` still works: it catches a
+  key, or changed this call. `wyzecrack run` still works: it catches a
   live view that the Wyze app opens.
 - **The first time takes long:** the camera only sends its ENR at certain
   moments. The tool resets its connection to Wyze until it does, usually
@@ -97,10 +97,10 @@ video goes to `session-N/`.
 - **"that live view did not pass through this host":** the camera opened
   channels for a live view, but the stream never came through here. Some
   of the camera's connections go straight through the router, probably
-  ones it opened before wyze-splice started. (Seen behind a home router
+  ones it opened before wyzecrack started. (Seen behind a home router
   router: the camera's traffic to two of its relays never reached this
   host while its other traffic did.) Unplugging the camera for 5 seconds
-  while wyze-splice runs fixes it: the connections it opens then pass
+  while wyzecrack runs fixes it: the connections it opens then pass
   through here. (Before an unplug, 3 of 5 test views were missed; after
   it, 3 of 3 were caught.)
 - **"waiting for the camera's ENR" for a long time:** trigger a motion
@@ -110,6 +110,6 @@ video goes to `session-N/`.
   traffic. Check its firewall.
 - **`engine failed` mentioning decryption:** the cached ENR is stale
   because the camera was re-paired. Rerun with `--reharvest`.
-- **A run was killed and the camera is offline:** run `wyze-splice
+- **A run was killed and the camera is offline:** run `wyzecrack
   cleanup`. The camera also recovers on its own within a few minutes, once
   its ARP entry expires.

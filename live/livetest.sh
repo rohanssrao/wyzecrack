@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Autonomous live test: the real Wyze app in the emulator opens the
-# camera's live view through the TUTK relays while wyze-splice runs.
+# camera's live view through the TUTK relays while wyzecrack runs.
 # usage: sudo CAM=<camera ip> bash live/livetest.sh [splice|pass|drive] [watch seconds]
 #   drive: only open the live view in the app (isolated); something else,
-#          such as the GUI, runs wyze-splice
+#          such as the GUI, runs wyzecrack
 #   TILE_XY  where the camera's tile sits on the app's home screen
 #            (default "543 1700": the second tile on a Pixel 6 AVD)
 #   EMU_HOME emulator state (default ~/wyze-emu of the sudo user)
@@ -57,7 +57,7 @@ ARGS="--target $CAM --out $OUT --journal"
 [ "$MODE" = pass ] && ARGS="$ARGS --pass-through"
 cd $R
 if [ "$MODE" != drive ]; then
-  PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc .venv/bin/wyze-splice run $ARGS > $LOG/tool.out 2>&1 &
+  PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc .venv/bin/wyzecrack run $ARGS > $LOG/tool.out 2>&1 &
   TOOL=$!
   for i in $(seq 1 40); do grep -q "watching" $LOG/tool.out && break; sleep 1; done
   grep -q "watching" $LOG/tool.out || { say "tool did not start:"; cat $LOG/tool.out; exit 1; }

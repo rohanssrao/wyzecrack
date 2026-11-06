@@ -14,8 +14,8 @@ gwmac() { ip -n tfl-cam neigh show 10.99.0.1 | awk '{print $5}'; }
 before=$(gwmac)
 ip netns exec tfl-mid env PYTHONPATH=$REPO $PY - <<'PY' &
 import tempfile, time
-from wyze_splice.changes import Changes
-from wyze_splice.onpath import OnPath
+from wyzecrack.changes import Changes
+from wyzecrack.onpath import OnPath
 c = Changes(tempfile.mkdtemp())
 o = OnPath(c, "10.99.0.20", "eth0", poison=True, gateway="10.99.0.1")
 o.start(); time.sleep(4); o.close()

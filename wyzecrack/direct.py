@@ -241,7 +241,7 @@ def open_first(make, timeout=OPEN_TIMEOUT, stop=None, av_log=None, on_av=None,
             pass
         except Exception as e:  # noqa: BLE001 - a bad packet ends this try only
             box["error"] = e
-        if os.environ.get("WYZE_SPLICE_DEBUG"):
+        if os.environ.get("WYZECRACK_DEBUG"):
             d.log(f"[d] session {n} ended at the {d.stage()} after "
                   f"{time.monotonic() - t0:.1f} s"
                   + (f": {box['error']!r}" if "error" in box else ""))
@@ -662,7 +662,7 @@ class Direct:
                 break
         if (self.leg.handshake_done
                 and time.monotonic() - self.last_rx > SILENT_AFTER):
-            if os.environ.get("WYZE_SPLICE_DEBUG"):
+            if os.environ.get("WYZECRACK_DEBUG"):
                 print(f"[d] quiet: last packet {time.monotonic() - self.last_rx:.1f} s "
                       f"ago, socket {self.sock.getsockname()}, peer {self.peer}")
             raise CameraGone("the camera went quiet")

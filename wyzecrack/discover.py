@@ -124,7 +124,7 @@ MODELS = {
     "HL_WCO2": "Wyze Cam Outdoor v2",
     "WYZEDB3": "Wyze Video Doorbell",
 }
-# models wyze-splice has been tested against
+# models wyzecrack has been tested against
 TESTED = {"WYZE_CAKP2JFUS", "WYZEC1-JZ"}
 
 

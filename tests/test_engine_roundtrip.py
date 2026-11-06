@@ -22,7 +22,7 @@ import struct
 import sys
 
 
-from wyze_splice.dtls import (  # noqa: E402
+from wyzecrack.dtls import (  # noqa: E402
     DTLSLeg, HS_CH, HS_CKE, RT_APPDATA, RT_CCS, RT_HANDSHAKE, SpliceEngine,
     Templates, derive_psk, parse_hs, parse_records,
 )
@@ -125,7 +125,7 @@ def run_session(media_plaintexts, ack_plaintexts, split=False):
             rounds += 1
             nxt = []
             if split:
-                from wyze_splice.dtls import split_records
+                from wyzecrack.dtls import split_records
                 replies = [(side, r) for side, f in replies
                            for r in (split_records(f) or [f])]
             for side, flight in replies:

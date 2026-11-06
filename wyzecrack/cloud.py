@@ -121,7 +121,7 @@ uL5ChFWOQU+ErSDnUq7yr+pjBQ==
 
 SO_ORIGINAL_DST = 80
 INTERCEPT_PORT = 0           # any free port (several taps can run at once)
-DEBUG = bool(os.environ.get("WYZE_SPLICE_DEBUG"))
+DEBUG = bool(os.environ.get("WYZECRACK_DEBUG"))
 # PUT /<MAC>/<date>/<alarm id>_<alarm ms>_<n>_<file type>_<n>/<uuid>_<n>.<ext>,
 # <n> 1 from the v3 (cpl-t-sightsafe.wyzecam.com), -1 from the v2 (S3)
 EVENT_PATH_RE = re.compile(rb"^/[0-9A-F]{12}/[0-9-]+/([0-9A-F]+)_(\d{13})_\d+_(\d)_\d+/"
@@ -397,7 +397,7 @@ class CloudTap:
                       "tls_failed": 0}
         self.hosts = {}
         self.refused = set()       # non-Wyze hosts whose leaf the camera refused
-        self._work = tempfile.mkdtemp(prefix="wyze-splice-certs-")
+        self._work = tempfile.mkdtemp(prefix="wyzecrack-certs-")
         self._ctx_lock = threading.Lock()
         self._tokens = []
         self._srv = None

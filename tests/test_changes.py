@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from wyze_splice import changes as ch
+from wyzecrack import changes as ch
 
 
 def test_undo_is_newest_first_and_journal_tracks_state(tmp_path):

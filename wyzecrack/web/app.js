@@ -192,9 +192,9 @@ $("#stop").onclick = async () => {
   await api("/api/stop", {});
 };
 $("#quit").onclick = async () => {
-  if (!confirm("Quit wyze-splice? Anything it changed on the network is put back.")) return;
+  if (!confirm("Quit wyzecrack? Anything it changed on the network is put back.")) return;
   await api("/api/quit", {});
-  document.body.innerHTML = `<main><div class="hero"><h1>wyze-splice stopped</h1><p>The network is back to normal. You can close this tab.</p></div></main>`;
+  document.body.innerHTML = `<main><div class="hero"><h1>wyzecrack stopped</h1><p>The network is back to normal. You can close this tab.</p></div></main>`;
 };
 $("#rescan").onclick = scan;
 
@@ -230,7 +230,7 @@ function showMotion(c) {
   note.classList.toggle("error", !!(cap && cap.error));
   note.textContent = cap && cap.error
     ? `Not saving motion clips: ${cap.error}`
-    : "While wyze-splice is open, this camera's internet traffic goes through this computer so its clips can be copied. If this computer sleeps or shuts down meanwhile, the camera is offline for up to about a minute.";
+    : "While wyzecrack is open, this camera's internet traffic goes through this computer so its clips can be copied. If this computer sleeps or shuts down meanwhile, the camera is offline for up to about a minute.";
 }
 
 $("#motion-toggle").onchange = async (e) => {

@@ -30,7 +30,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [REPO, os.path.join(REPO, "tests")]
 from test_engine_roundtrip import wrap, unwrap, PSK   # noqa: E402
-from wyze_splice.dtls import (DTLSLeg, Templates, RT_APPDATA, RT_HANDSHAKE,  # noqa: E402
+from wyzecrack.dtls import (DTLSLeg, Templates, RT_APPDATA, RT_HANDSHAKE,  # noqa: E402
                               RT_CCS, HS_CH, HS_CKE, parse_records, parse_hs)
 
 CAM = ("10.99.0.20", 33446)
@@ -53,7 +53,7 @@ P2P_CANDIDATES = [("198.51.100.77", 42727), ("10.0.2.15", 33039)]
 
 def send_flight(sock, flight, port, addr, cam_side, stun=False):
     """A handshake flight: one wrapper, or (SPLIT) one per record."""
-    from wyze_splice.dtls import split_records
+    from wyzecrack.dtls import split_records
     parts = split_records(flight) if SPLIT else [flight]
     for part in parts or [flight]:
         w = tag(wrap(part, cam_side=cam_side), port)

@@ -1,4 +1,4 @@
-# How wyze-splice works
+# How wyzecrack works
 
 A live view needs three things per camera: its MAC, its ENR and its TUTK
 UID. The MAC comes from ARP. The ENR is read once off the camera's own
@@ -172,10 +172,10 @@ for two cameras on the path) is put back when the last one is done.
 ## Safety
 
 Every change to the host (iptables rules, the policy route, sysctls, the
-camera's ARP entry) is written to a journal in `/run/wyze-splice/` before
+camera's ARP entry) is written to a journal in `/run/wyzecrack/` before
 it is made. However the tool exits, including Ctrl-C (once or repeatedly),
 SIGTERM or a closed terminal, it undoes the changes in reverse order. If
-the process is killed outright, `wyze-splice cleanup` or the next run
+the process is killed outright, `wyzecrack cleanup` or the next run
 replays the journal. (A reboot clears these changes on its own: none of
 them are persistent.) Only one instance runs at a time.
 

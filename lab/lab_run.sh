@@ -3,7 +3,7 @@
 #        [HARVEST=1] [PASS=1] [DUR=14] [KILL_AT=seconds KILL_SIG=TERM|HUP|INT2|KILL]
 #        sudo bash lab_run.sh splice|direct
 # KILL_AT signals the tool mid-session (INT2 = Ctrl-C twice; KILL is
-# followed by `wyze-splice cleanup`). Whatever the tool leaves behind in
+# followed by `wyzecrack cleanup`). Whatever the tool leaves behind in
 # the mid namespace is written to $OUT/leftovers.txt (empty = clean).
 set -u
 LAB=$(dirname "$(readlink -f "$0")")
@@ -15,10 +15,10 @@ DUR=${DUR:-14}
 PEERENV="STUNONLY=${STUNONLY:-0} SPLIT=${SPLIT:-0} MULTIPATH=${MULTIPATH:-0} FAIL_FIRST=${FAIL_FIRST:-0} DIE_FIRST=${DIE_FIRST:-0} CAM_IGNORE_FIRST_CH=${CAM_IGNORE_FIRST_CH:-0} MEDIA_SECS=${MEDIA_SECS:-8} MEDIA_PPS=${MEDIA_PPS:-60} PYTHONPYCACHEPREFIX=/tmp/pyc"
 OUT=/tmp/wslab-out; rm -rf $OUT; mkdir -p $OUT
 # the lab's journal and lock must never meet a real run's
-TOOLENV="WYZE_SPLICE_DEBUG=1 PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc WYZE_SPLICE_STATE=$OUT/state WYZE_SPLICE_RUN=$OUT/run"
+TOOLENV="WYZECRACK_DEBUG=1 PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/pyc WYZECRACK_STATE=$OUT/state WYZECRACK_RUN=$OUT/run"
 bash $LAB/lab_setup.sh up
 cd $REPO
-tool_pids() { for p in $(ip netns pids tfl-mid); do grep -qa wyze_splice /proc/$p/cmdline 2>/dev/null && echo $p; done; }
+tool_pids() { for p in $(ip netns pids tfl-mid); do grep -qa wyzecrack /proc/$p/cmdline 2>/dev/null && echo $p; done; }
 if [ "${HARVEST:-0}" = 1 ]; then
   ENRARG="--reharvest --harvest-timeout 20"
   ip netns exec tfl-relay env OUT=$OUT $PY $LAB/lab_api.py server $((DUR+15)) > $OUT/api-server.log 2>&1 &
@@ -27,7 +27,7 @@ else
 fi
 if [ "$MODE" = splice ]; then
   ip netns exec tfl-mid env $TOOLENV \
-     $PY -m wyze_splice run --target 10.99.0.20 $ENRARG --on-path --keep-going \
+     $PY -m wyzecrack run --target 10.99.0.20 $ENRARG --on-path --keep-going \
      --out $OUT --journal --no-video ${PASS:+--pass-through} > $OUT/splice.out 2>&1 &
   sleep 4
 fi
@@ -61,7 +61,7 @@ if [ "$MODE" = splice ]; then
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(tool_pids)" ] && break; sleep 0.5; done
   if [ -n "$(tool_pids)" ]; then echo "tool still running after SIGINT" >> $OUT/leftovers.txt; kill -9 $(tool_pids); fi
   if [ "${KILL_SIG:-}" = KILL ] && [ -z "${NO_CLEANUP:-}" ]; then
-    ip netns exec tfl-mid env $TOOLENV $PY -m wyze_splice cleanup > $OUT/cleanup.out 2>&1
+    ip netns exec tfl-mid env $TOOLENV $PY -m wyzecrack cleanup > $OUT/cleanup.out 2>&1
   fi
   # anything the tool installed must be gone (lab_setup's own MASQUERADE stays)
   ip netns exec tfl-mid sh -c '

@@ -2,7 +2,7 @@ import os
 import struct
 import tempfile
 
-from wyze_splice import media as av_extract
+from wyzecrack import media as av_extract
 
 
 def _rec(direction, payload, ts=0.0):
@@ -122,7 +122,7 @@ def test_segments_split_where_the_sps_changes():
 
 def test_g711_decodes_to_pcm():
     import struct
-    from wyze_splice.media import CODEC_PCMA, CODEC_PCMU, g711_to_pcm
+    from wyzecrack.media import CODEC_PCMA, CODEC_PCMU, g711_to_pcm
     mu = struct.unpack("<4h", g711_to_pcm(bytes((0xFF, 0x7F, 0x00, 0x80)), CODEC_PCMU))
     assert mu == (0, 0, -32124, 32124)
     al = struct.unpack("<4h", g711_to_pcm(bytes((0xD5, 0x55, 0xAA, 0x2A)), CODEC_PCMA))
@@ -133,7 +133,7 @@ def test_parse_media_decodes_v2_audio():
     """A v2 audio packet: plain format (version 0x0B), G.711 mu-law, with
     the 40-byte FrameInfo (codec 0x89) after the samples."""
     import struct
-    from wyze_splice.media import parse_media
+    from wyzecrack.media import parse_media
     samples = bytes((0xFF, 0x00)) * 4
     info = bytes((0x89, 0x00, 0x02)) + bytes(37)
     payload = samples + info
@@ -163,7 +163,7 @@ def _write_av_bin(path, stretches):
 def test_one_recording_across_a_reconnect(tmp_path):
     import av
     import pytest
-    from wyze_splice.media import export
+    from wyzecrack.media import export
     try:
         from test_jpegfeed import _h264_frames
         units = _h264_frames(n=20)

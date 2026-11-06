@@ -19,7 +19,7 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
-from wyze_splice.cloud import emudhra_chain  # noqa: E402
+from wyzecrack.cloud import emudhra_chain  # noqa: E402
 
 ADDR = ("203.0.113.3", 443)
 ENR = "gekMdn0XjZoWF/mD"

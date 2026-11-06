@@ -34,7 +34,7 @@ class _F:
 
 
 def test_frames_become_jpegs():
-    from wyze_splice.jpegfeed import JpegFeed
+    from wyzecrack.jpegfeed import JpegFeed
     units = _h264_frames()
     got, done = [], threading.Event()
 
@@ -53,7 +53,7 @@ def test_frames_become_jpegs():
 
 
 def test_waits_for_a_key_frame():
-    from wyze_splice.jpegfeed import JpegFeed
+    from wyzecrack.jpegfeed import JpegFeed
     feed = JpegFeed(lambda t, jpg: None)
     try:
         feed.feed(_F(b"\x00\x00\x00\x01\x41", key=False))

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Netns lab mirroring the real topology after on-path mode is up:
-#   cam (10.99.0.20) --L2-- mid (10.99.0.10, runs wyze-splice) --L2-- gw (10.99.0.1, NAT) -- relays (203.0.113.x)
+#   cam (10.99.0.20) --L2-- mid (10.99.0.10, runs wyzecrack) --L2-- gw (10.99.0.1, NAT) -- relays (203.0.113.x)
 # cam's default route points at mid (what the camera-only ARP poison does)
-# and mid NATs the camera's traffic out, so wyze-splice runs with --on-path.
+# and mid NATs the camera's traffic out, so wyzecrack runs with --on-path.
 set -eu
 down() {
   for n in tfl-cam tfl-mid tfl-gw tfl-relay tfl-lan; do ip netns del $n 2>/dev/null || true; done

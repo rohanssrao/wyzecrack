@@ -4,8 +4,8 @@ import hashlib
 import hmac
 import struct
 
-from wyze_splice import direct
-from wyze_splice.media import parse_media
+from wyzecrack import direct
+from wyzecrack.media import parse_media
 
 ENR, MAC = "gekMdn0XjZoWF/mD", "D03F27A1B2C3"
 UID = "ABCDEFGHJKLMNPQR111A"            # made up
@@ -114,7 +114,7 @@ def test_parse_media_takes_the_plain_format():
 def test_transcode_matches_go2rtc():
     """Vectors from go2rtc's pkg/tutk/crypto.go (TransCodeBlob,
     ReverseTransCodeBlob, TransCodePartial), run with Go."""
-    from wyze_splice.tutk import (trans_code, trans_code_blob, untrans_code,
+    from wyzecrack.tutk import (trans_code, trans_code_blob, untrans_code,
                                   untrans_code_blob)
     vectors = [
         ("0402",

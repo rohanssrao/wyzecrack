@@ -11,7 +11,7 @@ import time
 import unittest
 import unittest.mock
 
-from wyze_splice.splice import StormGuard
+from wyzecrack.splice import StormGuard
 
 
 class TestStormGuard(unittest.TestCase):
@@ -71,11 +71,11 @@ class TestWatcherLatch(unittest.TestCase):
     bursts (0x1102/0x1202), STUN, or established media (rt=23)."""
 
     def _pkt(self, src, dst, sport, dport, payload):
-        from wyze_splice.rawnet import UdpPacket
+        from wyzecrack.rawnet import UdpPacket
         return UdpPacket(src, dst, sport, dport, payload)
 
     def _watcher(self):
-        from wyze_splice.splice import RelayFlowWatcher
+        from wyzecrack.splice import RelayFlowWatcher
         return RelayFlowWatcher("192.168.1.20", masq_ip="192.168.1.2")
 
     @staticmethod
@@ -108,9 +108,9 @@ class TestWatcherLatch(unittest.TestCase):
 
     def test_1502_wrapper_latches_immediately(self):
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd, \
-                unittest.mock.patch("wyze_splice.netutil.local_ip_for",
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd, \
+                unittest.mock.patch("wyzecrack.netutil.local_ip_for",
                                     lambda dst: "192.168.1.2"):
             ipt.return_value.returncode = 0
             ip_cmd.return_value.returncode = 0
@@ -137,9 +137,9 @@ class TestWatcherLatch(unittest.TestCase):
 
     def test_probe_burst_alone_does_not_latch_early(self):
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd, \
-                unittest.mock.patch("wyze_splice.netutil.local_ip_for",
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd, \
+                unittest.mock.patch("wyzecrack.netutil.local_ip_for",
                                     lambda dst: "192.168.1.2"):
             ipt.return_value.returncode = 0
             ip_cmd.return_value.returncode = 0
@@ -151,7 +151,7 @@ class TestWatcherLatch(unittest.TestCase):
 
     def test_stun_burst_never_latches(self):
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt:
             ipt.return_value.returncode = 0
             stun = b"\x00\x01\x00\x02" + b"\x00" * 40  # not 0xCC51
             for _ in range(20):
@@ -162,9 +162,9 @@ class TestWatcherLatch(unittest.TestCase):
         """2026-10-25: relay sessions can carry the DTLS data flow on the
         STUN relay's :3478. The watcher must not exclude that port."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd, \
-                unittest.mock.patch("wyze_splice.netutil.local_ip_for",
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd, \
+                unittest.mock.patch("wyzecrack.netutil.local_ip_for",
                                     lambda dst: "192.168.1.2"):
             ipt.return_value.returncode = 0
             ip_cmd.return_value.returncode = 0
@@ -182,8 +182,8 @@ class TestWatcherLatch(unittest.TestCase):
         bursts (15 in 200us observed). It must not trip the rate
         fallback -- only 0x1502 data wrappers may."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd:
             ipt.return_value.returncode = 0
             ip_cmd.return_value.returncode = 0
             # real 0x0202 header shape: cmd 0x0202, plen 280, dir ffff
@@ -199,8 +199,8 @@ class TestWatcherLatch(unittest.TestCase):
         no phone leg. Without fresh inbound 0x1502 on the same tuple,
         the outbound packets must never latch."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd:
             ipt.return_value.returncode = 0
             ip_cmd.return_value.returncode = 0
             dtls = self._hs_flight()
@@ -216,11 +216,11 @@ class TestWatcherLatch(unittest.TestCase):
         confirm an outbound 0x1502 (dead flow's stale retransmit)."""
         import time as _time
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd:
             ipt.return_value.returncode = 0
             ip_cmd.return_value.returncode = 0
-            from wyze_splice.splice import INBOUND_TTL
+            from wyzecrack.splice import INBOUND_TTL
             w.inbound_1502[("198.51.100.101", 24520)] = _time.time() - INBOUND_TTL - 5
             dtls = self._hs_flight()
             w._cb(self._pkt("192.168.1.20", "198.51.100.101", 50169, 24520, dtls))
@@ -232,8 +232,8 @@ class TestWatcherLatch(unittest.TestCase):
         divert live video into a not-yet-started engine and kill it.
         Neither the confirmed path nor the rate fallback may latch."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd:
             ipt.return_value.returncode = 0
             ip_cmd.returncode.returncode = 0
             media = self._media()
@@ -253,8 +253,8 @@ class TestWatcherLatch(unittest.TestCase):
         flow to must not latch (the latch tuple must be a real camera
         flow)."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd:
             ipt.return_value.returncode = 0
             ip_cmd.returncode.returncode = 0
             w._cb(self._pkt("198.51.100.9", "192.168.1.20", 41002, 50169,
@@ -268,8 +268,8 @@ class TestWatcherLatch(unittest.TestCase):
         side retransmits on the dead tuple re-latch it across the app's
         retry window."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd:
             ipt.return_value.returncode = 0
             ip_cmd.returncode.returncode = 0
             cookie_ch = self._wrapper(
@@ -321,8 +321,8 @@ class TestWatcherLatch(unittest.TestCase):
         open noise (the app retries on a NEW port), but a plain CH on
         it still means a fresh session attempt."""
         w = self._watcher()
-        with unittest.mock.patch("wyze_splice.splice.ipt") as ipt, \
-                unittest.mock.patch("wyze_splice.splice.ip_cmd") as ip_cmd:
+        with unittest.mock.patch("wyzecrack.splice.ipt") as ipt, \
+                unittest.mock.patch("wyzecrack.splice.ip_cmd") as ip_cmd:
             ipt.return_value.returncode = 0
             ip_cmd.return_value.returncode = 0
             ch_open = self._wrapper(b"\x00" * 40, cmd=0x1102)
@@ -359,17 +359,17 @@ class TestRelatchReason(unittest.TestCase):
             self.client_leg = TestRelatchReason._Leg(cam_done)
 
     def test_not_started_within_5s_keeps_waiting(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         e = self._Engine(False, False, False)
         self.assertIsNone(_relatch_reason(e, 100.0, 100.0, 104.9))
 
     def test_not_started_after_5s_is_stale(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         e = self._Engine(False, False, False)
         self.assertIn("stale", _relatch_reason(e, 100.0, 100.0, 105.1))
 
     def test_camera_leg_stall_tears_down(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         # run-6 flow 12977: the phone's CH arrived (engine started)
         # but the camera never completed its server flight
         e = self._Engine(True, False, False)
@@ -377,7 +377,7 @@ class TestRelatchReason(unittest.TestCase):
         self.assertIsNone(_relatch_reason(e, 100.0, 100.0, 104.9))
 
     def test_failed_tears_down_despite_busy_traffic(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         # a failed engine's tuple stays busy with retransmits; the
         # teardown must follow latch age, not packet quiet
         e = self._Engine(True, True, False)
@@ -385,18 +385,18 @@ class TestRelatchReason(unittest.TestCase):
         self.assertIsNone(_relatch_reason(e, 100.0, 100.0, 107.0))
 
     def test_healthy_session_keeps_running(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         e = self._Engine(True, False, True)
         self.assertIsNone(_relatch_reason(e, 100.0, 100.0, 120.0))
 
     def test_established_session_quiet_30s_tears_down(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         e = self._Engine(True, False, True)
         r = _relatch_reason(e, 100.0, 100.0, 130.1)
         self.assertIn("quiet", r)
 
     def test_camera_silent_after_handshake_tears_down(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         e = self._Engine(True, None, True)
         # phone still chatty (last_packet fresh), camera quiet > 3 s
         r = _relatch_reason(e, 100.0, 110.0, 110.0, last_cam=106.9)
@@ -405,7 +405,7 @@ class TestRelatchReason(unittest.TestCase):
                                           last_cam=107.5))
 
     def test_no_engine_stale_pass_through_rearms(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         # alive while the camera talks, released once it goes silent 3 s
         self.assertIsNone(_relatch_reason(None, 100.0, 120.0, 120.0,
                                           last_cam=119.0))
@@ -415,10 +415,10 @@ class TestRelatchReason(unittest.TestCase):
                                                last_cam=130.0))
 
     def _install(self, peers):
-        from wyze_splice.changes import Changes
-        from wyze_splice.splice import install_splice_rules
+        from wyzecrack.changes import Changes
+        from wyzecrack.splice import install_splice_rules
         changes = Changes(tempfile.mkdtemp())
-        with unittest.mock.patch("wyze_splice.splice.ipt_restore") as restore:
+        with unittest.mock.patch("wyzecrack.splice.ipt_restore") as restore:
             restore.return_value.returncode = 0
             tokens = install_splice_rules(changes, "192.168.1.2", "192.168.1.20",
                                           52586, peers)
@@ -427,7 +427,7 @@ class TestRelatchReason(unittest.TestCase):
             return restore.call_args[0][0], tokens, undo
 
     def test_viewer_left_when_the_phone_goes_quiet(self):
-        from wyze_splice.splice import _relatch_reason
+        from wyzecrack.splice import _relatch_reason
         e = unittest.mock.Mock(started=True, failed=None)
         e.client_leg.handshake_done = True
         self.assertIsNone(_relatch_reason(e, 100.0, 120.0, 120.0,
@@ -461,8 +461,8 @@ class TestRelatchReason(unittest.TestCase):
         self.assertEqual(len(tokens), 6)
 
     def test_watcher_sees_relay_replies_to_our_nat_address(self):
-        from wyze_splice.rawnet import UdpPacket
-        from wyze_splice.splice import RelayFlowWatcher
+        from wyzecrack.rawnet import UdpPacket
+        from wyzecrack.splice import RelayFlowWatcher
         w = RelayFlowWatcher("192.168.1.20", masq_ip="192.168.1.2")
         open_ = (b"\x51\xcc\x00\x00\x02\x11\x28\x00" + bytes(44))
         cam = UdpPacket("192.168.1.20", "198.51.100.152", 52586, 44369, open_)
@@ -475,7 +475,7 @@ class TestRelatchReason(unittest.TestCase):
                          ("198.51.100.152", 44369, 52586))
 
     def test_0x1402_clienthello_is_recognised(self):
-        from wyze_splice.splice import is_clienthello_flight, is_dtls_wrap
+        from wyzecrack.splice import is_clienthello_flight, is_dtls_wrap
         ch = bytearray(305)
         ch[0:2] = b"\x51\xcc"
         struct.pack_into("<H", ch, 4, 0x1402)
@@ -485,11 +485,11 @@ class TestRelatchReason(unittest.TestCase):
         self.assertTrue(is_clienthello_flight(bytes(ch)))
 
     def test_install_splice_rules_fails_cleanly(self):
-        from wyze_splice.changes import Changes
-        from wyze_splice.splice import install_splice_rules
+        from wyzecrack.changes import Changes
+        from wyzecrack.splice import install_splice_rules
         changes = Changes(tempfile.mkdtemp())
-        with unittest.mock.patch("wyze_splice.splice.ipt_restore") as restore, \
-                unittest.mock.patch("wyze_splice.changes.run") as run:
+        with unittest.mock.patch("wyzecrack.splice.ipt_restore") as restore, \
+                unittest.mock.patch("wyzecrack.changes.run") as run:
             bad = subprocess.CompletedProcess([], 1)
             bad.stderr = "iptables-restore: bad rule"
             restore.return_value = bad
@@ -506,7 +506,7 @@ class TestRelatchReason(unittest.TestCase):
                      "transparent sockets need Linux + root")
 class TestOpenFaces(unittest.TestCase):
     def test_ttl_mirror_sets_arrival_minus_one(self):
-        from wyze_splice.splice import TtlMirror, IP_TTL
+        from wyzecrack.splice import TtlMirror, IP_TTL
         f = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             m = TtlMirror(f)
@@ -518,8 +518,8 @@ class TestOpenFaces(unittest.TestCase):
             f.close()
 
     def test_faces_bind_spoofed_and_connect(self):
-        from wyze_splice.netutil import local_ip_for
-        from wyze_splice.splice import open_faces
+        from wyzecrack.netutil import local_ip_for
+        from wyzecrack.splice import open_faces
         us = local_ip_for("8.8.8.8")
         cam_face, relay_face = open_faces(("192.0.2.42", 40001),
                                           ("198.51.100.7", 40002), us)
@@ -541,7 +541,7 @@ if __name__ == "__main__":
 
 class TestBypassCheck(unittest.TestCase):
     def _w(self, expected=()):
-        from wyze_splice.splice import RelayFlowWatcher
+        from wyzecrack.splice import RelayFlowWatcher
         w = RelayFlowWatcher("192.168.1.20", masq_ip="192.168.1.2")
         w.expected_relays = set(expected)
         w.watch_since = 1000.0

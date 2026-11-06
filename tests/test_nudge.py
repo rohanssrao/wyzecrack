@@ -3,7 +3,7 @@ import struct
 
 import socket
 
-from wyze_splice.nudge import MQTT_PORT, _checksum, mqtt_segment, rst_packet
+from wyzecrack.nudge import MQTT_PORT, _checksum, mqtt_segment, rst_packet
 
 
 def _frame(sport, dport, flags, proto=6, ack=7):
