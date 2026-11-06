@@ -51,7 +51,7 @@ is rerouted. Step 5 turns what it records into video files.
    posted `set_device_info` with its ENR. The camera stays online apart
    from a few seconds per reconnect, and live views are unaffected. The
    nudge runs on the models it was tried on (`NUDGE_MODELS`: the v3 and
-   the v2); `--no-nudge` turns it off.
+   the v2).
 
    An earlier version cut all of the camera's traffic until it noticed.
    That produced the report only when the burst of connection events
@@ -126,10 +126,9 @@ is rerouted. Step 5 turns what it records into video files.
 5. **Export** (`media.py`). The tool reassembles the H.264 from TUTK media
    frames and remuxes it (without re-encoding) into an MP4 paced to
    arrival time, with the audio as AAC. The camera starts each live view
-   in SD and switches to 1080p a few seconds in; each resolution that
-   lasted at least 2 s gets its own MP4. Frames that could not decode
-   cleanly are left out: any incomplete frame, plus the rest of its group
-   of pictures.
+   in SD and switches to 1080p a few seconds in; the recording is the
+   1080p part. Frames that could not decode cleanly are left out: any
+   incomplete frame, plus the rest of its group of pictures.
 
 ## The page
 
@@ -172,7 +171,7 @@ them are persistent.) Only one instance runs at a time.
 
 The tool also adds FORWARD accept rules for the camera, for firewalls that
 drop forwarded traffic (ufw, Docker, firewalld). These rules can't override
-a firewall that drops the traffic directly in nftables; `wyzecrack check`
-warns about one. While it routes a camera or shows a live view, the tool
+a firewall that drops the traffic directly in nftables; the tool warns
+about one when it starts rerouting. While it routes a camera or shows a live view, the tool
 holds a `systemd-inhibit` sleep lock: a suspended host black-holes a
 rerouted camera and ends a live view.

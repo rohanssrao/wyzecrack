@@ -1,17 +1,14 @@
 """wyzecrack: watch and record Wyze cameras from their local network.
 
   wyzecrack                          open the app (pick a camera, watch it)
-  sudo wyzecrack watch               record the live view straight from the camera
-  sudo wyzecrack key                 get and save the camera's ENR and UID
-  sudo wyzecrack events              only save motion-event clips
-  sudo wyzecrack find                list Wyze devices on this LAN
-  sudo wyzecrack check               pre-flight checks, camera untouched
-  sudo wyzecrack cleanup             undo what a crashed run left behind
-  wyzecrack extract <capture>/av.bin rebuild the video from a capture
+  wyzecrack watch                    record the live view straight from the camera
+  wyzecrack events                   save the camera's motion clips
+  wyzecrack cleanup                  undo what a killed wyzecrack left behind
+  wyzecrack extract <recording>      write a recording's video again, if that failed
 
-watch, key and events find the camera by themselves when the LAN has one
-Wyze device, and ask which one when it has several; --target <camera ip>
-skips the search.
+watch and events find the camera by themselves when the LAN has one Wyze
+device, and ask which one when it has several; --target <camera ip> skips
+the search.
 """
 import argparse
 import atexit
@@ -233,8 +230,8 @@ class Armed:
     lock, on-path routing and the HTTPS interceptor. Leaving it (normally,
     by exception, Ctrl-C, SIGTERM or SIGHUP) undoes it all."""
 
-    def __init__(self, a, out, dry=False, harvest=False, changes=None):
-        self.a, self.out, self.dry = a, out, dry
+    def __init__(self, a, out, harvest=False, changes=None):
+        self.a, self.out = a, out
         self.want_harvest = harvest
         # a scope of a longer-lived journal (the page's), or None to take
         # the single-instance lock and a journal of its own
@@ -273,8 +270,7 @@ class Armed:
         if not self.cam_mac:
             sys.exit(f"{target} does not answer on {iface}; is the camera on?")
         self.iface = iface
-        if not self.dry:
-            self.out.mkdir(parents=True, exist_ok=True)
+        self.out.mkdir(parents=True, exist_ok=True)
         # bind and check everything before touching the camera's route
         if getattr(a, "events_dir", None) is not None or self.want_harvest:
             self.tap = CloudTap(self.changes, target,
@@ -284,8 +280,6 @@ class Armed:
         self.onpath = OnPath(self.changes, target, iface,
                              poison=not a.on_path)
         self.gateway = self.onpath.gateway
-        if self.dry:
-            return
         self._sleep_lock = _inhibit_sleep("camera gateway")
         self.onpath.start()
         if self.tap:
@@ -299,16 +293,16 @@ class Armed:
             return None
         return _cached_enr(self.cam_mac)
 
-    def wait_enr(self, timeout, nudge=True):
-        """Wait for the camera to send its ENR. With nudge, on models in
-        NUDGE_MODELS, make it send one now (nudge.py)."""
+    def wait_enr(self):
+        """Wait for the camera to send its ENR (None if stopped). On models
+        in NUDGE_MODELS, make it send one now (nudge.py)."""
         from .nudge import MqttNudge
         n = None
-        if nudge and self.model() in NUDGE_MODELS:
+        if self.model() in NUDGE_MODELS:
             n = MqttNudge(self.changes, self.a.target, self.iface)
             n.start()
         try:
-            return self._wait_enr(timeout, n)
+            return self._wait_enr(n)
         finally:
             if n:
                 n.stop.set()
@@ -319,7 +313,7 @@ class Armed:
         return (_cached(self.cam_mac).get("model")
                 or describe(self.a.target, self.cam_mac, self.gateway).get("model_id"))
 
-    def _wait_enr(self, timeout, n):
+    def _wait_enr(self, n):
         from . import events
         tap = self.tap
         if n:
@@ -355,8 +349,6 @@ class Armed:
                       "if you have the ENR some other way")
                 events.emit("enr", state="refused", stats=st)
                 warned = True
-            if timeout and time.monotonic() - start > timeout:
-                return None
         if tap.mac and _mac_key(tap.mac) != _mac_key(self.cam_mac):
             print(f"[!] the ENR came from MAC {tap.mac}, but {self.a.target} "
                   f"is {self.cam_mac}")
@@ -450,7 +442,7 @@ def cmd_events(a):
     return 0
 
 
-def obtain_key(armed, a, nudge=True):
+def obtain_key(armed, a):
     """(enr, uid) for the armed camera: from the cache, else the ENR from
     the camera's HTTPS and the UID from Wyze. Returns (enr, None) when
     Wyze won't give the UID, and (None, None) without an ENR."""
@@ -461,7 +453,7 @@ def obtain_key(armed, a, nudge=True):
     if enr:
         events.emit("enr", state="harvested", cached=True)
     else:
-        enr = armed.wait_enr(getattr(a, "harvest_timeout", 0), nudge=nudge)
+        enr = armed.wait_enr()
     if not enr:
         return None, None
     uid = None if getattr(a, "reharvest", False) else _cached_uid(mac)
@@ -522,19 +514,13 @@ def _direct_key(a):
     armed = Armed(a, Path("."), harvest=True)
     a.events_dir = None
     with armed:
-        enr, uid = obtain_key(armed, a, nudge=not a.no_nudge)
+        enr, uid = obtain_key(armed, a)
     if not enr:
         sys.exit("no ENR seen; trigger a motion alarm and try again, or "
                  "pass --enr")
     if not uid:
         sys.exit("Wyze didn't hand out the camera's UID")
     return target, mac, enr, uid
-
-
-def cmd_key(a):
-    target, mac, enr, uid = _direct_key(a)
-    print(f"[+] {target} ({mac}): ENR and UID saved in {STATE_DIR}/enr.json")
-    return 0
 
 
 def cmd_watch(a):
@@ -589,50 +575,10 @@ def cmd_watch(a):
             changes.undo_all()
         changes.release()
         _release_inhibitor(sleep_lock)
-    if ok and not a.no_video:
+    if ok:
         _export(out / "av.bin", out)
     _give_to_user(root, started)
     return 0 if ok else 1
-
-
-def cmd_check(a):
-    """The checks made before a camera is routed through this host (for its
-    first key read, or saving its clips), without touching it."""
-    from .netutil import ipt
-    a.events_dir = None
-    armed = Armed(a, Path("."), dry=True, harvest=True)
-    with armed:
-        print(f"[+] camera {a.target} ({armed.cam_mac}) on {armed.iface}, "
-              f"gateway {armed.gateway}")
-        print("[+] key: " + ("saved" if armed.enr() else
-                             "not saved yet; the first view reads it"))
-        policy = ipt("-S", "FORWARD").stdout.splitlines()[:1]
-        if policy and policy[0].endswith("DROP"):
-            print("[*] iptables FORWARD policy is DROP; the tool adds accept "
-                  "rules for the camera")
-        if shutil.which("nft"):
-            nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True,
-                                 text=True).stdout
-            if "hook forward" in nft and "policy drop" in nft:
-                print("[!] an nftables chain drops forwarded traffic; iptables "
-                      "rules may not override it, and the camera would lose "
-                      "its connection")
-    print("[+] ready")
-    return 0
-
-
-def cmd_find(a):
-    from .discover import find_cameras
-    _need_root_linux()
-    iface = a.iface or _internet_iface()
-    cams = find_cameras(iface)
-    if not cams:
-        print(f"no Wyze devices answered on {iface}")
-        return 1
-    known = {_mac_key(m) for m in _cache()}
-    for ip, mac in cams:
-        print(f"{ip}  {mac}{'  (ENR cached)' if _mac_key(mac) in known else ''}")
-    return 0
 
 
 def cmd_cleanup(a):
@@ -649,25 +595,24 @@ def cmd_cleanup(a):
 
 
 def _export(av, outdir):
+    """video.mp4 and frame.jpg from av.bin, which then goes; it stays if
+    the export failed, for `extract` to try again."""
     from .media import export
     try:
         r = export(str(av), str(outdir))
     except Exception as e:  # noqa: BLE001
-        print(f"[!] video export failed: {e!r}")
+        r = {"mp4": None, "error": repr(e)}
+    if r["error"]:
+        print(f"[!] couldn't write the video ({r['error']}); "
+              f"`wyzecrack extract {outdir}` tries again")
         return False
-    if not r["frames"]:
-        print("[!] no decodable video in av.bin")
+    if not r["mp4"]:
+        print("[!] the camera sent no whole picture")
+        av.unlink()
         return False
-    for m in r["mp4s"]:
-        size = f"{m['size'][0]}x{m['size'][1]}" if m["size"] else "?"
-        print(f"[+] video: {m['path']} ({size}, {m['seconds']:.1f}s)")
-    if r.get("frame"):
-        print(f"[+] still: {r['frame']}")
-    for err in r.get("errors", []):
-        print(f"[!] {err}")
-    if r["dropped"]:
-        print(f"    {r['dropped']} frame(s) left out: incomplete, or after an "
-              f"incomplete I-frame")
+    size = f"{r['size'][0]}x{r['size'][1]}" if r["size"] else "?"
+    print(f"[+] video: {r['mp4']} ({size}, {r['seconds']:.1f} s)")
+    av.unlink()
     return True
 
 
@@ -693,15 +638,12 @@ def _target_args(p):
 def _key_args(p):
     p.add_argument("--target", help="camera IPv4 address (default: find the "
                                     "one Wyze device on this LAN)")
-    p.add_argument("--enr", help="camera ENR (default: harvest it once, then "
-                                 "reuse it)")
+    p.add_argument("--enr", help="the camera's key (ENR), if you have it "
+                                 "from elsewhere (default: read it from the "
+                                 "camera once)")
     p.add_argument("--reharvest", action="store_true",
-                   help="ignore the saved ENR and UID and get them again")
-    p.add_argument("--no-nudge", action="store_true",
-                   help="don't reset the camera's cloud connection to make it "
-                        "report its ENR; wait for it to report on its own")
-    p.add_argument("--harvest-timeout", type=int, default=0, metavar="SECONDS",
-                   help="give up waiting for the ENR (default: wait)")
+                   help="read the camera's key again (after it was set up "
+                        "again in the Wyze app)")
     p.add_argument("--on-path", action="store_true", help=argparse.SUPPRESS)
 
 
@@ -752,7 +694,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="wyzecrack", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
-    g = sub.add_parser("gui", help="the app (default): pick a camera, watch along")
+    g = sub.add_parser("gui", help="the page (default): pick a camera and watch it")
     g.add_argument("--listen", default="127.0.0.1",
                    help="address to serve the page on (e.g. a tailnet address "
                         "to watch from another device)")
@@ -762,55 +704,35 @@ def main(argv=None):
                    help="print the link instead of opening a browser")
     g.set_defaults(fn=cmd_gui)
 
-    w = sub.add_parser("watch", help="watch and record the camera directly "
-                                     "over the LAN (no phone needed)")
+    w = sub.add_parser("watch", help="record the live view straight from "
+                                     "the camera, until Ctrl-C")
     _key_args(w)
     w.add_argument("--out", help="output directory (default captures/watch-<time>)")
     w.add_argument("--seconds", type=float, default=0,
                    help="stop after this long (default: until Ctrl-C)")
-    w.add_argument("--no-video", action="store_true",
-                   help="skip the MP4 export at the end")
     w.set_defaults(fn=cmd_watch)
 
-    k = sub.add_parser("key", help="get and save the camera's ENR and UID "
-                                   "(once per camera)")
-    _key_args(k)
-    k.set_defaults(fn=cmd_key)
-
-    ev = sub.add_parser("events", help="get on-path and save motion-event "
-                                       "clips and snapshots until Ctrl-C")
+    ev = sub.add_parser("events", help="save the camera's motion clips, "
+                                       "until Ctrl-C")
     _target_args(ev)
     ev.add_argument("--count", type=int, default=0,
                     help="stop after this many clips (default: until Ctrl-C)")
     ev.set_defaults(fn=cmd_events)
 
-    ck = sub.add_parser("check", help="check that this host can reroute the "
-                                      "camera, without touching it")
-    ck.add_argument("--target", help="camera IPv4 address (default: find it)")
-    ck.add_argument("--on-path", action="store_true", help=argparse.SUPPRESS)
-    ck.add_argument("--enr", help=argparse.SUPPRESS)
-    ck.add_argument("--reharvest", action="store_true", help=argparse.SUPPRESS)
-    ck.set_defaults(fn=cmd_check)
-
-    f = sub.add_parser("find", help="list Wyze devices on this LAN")
-    f.add_argument("--iface", help="interface to search (default: the one "
-                                   "with the internet route)")
-    f.set_defaults(fn=cmd_find)
-
     c = sub.add_parser("cleanup", help="undo network changes left by a "
                                        "killed wyzecrack")
     c.set_defaults(fn=cmd_cleanup)
 
-    e = sub.add_parser("extract", help="rebuild video.mp4 + frame.jpg "
-                                       "from a capture")
-    e.add_argument("av_bin", help="a capture directory or its av.bin")
+    e = sub.add_parser("extract", help="write a recording's video again, "
+                                       "if that failed")
+    e.add_argument("av_bin", help="a recording's directory or its av.bin")
     e.add_argument("outdir", nargs="?")
     e.set_defaults(fn=cmd_extract)
 
     a = ap.parse_args(argv)
     if a.cmd is None:
         a = ap.parse_args(["gui", *(argv or [])])
-    if a.cmd in ("watch", "key", "events", "find", "check", "cleanup"):
+    if a.cmd in ("watch", "events", "cleanup"):
         _sudo_reexec()
     try:
         return a.fn(a)

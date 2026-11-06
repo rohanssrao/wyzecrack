@@ -261,8 +261,7 @@ class Controller:
                 self._step("uid", "problem", {"detail": str(e)})
                 return enr, None
         args = SimpleNamespace(target=cam["ip"], on_path=False, enr=None,
-                               reharvest=False, events_dir=cam_dir / "events",
-                               harvest_timeout=0)
+                               reharvest=False, events_dir=cam_dir / "events")
         armed = Armed(args, cam_dir, harvest=True, changes=self.journal.scope())
         armed.stop = self.stop
         armed.on_motion = self._motion
@@ -398,28 +397,29 @@ class Controller:
         self.hub.send_json({"kind": "saving"})
         started = time.time()
         try:
-            r = export(str(out / "av.bin"), str(out), merge=True)
+            r = export(str(out / "av.bin"), str(out))
         except Exception as e:  # noqa: BLE001
+            r = {"mp4": None, "error": repr(e)}
+        if r["error"]:
+            # av.bin stays, for `wyzecrack extract` to try again
             self.hub.send_json({"kind": "toast", "level": "error",
-                                "text": f"Could not save the video: {e}"})
+                                "text": f"Could not save the video: {r['error']}"})
             return
-        main = next((m for m in r["mp4s"] if m["path"].endswith("/video.mp4")),
-                    None)
-        if not main:
+        if not r["mp4"]:
             # the camera hung up before a whole picture
             shutil.rmtree(out, ignore_errors=True)
             return
+        (out / "av.bin").unlink()
         cam = self.camera or {}
         meta = {"mac": cam.get("mac"), "ip": cam.get("ip"),
                 "camera": cam.get("name") or cam.get("model"),
                 "started": out.stat().st_mtime,
-                "seconds": round(main["seconds"], 1) if main else 0,
-                "width": main["size"][0] if main and main["size"] else None,
-                "height": main["size"][1] if main and main["size"] else None}
+                "seconds": round(r["seconds"], 1),
+                "width": r["size"][0] if r["size"] else None,
+                "height": r["size"][1] if r["size"] else None}
         (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
         _give_to_user(out.parent, started - 600)
-        self.hub.send_json({"kind": "library", "new": self.lib.url(out / "video.mp4")
-                            if main else None})
+        self.hub.send_json({"kind": "library", "new": self.lib.url(out / "video.mp4")})
 
     # -- motion clips, in the background -------------------------------
     def set_motion(self, cam, on):

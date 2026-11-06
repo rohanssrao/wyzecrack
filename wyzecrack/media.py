@@ -357,108 +357,53 @@ def _size(h264_path):
     return None
 
 
-# a resolution other than the main one gets its own MP4 only if it lasted
-MIN_SIDE_SECONDS = 2.0
+def export(av_bin, outdir):
+    """av.bin -> outdir/video.mp4 (true speed, with the audio as AAC) and
+    outdir/frame.jpg (its last picture). A capture that holds several AV
+    sessions (the page's view, reconnecting when the camera hung up) makes
+    one recording; the picture holds still across each gap. Only the main
+    resolution is kept: the camera starts each session in SD for a few
+    seconds before it switches to HD.
 
-
-def export(av_bin, outdir, merge=False):
-    """av.bin -> per AV session (one per live view; a single session is
-    written to outdir itself, several to outdir/session-N): video.h264
-    (all clean GOPs), one true-speed MP4 per resolution (video.mp4 is the
-    longest; others video-WxH.mp4) and frame.jpg, the last picture of
-    video.mp4. Returns totals plus every MP4 written.
-
-    merge=True writes the sessions as one recording instead (the page's:
-    one live view that reconnected when the camera hung up); the picture
-    holds still across each gap."""
-    res = {"frames": 0, "dropped": 0, "mp4s": [], "sessions": 0}
-    parts = [([t for t in assemble(recs) if t[1] in VIDEO_CHANNELS], recs, None)
-             for recs in sessions(av_bin)]
-    parts = [p for p in parts if p[0]]
-    if merge and len(parts) > 1:
-        # frame numbers restart with each session, so assemble and dedupe
-        # audio per session, then lay them end to end
-        parts = [([t for p in parts for t in p[0]], (),
-                  [a for p in parts for a in audio_frames(p[1], float("-inf"),
-                                                          float("inf"))])]
-    for n, (every, recs, audio) in enumerate(parts, 1):
-        d = outdir if len(parts) == 1 else os.path.join(outdir, f"session-{n}")
-        try:
-            r = _export_session(every, d, recs, audio)
-        except Exception as e:  # noqa: BLE001  (one bad session must not
-            res.setdefault("errors", []).append(f"{d}: {e!r}")  # cost the rest)
-            continue
-        res["sessions"] += 1
-        res["frames"] += r["frames"]
-        res["dropped"] += r["dropped"]
-        res["mp4s"] += r["mp4s"]
-        res.setdefault("errors", []).extend(r.get("errors", []))
-        if "frame" in r and "frame" not in res:
-            res["frame"] = r["frame"]
-    return res
-
-
-def _drop_brief_sides(segs):
-    """Leave out brief stretches at another resolution than the main one
-    (the SD moment at the start of each session), so that the stretches
-    either side of one join up again."""
-    if len(segs) < 2:
-        return segs
-    total = {}
-    for seg in segs:
-        sps = _sps(seg[0][3])
-        total[sps] = total.get(sps, 0) + seg[-1][0] - seg[0][0]
-    main_sps = max(total, key=total.get)
-    kept = [seg for seg in segs if _sps(seg[0][3]) == main_sps
-            or seg[-1][0] - seg[0][0] >= MIN_SIDE_SECONDS]
-    return segments([t for seg in kept for t in seg]) if kept else segs
-
-
-def _export_session(every, outdir, records=(), audio=None):
-    os.makedirs(outdir, exist_ok=True)
+    Returns {"mp4", "size", "seconds", "frames", "dropped", "frame",
+    "error"}; "mp4" is None when nothing decodable was found or the remux
+    failed ("error")."""
+    res = {"mp4": None, "size": None, "seconds": 0.0, "frames": 0,
+           "dropped": 0, "frame": None, "error": None}
+    every, audio = [], []
+    # frame numbers restart with each session: assemble and dedupe per
+    # session, then lay them end to end
+    for recs in sessions(av_bin):
+        every += [t for t in assemble(recs) if t[1] in VIDEO_CHANNELS]
+        audio += audio_frames(recs, float("-inf"), float("inf"))
     tagged = decodable(every)
-    res = {"frames": len(tagged), "dropped": len(every) - len(tagged),
-           "mp4s": []}
+    res["dropped"] = len(every) - len(tagged)
     if not tagged:
         return res
-    h264 = os.path.join(outdir, "video.h264")
-    with open(h264, "wb") as f:
-        f.write(b"".join(t[3] for t in tagged))
-    segs = _drop_brief_sides(segments(tagged))
-    main = max(range(len(segs)), key=lambda i: len(segs[i]))
-    used = set()
-    for i, seg in enumerate(segs):
-        part = os.path.join(outdir, f".seg{i}.h264")
+    segs = segments(tagged)
+    span = {}
+    for seg in segs:
+        sps = _sps(seg[0][3])
+        span[sps] = span.get(sps, 0) + seg[-1][0] - seg[0][0] + 0.05
+    main = max(span, key=span.get)
+    frames = [t for seg in segs if _sps(seg[0][3]) == main for t in seg]
+    os.makedirs(outdir, exist_ok=True)
+    part = os.path.join(outdir, ".video.h264")
+    mp4 = os.path.join(outdir, "video.mp4")
+    try:
         with open(part, "wb") as f:
-            f.write(b"".join(t[3] for t in seg))
-        try:
-            size = _size(part)
-        except Exception:  # noqa: BLE001
-            size = None
-        stem = ("video" if i == main else
-                f"video-{size[0]}x{size[1]}" if size else f"video-part{i + 1}")
-        name, k = f"{stem}.mp4", 2
-        while name in used:
-            name, k = f"{stem}-{k}.mp4", k + 1
-        used.add(name)
-        mp4 = os.path.join(outdir, name)
-        try:
-            t0, t1 = seg[0][0], seg[-1][0]
-            make_mp4(part, mp4, seg,
-                     audio_frames(records, t0, t1) if audio is None else
-                     [a for a in audio if t0 - 0.5 <= a[0] <= t1 + 0.5])
-        except Exception as e:  # noqa: BLE001
-            res.setdefault("errors", []).append(f"{mp4}: {e!r}")
+            f.write(b"".join(t[3] for t in frames))
+        t0, t1 = frames[0][0], frames[-1][0]
+        make_mp4(part, mp4, frames,
+                 [a for a in audio if t0 - 0.5 <= a[0] <= t1 + 0.5])
+        res.update(mp4=mp4, size=_size(part), seconds=t1 - t0,
+                   frames=len(frames))
+        jpg = os.path.join(outdir, "frame.jpg")
+        if last_frame_jpeg(part, jpg):
+            res["frame"] = jpg
+    except Exception as e:  # noqa: BLE001
+        res["error"] = repr(e)
+    finally:
+        if os.path.exists(part):
             os.remove(part)
-            continue
-        res["mp4s"].append({"path": mp4, "size": size, "frames": len(seg),
-                            "seconds": seg[-1][0] - seg[0][0]})
-        if i == main:
-            jpg = os.path.join(outdir, "frame.jpg")
-            try:
-                if last_frame_jpeg(part, jpg):
-                    res["frame"] = jpg
-            except Exception:  # noqa: BLE001
-                pass
-        os.remove(part)
     return res

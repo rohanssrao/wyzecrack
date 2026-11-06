@@ -168,22 +168,41 @@ def _write_av_bin(path, stretches):
 
 def test_one_recording_across_a_reconnect(tmp_path):
     import av
-    import pytest
     from wyzecrack.media import export
-    try:
-        from test_jpegfeed import _h264_frames
-        units = _h264_frames(n=20)
-    except pytest.skip.Exception:
-        raise
+    from test_jpegfeed import _h264_frames
+    units = _h264_frames(n=20)
     av_bin = tmp_path / "av.bin"
     _write_av_bin(av_bin, [(1000.0, units), (1004.0, units)])  # 3 s gap
-    merged = tmp_path / "merged"
-    r = export(str(av_bin), str(merged), merge=True)
-    assert [m["path"] for m in r["mp4s"]] == [str(merged / "video.mp4")]
-    with av.open(str(merged / "video.mp4")) as c:
+    out = tmp_path / "out"
+    r = export(str(av_bin), str(out))
+    assert r["mp4"] == str(out / "video.mp4") and r["error"] is None
+    assert sorted(p.name for p in out.iterdir()) == ["frame.jpg", "video.mp4"]
+    with av.open(str(out / "video.mp4")) as c:
         v = c.streams.video[0]
         assert v.frames == 40
         assert float(v.duration * v.time_base) > 4.5      # the gap is kept
-    split = tmp_path / "split"
-    r = export(str(av_bin), str(split))
-    assert sorted(p.name for p in split.iterdir() if p.is_dir()) == ["session-1", "session-2"]
+
+
+def test_only_the_main_resolution_is_kept(tmp_path):
+    """The camera starts in SD and switches to HD a few seconds in; the
+    recording is the HD part."""
+    import av
+    from wyzecrack.media import export
+    from test_jpegfeed import _h264_frames
+    sd = _h264_frames(n=20, w=320, h=240)       # 1 s
+    hd = _h264_frames(n=60, w=640, h=480)       # 3 s
+    av_bin = tmp_path / "av.bin"
+    _write_av_bin(av_bin, [(1000.0, sd + hd)])
+    r = export(str(av_bin), str(tmp_path / "out"))
+    assert r["size"] == (640, 480) and r["frames"] == 60
+    with av.open(r["mp4"]) as c:
+        assert (c.streams.video[0].width, c.streams.video[0].frames) == (640, 60)
+
+
+def test_watch_keeps_only_the_video_and_its_still(tmp_path):
+    from wyzecrack import cli
+    from test_jpegfeed import _h264_frames
+    av_bin = tmp_path / "av.bin"
+    _write_av_bin(av_bin, [(1000.0, _h264_frames(n=20))])
+    assert cli._export(av_bin, tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["frame.jpg", "video.mp4"]

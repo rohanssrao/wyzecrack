@@ -1,4 +1,6 @@
 """Getting on the camera's path (router mode)."""
+import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -56,6 +58,7 @@ class OnPath:
                              f"{r.stderr.strip()}")
 
     def start(self):
+        _warn_nft_forward_drop()
         c = self.changes
         # setting ip_forward rewrites every conf/*/forwarding and
         # conf/all/accept_redirects; journal them first so they are put
@@ -159,3 +162,16 @@ def neighbor_mac(ip):
     if "lladdr" not in out:
         return None
     return out[out.index("lladdr") + 1].lower()
+
+
+def _warn_nft_forward_drop():
+    """The FORWARD accept rules can't override an nftables chain that drops
+    forwarded traffic itself; the camera would lose its connection."""
+    if not shutil.which("nft"):
+        return
+    rules = subprocess.run(["nft", "list", "ruleset"], capture_output=True,
+                           text=True).stdout
+    if "hook forward" in rules and "policy drop" in rules:
+        print("[!] an nftables chain on this host drops forwarded traffic; "
+              "the camera may lose its connection while it is routed through "
+              "here")
