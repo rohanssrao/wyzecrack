@@ -30,7 +30,7 @@ function camCard(c) {
   const thumb = el("div", "thumb", (c.thumb ? `<img src="${esc(c.thumb)}" alt="">` : `<span class="ph">📷</span>`) + `<div class="go">Watch</div>`);
   const body = el("div", "body");
   const name = el("div", "name", `<span>${esc(displayName(c))}</span><button class="edit" title="Rename">✎</button>`);
-  const status = c.online === false ? "off or offline" : c.ready ? "ready" : c.key_known ? "key saved" : null;
+  const status = c.online === false ? "not answering" : c.ready ? "ready" : c.key_known ? "key saved" : null;
   const saving = c.capturing === "on" ? "saving motion clips" : c.capturing === "error" ? "motion clips: not saving" : null;
   const bits = [c.name ? c.model : null, c.ip, status, saving, c.tested ? null : "untested model"].filter(Boolean);
   const meta = el("div", "meta", esc(bits.join(" · ")));
@@ -99,6 +99,7 @@ const STATUS = {
   stopping_direct: ["⏻", "spin", "Stopping", "Saving the recording."],
   stopping_plain: ["⏻", "spin", "Stopping", ""],
   error: ["!", "bad", "Something went wrong", ""],
+  no_answer: ["!", "bad", "The camera doesn't answer", ""],
   ended_saving: ["💾", "spin", "Saving", "Writing the recording…"],
   ended: ["✓", "ok", "Saved", "This live view is at the top of Saved, below."],
 };
@@ -109,7 +110,7 @@ function setStatus(key, extra) {
   i.textContent = icon;
   i.className = "status-icon " + anim;
   $("#status-title").textContent = title;
-  $("#status-text").textContent = key === "error" ? (state.error || "") : text;
+  $("#status-text").textContent = key === "error" || key === "no_answer" ? (state.error || "") : text;
   $("#status-extra").textContent = extra || "";
 }
 
@@ -144,6 +145,7 @@ function applyState(s) {
   if (steps.uid?.status === "active") key = "uid";
   if (s.phase === "connecting") key = "direct";
   if (s.phase === "stopping") key = keyRead ? "stopping" : hadPicture ? "stopping_direct" : "stopping_plain";
+  if (s.phase === "error" && s.error_kind === "no_answer") key = "no_answer";
   let extra = "";
   if (key === "key") { const n = steps.enr?.detail?.seen || 0; extra = n ? `${n} camera connection${n > 1 ? "s" : ""} read so far` : ""; }
   if (key === "key_nudge") { const r = steps.enr?.detail?.resets || 0; extra = r ? `Reset ${r} of up to 8` : ""; }

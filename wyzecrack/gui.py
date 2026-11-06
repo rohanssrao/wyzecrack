@@ -327,11 +327,10 @@ class Controller:
                 # a new key; trying again won't change that
                 if failures >= RETRIES or ("(discovery)" in why and not any_video):
                     self.set(phase="error", error_kind="no_answer",
-                             error="The camera doesn't answer. Is it switched "
-                                   "on in the Wyze app? A camera that is "
-                                   "turned off can't be watched. If it is on "
-                                   "and was set up again in the Wyze app, its "
-                                   "key has changed.")
+                             error="Is it switched on in the Wyze app? A "
+                                   "camera that is turned off can't be "
+                                   "watched. If it is on and was set up again "
+                                   "in the Wyze app, its key has changed.")
                     break
                 self.hub.send_json({"kind": "toast", "text":
                                     "The camera hung up · reconnecting"
