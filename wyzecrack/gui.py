@@ -276,7 +276,7 @@ class Controller:
         from .changes import signals_held
         from .cli import (_cached, _inhibit_sleep, _release_inhibitor,
                           _remember_framing)
-        from .direct import CameraGone, Direct, open_firewall, open_first
+        from .direct import RETRIES, CameraGone, Direct, open_firewall, open_first
         from .netutil import local_ip_for
         failures = 0                 # attempts in a row without a picture
         any_video = False
@@ -325,7 +325,7 @@ class Controller:
                 failures = 0 if had_video else failures + 1
                 # no answer at all to a first try: switched off, offline, or
                 # a new key; trying again won't change that
-                if failures >= 3 or ("(discovery)" in why and not any_video):
+                if failures >= RETRIES or ("(discovery)" in why and not any_video):
                     self.set(phase="error", error_kind="no_answer",
                              error="The camera doesn't answer. Is it switched "
                                    "on in the Wyze app? A camera that is "

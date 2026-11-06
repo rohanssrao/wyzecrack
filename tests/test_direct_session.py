@@ -174,3 +174,23 @@ def test_no_hedging_for_a_camera_that_does_not_answer(h264, monkeypatch):
         assert len(made) == 1
     finally:
         cam.close()
+
+
+def test_a_camera_that_comes_back_takes_a_new_session(h264, monkeypatch):
+    """What `watch` and the page do when the camera drops off and returns."""
+    monkeypatch.setattr(direct, "SILENT_AFTER", 1.0)
+    cam = FakeCamera(UID, ENR, MAC, frames=h264, quiet_after=1.0, quiet_for=2.0)
+    try:
+        d = _session(cam)
+        d.open(timeout=10)
+        with pytest.raises(direct.CameraGone, match="quiet"):
+            while True:
+                d.pump(0.2)
+        d.close()
+        time.sleep(1.5)                       # back by now
+        d = _session(cam)
+        d.open(timeout=10)
+        d.close()
+        assert cam.events.count("login") == 2 and "back" in cam.events
+    finally:
+        cam.close()

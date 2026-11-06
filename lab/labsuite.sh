@@ -20,6 +20,11 @@ if want == "live":
     good = live and media_off and (r["mp4_frames"] or 0) > 20 and r["rc"] == 0
 elif want == "gone":
     good = live and "went quiet" in ev and "camera went quiet" in out
+elif want == "reconnect":
+    # the camera dropped off and came back: watch reconnected, one recording
+    good = (out.count("[+] live from") == 2 and "reconnecting" in out
+            and ev.count("login") == 2 and (r["mp4_frames"] or 0) > 20
+            and r["rc"] == 0)
 else:
     good = live
 good = good and not left
@@ -31,6 +36,7 @@ PY
 for spec in "watch-cc51:FRAMING=cc51:live" "watch-iotc:FRAMING=iotc:live" \
             "watch-slow-login:LOGIN_DELAY=4:live" \
             "watch-camera-gone:QUIET_AFTER=3 SECS=30:gone" \
+            "watch-reconnect:QUIET_AFTER=3 QUIET_FOR=8 SECS=30:reconnect" \
             "watch-sigterm:KILL_AT=5 KILL_SIG=TERM:killed" \
             "watch-ctrl-c:KILL_AT=5 KILL_SIG=INT:killed" \
             "watch-sigkill-then-cleanup:KILL_AT=5 KILL_SIG=KILL:killed"; do

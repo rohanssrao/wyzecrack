@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Direct mode end to end: a fake camera (tests/fakecam.py) in the cam
 # namespace, `wyzecrack watch` in mid with the camera's key already saved.
-# usage: [FRAMING=cc51|iotc] [LOGIN_DELAY=s] [QUIET_AFTER=s]
+# usage: [FRAMING=cc51|iotc] [LOGIN_DELAY=s] [QUIET_AFTER=s [QUIET_FOR=s]]
 #        [KILL_AT=s KILL_SIG=TERM|INT|KILL] [SECS=8] sudo bash lab_watch.sh
 # Result: $OUT/watch.json (what the camera saw and what was recorded) and
 # $OUT/leftovers.txt (firewall rules the tool left in mid; empty = clean).
@@ -22,6 +22,7 @@ EOF
 ip netns exec tfl-cam env PYTHONPYCACHEPREFIX=/tmp/pyc $PY tests/fakecam.py \
    --host 10.99.0.20 --mac $MAC --framing ${FRAMING:-cc51} --seconds $((SECS + 12)) \
    --login-delay ${LOGIN_DELAY:-0} ${QUIET_AFTER:+--quiet-after $QUIET_AFTER} \
+   ${QUIET_FOR:+--quiet-for $QUIET_FOR} \
    > $OUT/cam.json 2> $OUT/cam.err &
 CAM=$!
 sleep 1.5

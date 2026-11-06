@@ -9,7 +9,8 @@ it was given, one plain-format record per frame, plus a keepalive every
 second. Knobs for the failure cases: login_delay (a slow camera),
 ignore_logins (sessions whose AV login is never answered), and
 quiet (stop sending everything, as when a camera drops off its Wi-Fi;
-quiet_after sets it that many seconds into the live view).
+quiet_after sets it that many seconds into the live view, quiet_for ends
+it after that long).
 """
 import hashlib
 import hmac
@@ -64,7 +65,7 @@ def media_record(frame_no, au, key, version=0x0C, channel=None):
 class FakeCamera:
     def __init__(self, uid, enr, mac, framing=CC51, frames=(), login_delay=0.0,
                  fps=20.0, host="127.0.0.1", disco_port=0, quiet_after=None,
-                 ignore_logins=()):
+                 quiet_for=None, ignore_logins=()):
         self.uid, self.enr, self.framing = uid.encode(), enr, framing
         self.authkey = direct.auth_key(enr, mac)
         self.key = self.uid + self.authkey
@@ -80,6 +81,8 @@ class FakeCamera:
         self._new_session()
         self.quiet = False
         self.quiet_after = quiet_after
+        self.quiet_for = quiet_for          # None: quiet for good
+        self.quiet_since = None
         self.ignore_logins = set(ignore_logins)   # sessions (1, 2, ...) left waiting
         self._stop = threading.Event()
         self._tx_seq = 0
@@ -161,9 +164,16 @@ class FakeCamera:
             if self.live_at is None and self.media_on[1]:
                 self.live_at = now
             if (self.quiet_after is not None and self.live_at is not None
-                    and now - self.live_at >= self.quiet_after and not self.quiet):
-                self.quiet = True
+                    and now - self.live_at >= self.quiet_after and not self.quiet
+                    and self.quiet_since is None):
+                self.quiet, self.quiet_since = True, now
                 self.events.append("went quiet")
+            if (self.quiet and self.quiet_for is not None
+                    and now - self.quiet_since >= self.quiet_for):
+                self.quiet = False           # back, for a new session
+                self.client = None
+                self.media_on = {1: False, 2: False}
+                self.events.append("back")
             self._stream(now)
             r, _, _ = select.select([self.disco, self.p2p], [], [], 0.01)
             for s in r:
@@ -352,12 +362,14 @@ def main():
     ap.add_argument("--seconds", type=float, default=20)
     ap.add_argument("--login-delay", type=float, default=0)
     ap.add_argument("--quiet-after", type=float)
+    ap.add_argument("--quiet-for", type=float)
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from test_jpegfeed import _h264_frames
     cam = FakeCamera(a.uid, a.enr, a.mac, a.framing, frames=_h264_frames(n=20),
                      login_delay=a.login_delay, host=a.host,
-                     disco_port=direct.DISCO_PORT, quiet_after=a.quiet_after)
+                     disco_port=direct.DISCO_PORT, quiet_after=a.quiet_after,
+                     quiet_for=a.quiet_for)
     print(f"fake camera on {a.host}:{direct.DISCO_PORT} ({a.framing})",
           file=sys.stderr, flush=True)
     try:

@@ -525,9 +525,11 @@ def _direct_key(a):
 
 def cmd_watch(a):
     """The live view straight from the camera, recorded until Ctrl-C (or
-    --seconds)."""
+    --seconds). When the camera hangs up it reconnects, as the page does;
+    everything goes into one recording."""
     from .changes import Changes, signals_held
-    from .direct import CameraGone, Direct, open_firewall, open_first
+    from .direct import RETRIES, CameraGone, Direct, open_firewall, open_first
+    from .live import LiveAssembler
     from .netutil import local_ip_for
     started = time.time()
     target, mac, enr, uid = _direct_key(a)
@@ -536,49 +538,81 @@ def cmd_watch(a):
     out.mkdir(parents=True, exist_ok=True)
     changes = Changes()
     changes.acquire()
-    framing = _cached(mac).get("framing")
-
-    def make(stop):
-        s = Direct(target, uid, enr, mac, local_ip=local_ip_for(target),
-                   stop=stop, framing=framing)
-        open_firewall(changes, target, s.port)
-        return s
-
-    d, ok = None, False
+    end = None                     # --seconds counts from when it went live
+    debug = os.environ.get("WYZECRACK_DEBUG")
+    failures, opened, any_video = 0, False, False
     sleep_lock = _inhibit_sleep("recording a live view")
     try:
-        t0 = time.monotonic()
-        d = open_first(make, av_log=str(out / "av.bin"))
-        _remember_framing(mac, d)
-        print(f"[+] live from {target} after {time.monotonic() - t0:.1f} s"
-              + (f" ({d.tries} sessions tried)" if d.tries > 1 else "")
-              + f"; recording to {out}/ (Ctrl-C to stop)")
-        ok = True
-        end = time.monotonic() + a.seconds if a.seconds else None
-        tick = time.monotonic() + 5
         while end is None or time.monotonic() < end:
-            d.pump(0.5)
-            if os.environ.get("WYZECRACK_DEBUG") and time.monotonic() >= tick:
-                print(f"[d] {time.strftime('%T')} rx {d.stats['rx']} "
-                      f"ignored {d.stats.get('ignored', 0)} tx {d.stats['tx']}")
-                tick += 5
+            scope = changes.scope()           # this session's firewall rule
+            framing = _cached(mac).get("framing")
+
+            def make(stop, scope=scope, framing=framing):
+                s = Direct(target, uid, enr, mac, local_ip=local_ip_for(target),
+                           stop=stop, framing=framing)
+                open_firewall(scope, target, s.port)
+                return s
+
+            pictures = [0]
+            live = LiveAssembler(on_video=lambda f: pictures.__setitem__(
+                0, pictures[0] + 1))
+            d, why = None, ""
+            try:
+                t0 = time.monotonic()
+                d = open_first(make, av_log=str(out / "av.bin"), on_av=live.feed)
+                _remember_framing(mac, d)
+                print(f"[+] live from {target} after {time.monotonic() - t0:.1f} s"
+                      + (f" ({d.tries} sessions tried)" if d.tries > 1 else "")
+                      + ("" if opened else
+                         f"; recording to {out}/ (Ctrl-C to stop)"))
+                opened = True
+                if a.seconds and end is None:
+                    end = time.monotonic() + a.seconds
+                tick = time.monotonic() + 5
+                while end is None or time.monotonic() < end:
+                    d.pump(0.5)
+                    if debug and time.monotonic() >= tick:
+                        print(f"[d] {time.strftime('%T')} rx {d.stats['rx']} "
+                              f"ignored {d.stats.get('ignored', 0)} "
+                              f"tx {d.stats['tx']}")
+                        tick += 5
+            except (CameraGone, ValueError, OSError) as e:
+                # ValueError: a DTLS handshake that went wrong; OSError: no
+                # route (the host's network is still coming up)
+                why = str(e)
+                print(f"[!] {e}")
+            finally:
+                any_video = any_video or pictures[0] > 0
+                if d:
+                    if debug:
+                        print(f"[d] session ({d.framing} framing): {d.stats}")
+                    d.close()
+                with signals_held():
+                    scope.undo_all()
+            if not why or (end is not None and time.monotonic() >= end):
+                break
+            failures = 0 if pictures[0] else failures + 1
+            # no answer at all to a first try: switched off, offline, or a
+            # new key; trying again won't change that
+            if failures >= RETRIES or ("(discovery)" in why and not any_video):
+                print("[!] the camera doesn't answer. Is it switched on in the "
+                      "Wyze app? If it was set up again there, its key changed: "
+                      "`wyzecrack watch --reharvest` reads the new one")
+                break
+            print("[*] the camera hung up; reconnecting" if pictures[0]
+                  else "[*] trying again")
+            time.sleep(1.5)
     except KeyboardInterrupt:
         print()
-    except (CameraGone, ValueError) as e:
-        print(f"[!] {e}")
     finally:
-        if d:
-            if os.environ.get("WYZECRACK_DEBUG"):
-                print(f"[d] session ({d.framing} framing): {d.stats}")
-            d.close()
         with signals_held():
             changes.undo_all()
         changes.release()
         _release_inhibitor(sleep_lock)
-    if ok:
+    if opened:
         _export(out / "av.bin", out)
     _give_to_user(root, started)
-    return 0 if ok else 1
+    return 0 if any_video else 1
 
 
 def cmd_cleanup(a):
@@ -709,7 +743,7 @@ def main(argv=None):
     _key_args(w)
     w.add_argument("--out", help="output directory (default captures/watch-<time>)")
     w.add_argument("--seconds", type=float, default=0,
-                   help="stop after this long (default: until Ctrl-C)")
+                   help="stop after this long live (default: until Ctrl-C)")
     w.set_defaults(fn=cmd_watch)
 
     ev = sub.add_parser("events", help="save the camera's motion clips, "

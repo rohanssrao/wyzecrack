@@ -19,8 +19,10 @@ the network has one Wyze device, and asks which one when it has several;
 `--target <camera ip>` skips the search.
 
 - `wyzecrack watch` records the live view until Ctrl-C. The first time
-  with a camera, it reads the camera's key and ID first.
-  - `--seconds <n>` stops after that long.
+  with a camera, it reads the camera's key and ID first. When the camera
+  hangs up, it reconnects, as the page does, and gives up after three
+  tries in a row without a picture; it's all one recording.
+  - `--seconds <n>` stops after that many seconds of live view.
   - `--out <dir>` sets where the recording goes (default
     `captures/watch-<time>`).
   - `--reharvest` reads the camera's key again, for a camera that was set

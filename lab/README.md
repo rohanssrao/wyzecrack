@@ -25,7 +25,8 @@ Run as root on Linux, from the repo, after `uv sync`:
     sudo bash lab/labsuite.sh            # everything; one PASS/FAIL line each in /tmp/wslab-suite.txt
     sudo bash lab/lab_watch.sh           # one view; FRAMING=iotc for the v2's framing,
                                          # LOGIN_DELAY=4 for a slow camera, QUIET_AFTER=3 SECS=30
-                                         # for a camera that drops off mid-view
+                                         # for a camera that drops off mid-view (QUIET_FOR=8:
+                                         # and comes back, so watch reconnects)
     sudo bash lab/lab_onpath.sh          # the key and clips; KILL_AT=2 KILL_SIG=TERM|HUP|INT2|KILL
                                          # signals the tool instead (INT2 = Ctrl-C twice,
                                          # KILL = then `wyzecrack cleanup`)

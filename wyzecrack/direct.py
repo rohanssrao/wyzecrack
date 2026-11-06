@@ -80,6 +80,9 @@ LOGIN_EVERY = 0.5         # the answer follows the first resend it takes
 # a camera that is on answers discovery within 0.1 s; one that is switched
 # off, offline, or set up again (a new key) never does
 DISCO_GIVE_UP = 10.0
+# a live view reconnects when the camera hangs up, and gives up after this
+# many sessions in a row without a picture (the page and `watch` both)
+RETRIES = 3
 HD_1080P, BITRATE_MAX = 1, 0xF0             # K10056 frame size 0 (+1), kbps
 ACK_EVERY = 0.1
 SILENT_AFTER = 6.0                          # camera quiet this long: gone
