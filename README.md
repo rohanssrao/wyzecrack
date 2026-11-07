@@ -7,8 +7,7 @@ wyzecrack exploits unpatched Wyze cam (v2 and v3) firmwares that still trust eMu
 ## Get started
 
 You need a Linux computer on the same network as the cameras, with `sudo`,
-`iptables` and [uv](https://docs.astral.sh/uv/). Install wyzecrack and
-start it:
+`iptables` and [uv](https://docs.astral.sh/uv/).
 
 ```
 uv tool install git+https://github.com/rohanssrao/wyzecrack
@@ -18,18 +17,11 @@ wyzecrack
 wyzecrack will open in your browser. Pick a camera to watch it live.
 
 Watching a camera for the first time takes a few minutes as wyzecrack routes that camera through your computer with ARP spoofing and reads the
-camera's key (ENR) from what it sends to Wyze. The camera reconnects to
-Wyze a few times meanwhile, and its network goes back to normal
-afterwards. From then on, live views start within seconds.
+camera's key (ENR) from what it sends to Wyze. From then on, live views start within seconds. Camera keys are stored in `~/.local/share/wyzecrack` for future use.
 
-Every live view is recorded. When you press **Stop**, the recording
-appears under the camera's live view, where you can play or delete it.
-Recordings and motion clips are saved in `~/Videos/wyzecrack`, a folder per
-camera. To keep a camera's motion clips too, turn on **Save motion clips**
-on its page. Clips are copied while wyzecrack is running.
+Recordings and motion clips are saved in `~/Videos/wyzecrack`.
 
-Tested with the Wyze Cam v3 (firmware 4.36.16 and 4.36.17) and the Wyze
-Cam v2 (4.9.9).
+Tested with Wyze Cam v3 (firmwares 4.36.16 and 4.36.17) and Wyze Cam v2 (4.9.9).
 
 ## More
 
