@@ -1,5 +1,32 @@
 # How wyzecrack works
 
+To connect to a Wyze camera from the local network and stream its feed, you need three values:
+
+- its MAC address
+- its ENR, an encryption key used for DTLS
+- its TUTK (ThroughTek UDP Tunnel Kit) UID, a 20-character P2P identifier
+
+The ENR is lives in the camera and sent in every request to the Wyze device API (device-api.wyzecam.com), which happens:
+- on boot
+- on motion event
+- in periodic metric reports. These happen on a random basis, between 0 and 20 minutes apart. Boring 😴. Fortunately, if the camera's MQTT connection to aws-iot.wyzecam.com ever drops, it immediately sends a metric report while it tries to reconnect.
+
+The UID is retrievable from Wyze's device API by sending a `POST /device/system/get_p2pid` with the camera's MAC and ENR in the body.
+
+So, how do we get these?
+
+wyzecrack:
+1. retrieves the camera's MAC from ARP.
+2. achieves a MitM position by ARP-poisoning the camera so this host becomes its gateway, and MASQUERADEs its traffic out to the real gateway.
+3. presents forged eMudhra intermediate-signed certificates for TLS connections to `*.wyzecam.com` and `*c-t-*.s3.*.amazonaws.com` (the S3 bucket motion events are uploaded to) to decrypt the camera's cloud communications.
+4. spoofs TCP RSTs from aws-iot.wyzecam.com to drop the camera's MQTT connection, triggering a metrics report on demand that contains its ENR.
+5. requests its UID from the Wyze API using its MAC and ENR
+6. connects directly to the camera!
+
+AI slop with more technical details below.
+
+---
+
 A live view needs three things per camera: its MAC, its ENR and its TUTK
 UID. The MAC comes from ARP. The ENR is read once off the camera's own
 HTTPS (steps 1 and 2 below). The UID never crosses the LAN, but Wyze's
