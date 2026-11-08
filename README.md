@@ -2,7 +2,7 @@
 
 Watch and record Wyze cameras on a local network without authentication.
 
-wyzecrack exploits unpatched Wyze cam (v2 and v3) firmwares that still trust eMudhra intermediate CAs. It MITMs the camera to sniff its master secret, asks the Wyze cloud for its UID, and connects directly to it to stream its feed.
+wyzecrack exploits unpatched Wyze cam (v2 and v3) firmwares [that still trust eMudhra intermediate CAs](https://en.wikipedia.org/wiki/EMudhra#2026_weak_key_incident). It MITMs the camera to sniff its master secret, asks the Wyze cloud for its UID, and connects directly to it to stream its feed.
 
 ## Get started
 
